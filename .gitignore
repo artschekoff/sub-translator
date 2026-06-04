@@ -1,0 +1,14 @@
+# Binary
+subtrans
+subtrans-*
+
+# Build artifacts
+/dist/
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp
