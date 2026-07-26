@@ -30,13 +30,14 @@ You have a video with subtitles in a language you don't read. Getting it into a 
 | **API keys and billing.** Most translation tooling wants a cloud account, a credit card, and a quota dashboard before it will translate one file. | Zero setup. Uses Google Translate's free public endpoint — no key, no login, no quota to manage. |
 | **Slow, one-line-at-a-time translation.** Naive tools fire one request per subtitle block: thousands of round-trips for a feature film. | Batches ~40 blocks per request, with automatic per-block retry so one bad block can't poison the batch. |
 | **Re-muxing loses quality.** Re-encoding to add a subtitle track costs an hour of CPU and a generation of video quality. | Stream-copies everything. Video and audio are untouched; only a new subtitle track is added. Takes seconds. |
-| **AVI can't hold subtitles.** So the tool errors out and you're left with nothing. | Detects the container limitation and writes an external `.srt` next to the video instead. |
+| **AVI can't hold subtitles.** So the tool errors out and you're left with nothing. | Detects the container limitation and writes an external `.srt` next to the video instead — which is also what the default mode does for every container. |
 
 The result is one command, a few seconds of waiting, and a file that plays with translated subs in any player.
 
 ## Features
 
 - **Automatic track detection** — finds the right subtitle track by language code, no manual stream index needed
+- **Sidecar or embedded** — writes a `.srt` next to your video by default, or embeds the translated track into a new container with `-mode mux`
 - **Timing-safe translation** — timecode lines are never sent to the translator, so sync is preserved exactly
 - **Smart batching** — groups subtitle blocks for fewer requests, with per-block fallback on failure
 - **ISO 639-1/2 aware** — handles both `en` and `eng`, `es` and `spa` transparently
@@ -47,11 +48,13 @@ The result is one command, a few seconds of waiting, and a file that plays with 
 
 ## Supported Formats
 
-| Container | Embed subtitle track | External SRT |
-|-----------|:-------------------:|:------------:|
-| MKV       | ✅                  | optional (`-srt`) |
-| MP4 / M4V / MOV | ✅            | optional (`-srt`) |
-| AVI       | ❌ (not supported by container) | ✅ auto |
+| Container | `-mode srt` (default) | `-mode mux` | `-mode both` |
+|-----------|:---------------------:|:-----------:|:------------:|
+| MKV       | ✅ sidecar `.srt`     | ✅ embedded | ✅ |
+| MP4 / M4V / MOV | ✅ sidecar `.srt` | ✅ embedded (`mov_text`) | ✅ |
+| AVI       | ✅ sidecar `.srt`     | falls back to sidecar | falls back to sidecar |
+
+AVI cannot carry subtitle tracks, so `-mode mux` and `-mode both` downgrade to a sidecar `.srt` and say so.
 
 ## Installation
 
@@ -97,33 +100,43 @@ Flags:
   -from    source language code  (default: en)
   -to      target language code  (required — prompted for if omitted)
   -track   subtitle stream index, -1 = auto-detect (default: -1)
-  -srt     also save translated .srt alongside the output file
-  -no-mux  skip muxing, only save translated .srt
-  -out     custom output file path
+  -mode    output mode: srt, mux or both  (default: srt)
+  -out     output path (.srt in srt mode, container otherwise)
   -version print version and exit
 ```
+
+### Output modes
+
+| Mode | What you get | When to use it |
+|------|--------------|----------------|
+| `srt` *(default)* | `movie.es.srt` next to the video | Fastest, non-destructive — your video file is never rewritten and no second copy lands on disk. Works with any player that loads sidecar subtitles. |
+| `mux` | `movie.ES.mkv` with the translated track embedded | One self-contained file to copy to a TV, phone or media server that ignores sidecars. Costs a full copy of the video on disk. |
+| `both` | `movie.ES.mkv` **and** `movie.es.srt` | You want the embedded track but also a plain-text copy to edit or reuse. |
 
 ### Examples
 
 ```bash
-# Translate English subs to Spanish, embed into new MKV
+# Default: write movie.es.srt next to the video
 sub-translator -to es movie.mkv
 
 # Omit -to and you'll be asked for it
 sub-translator movie.mkv
 # Target language code (e.g. es, fr, de, ja): fr
 
-# Save SRT only, skip muxing
-sub-translator -to fr -no-mux movie.mkv
+# Embed the translated track into a new container
+sub-translator -to fr -mode mux movie.mkv
 
-# Also keep the .srt file alongside the output
-sub-translator -srt -to de movie.mp4
+# Embedded track plus a sidecar .srt
+sub-translator -to de -mode both movie.mp4
 
 # Pick a specific subtitle track by stream index
 sub-translator -to ru -track 3 movie.mkv
 
-# Custom output path
-sub-translator -to es -out /tmp/movie_es.mkv movie.mkv
+# Custom output path (names the .srt in srt mode)
+sub-translator -to es -out /tmp/movie_es.srt movie.mkv
+
+# Custom output path (names the container in mux mode)
+sub-translator -to es -mode mux -out /tmp/movie_es.mkv movie.mkv
 ```
 
 `-to` has no default — translating into an arbitrary language silently is worse than asking, so an omitted `-to` prompts on stdin (and errors out when stdin isn't interactive).
@@ -132,12 +145,13 @@ If auto-detection can't find a track for `-from`, the tool prints every subtitle
 
 ### Output naming
 
-| Input | Flag | Output |
-|-------|------|--------|
-| `movie.mkv` | *(default)* | `movie.ES.mkv` |
-| `movie.mp4` | `-to fr` | `movie.FR.mp4` |
-| `movie.mkv` | `-srt` | `movie.ES.mkv` + `movie.es.srt` |
-| `movie.avi` | *(any)* | `movie.es.srt` *(AVI only)* |
+| Input | Flags | Output |
+|-------|-------|--------|
+| `movie.mkv` | *(default)* | `movie.es.srt` |
+| `movie.mkv` | `-mode mux` | `movie.ES.mkv` |
+| `movie.mkv` | `-mode both` | `movie.ES.mkv` + `movie.es.srt` |
+| `movie.mp4` | `-to fr -mode mux` | `movie.FR.mp4` |
+| `movie.avi` | `-mode mux` | `movie.es.srt` *(downgraded)* |
 
 ## Languages
 
