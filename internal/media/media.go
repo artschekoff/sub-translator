@@ -116,21 +116,34 @@ func MuxSubtitle(input, srtPath, lang, title, output string) error {
 		subCodec = "mov_text"
 	}
 
-	metaFlag := fmt.Sprintf("s:s:%d", subCount)
+	args := muxArgs(input, srtPath, lang, title, output, subCodec, subCount)
+	cmd := exec.Command("ffmpeg", args...)
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
 
-	cmd := exec.Command("ffmpeg", "-y",
+// muxArgs builds the ffmpeg argument list that copies every stream from input
+// and appends the translated SRT as the (subCount+1)-th subtitle track.
+//
+// subCount is the number of subtitle streams already in input, so it doubles as
+// the 0-based index of the track being added.
+func muxArgs(input, srtPath, lang, title, output, subCodec string, subCount int) []string {
+	// Metadata specifier is -metadata:s:<stream_spec>, and the stream spec for
+	// "the Nth subtitle stream" is itself "s:N" — hence the doubled s:s:.
+	meta := fmt.Sprintf("-metadata:s:s:%d", subCount)
+
+	return []string{
+		"-y",
 		"-i", input,
 		"-i", srtPath,
 		"-map", "0",
 		"-map", "1",
 		"-c", "copy",
 		"-c:s", subCodec,
-		fmt.Sprintf("-metadata:s:%s", metaFlag), fmt.Sprintf("language=%s", lang),
-		fmt.Sprintf("-metadata:s:%s", metaFlag), fmt.Sprintf("title=%s", title),
+		meta, fmt.Sprintf("language=%s", lang),
+		meta, fmt.Sprintf("title=%s", title),
 		output,
-	)
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	}
 }
 
 func DefaultOutputPath(input, lang string) string {
