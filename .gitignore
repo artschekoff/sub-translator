@@ -1,9 +1,18 @@
-# Binary
-subtrans
-subtrans-*
+# Binaries
+sub-translator
+sub-translator-*
+/bin/
 
 # Build artifacts
 /dist/
+
+# Media / test fixtures
+*.mkv
+*.mp4
+*.m4v
+*.mov
+*.avi
+*.srt
 
 # macOS
 .DS_Store

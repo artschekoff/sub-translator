@@ -1,20 +1,25 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
-	"github.com/artschekoff/subtrans/internal/media"
-	"github.com/artschekoff/subtrans/internal/srt"
-	"github.com/artschekoff/subtrans/internal/translate"
+	"github.com/artschekoff/sub-translator/internal/media"
+	"github.com/artschekoff/sub-translator/internal/srt"
+	"github.com/artschekoff/sub-translator/internal/translate"
 )
 
-const usage = `subtrans — subtitle translator for MKV, MP4, AVI and more
+// version is injected at build time via -ldflags "-X main.version=..."
+var version = "dev"
+
+const usage = `sub-translator — subtitle translator for MKV, MP4, AVI and more
 
 Usage:
-  subtrans [flags] <input>
+  sub-translator [flags] <input>
 
 Supported formats:
   MKV, MP4/M4V/MOV  — translated track embedded into output file
@@ -22,28 +27,35 @@ Supported formats:
 
 Flags:
   -from   source language code (default: en)
-  -to     target language code (default: es)
+  -to     target language code (required; prompted for if omitted)
   -track  subtitle stream index, -1 = auto-detect by -from lang (default: -1)
   -srt    also save translated .srt alongside the output file
   -no-mux skip muxing, only save translated .srt
   -out    output file path (default: input.<TO><ext>)
+  -version print version and exit
 
 Examples:
-  subtrans movie.mkv
-  subtrans -from en -to fr movie.mp4
-  subtrans -srt movie.mkv
-  subtrans -no-mux movie.avi
+  sub-translator movie.mkv
+  sub-translator -from en -to fr movie.mp4
+  sub-translator -srt movie.mkv
+  sub-translator -no-mux movie.avi
 `
 
 func main() {
 	from := flag.String("from", "en", "source language")
-	to := flag.String("to", "es", "target language")
+	to := flag.String("to", "", "target language (required)")
 	track := flag.Int("track", -1, "subtitle stream index (-1 = auto)")
 	saveSRT := flag.Bool("srt", false, "save translated .srt alongside MKV")
 	noMux := flag.Bool("no-mux", false, "skip muxing back into MKV")
 	out := flag.String("out", "", "output MKV path")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("sub-translator %s\n", version)
+		return
+	}
 
 	if flag.NArg() < 1 {
 		flag.Usage()
@@ -52,6 +64,10 @@ func main() {
 	input := flag.Arg(0)
 	if _, err := os.Stat(input); err != nil {
 		fatalf("input file not found: %s", input)
+	}
+
+	if *to = strings.TrimSpace(*to); *to == "" {
+		*to = promptTargetLang()
 	}
 
 	// Detect subtitle track
@@ -63,7 +79,7 @@ func main() {
 
 	subs := media.SubtitleStreams(streams)
 	if len(subs) == 0 {
-		fatalf("no subtitle tracks found")
+		fatalf("no subtitle tracks in %s — nothing to translate", filepath.Base(input))
 	}
 
 	var srcStream media.Stream
@@ -93,7 +109,7 @@ func main() {
 	fmt.Printf("Source: #%d  lang=%s  %q\n", srcStream.Index, srcStream.Tags.Language, srcStream.Tags.Title)
 
 	// Extract
-	tmpSRT := filepath.Join(os.TempDir(), "subtrans_src.srt")
+	tmpSRT := filepath.Join(os.TempDir(), "sub_translator_src.srt")
 	defer os.Remove(tmpSRT)
 	fmt.Printf("Extracting subtitle track #%d...\n", srcStream.Index)
 	if err := media.ExtractSubtitle(input, srcStream.Index, tmpSRT); err != nil {
@@ -104,6 +120,9 @@ func main() {
 	blocks, err := srt.Parse(tmpSRT)
 	if err != nil {
 		fatalf("parse SRT: %v", err)
+	}
+	if len(blocks) == 0 {
+		fatalf("subtitle track #%d is empty — nothing to translate", srcStream.Index)
 	}
 	fmt.Printf("Parsed %d subtitle blocks\n", len(blocks))
 
@@ -135,7 +154,7 @@ func main() {
 
 	// Determine SRT output path
 	srtOut := media.DefaultSRTPath(input, *to)
-	tmpTranslated := filepath.Join(os.TempDir(), "subtrans_dst.srt")
+	tmpTranslated := filepath.Join(os.TempDir(), "sub_translator_dst.srt")
 	defer os.Remove(tmpTranslated)
 
 	writePath := tmpTranslated
@@ -186,6 +205,24 @@ func main() {
 		fatalf("mux: %v", err)
 	}
 	fmt.Printf("Done: %s\n", outMKV)
+}
+
+// promptTargetLang asks for the target language on stdin. -to has no default:
+// silently translating to some arbitrary language is worse than asking.
+func promptTargetLang() string {
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		fmt.Print("Target language code (e.g. es, fr, de, ja): ")
+		line, err := reader.ReadString('\n')
+		if lang := strings.TrimSpace(line); lang != "" {
+			return lang
+		}
+		if err != nil {
+			// Non-interactive stdin (pipe, CI) — nothing left to read.
+			fmt.Println()
+			fatalf("-to is required: no target language given")
+		}
+	}
 }
 
 func fatalf(format string, args ...any) {
