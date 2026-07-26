@@ -97,7 +97,7 @@ sub-translator [flags] <input>
 
 ```
 Flags:
-  -from    source language code  (default: en)
+  -from    source language code  (required — prompted for if omitted)
   -to      target language code  (required — prompted for if omitted)
   -track   subtitle stream index, -1 = auto-detect (default: -1)
   -mode    output mode: srt, mux or both  (default: srt)
@@ -117,31 +117,57 @@ Flags:
 
 ```bash
 # Default: write movie.es.srt next to the video
-sub-translator -to es movie.mkv
+sub-translator -from en -to es movie.mkv
 
-# Omit -to and you'll be asked for it
+# Omit the languages and you'll be asked for both
 sub-translator movie.mkv
-# Target language code (e.g. es, fr, de, ja): fr
 
 # Embed the translated track into a new container
-sub-translator -to fr -mode mux movie.mkv
+sub-translator -from en -to fr -mode mux movie.mkv
 
 # Embedded track plus a sidecar .srt
-sub-translator -to de -mode both movie.mp4
+sub-translator -from en -to de -mode both movie.mp4
 
 # Pick a specific subtitle track by stream index
-sub-translator -to ru -track 3 movie.mkv
+sub-translator -from en -to ru -track 3 movie.mkv
 
 # Custom output path (names the .srt in srt mode)
-sub-translator -to es -out /tmp/movie_es.srt movie.mkv
+sub-translator -from en -to es -out /tmp/movie_es.srt movie.mkv
 
 # Custom output path (names the container in mux mode)
-sub-translator -to es -mode mux -out /tmp/movie_es.mkv movie.mkv
+sub-translator -from en -to es -mode mux -out /tmp/movie_es.mkv movie.mkv
 ```
 
-`-to` has no default — translating into an arbitrary language silently is worse than asking, so an omitted `-to` prompts on stdin (and errors out when stdin isn't interactive).
+### Track listing and prompts
 
-If auto-detection can't find a track for `-from`, the tool prints every subtitle stream it *did* find — index, language and title — so you can pick one with `-track`. If the file has no subtitle streams at all, it exits with `nothing to translate`.
+Every run lists the subtitle tracks it found before doing anything else:
+
+```
+$ sub-translator movie.mkv
+Probing movie.mkv...
+Subtitle tracks:
+  #2   lang=rus      Rus, SRT
+  #3   lang=eng      Eng, SRT
+Source language code (e.g. en, ru, es, fr): ru
+Target language code (e.g. en, ru, es, fr): en
+```
+
+Neither `-from` nor `-to` has a default — guessing the languages silently is worse than asking — so an omitted flag prompts on stderr. When stdin isn't interactive (a pipe, CI), the run errors out instead of hanging.
+
+The listing matters because plenty of releases ship subtitle tracks with **no language tag at all**:
+
+```
+Subtitle tracks:
+  #2   lang=(none)   (none)
+```
+
+Auto-detection by `-from` can't match those, so pick the track by its stream index:
+
+```bash
+sub-translator -from ru -to en -track 2 movie.mkv
+```
+
+`-track` takes the **absolute** ffprobe stream index shown in the listing, not the position among subtitle tracks. With `-track` set, `-from` no longer selects the track — it only tells the translator what language the text is in. If the file has no subtitle streams at all, the run exits with `nothing to translate`.
 
 ### Output naming
 

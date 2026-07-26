@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"flag"
 	"fmt"
 	"os"
@@ -30,8 +29,11 @@ Supported formats:
   MKV, MP4/M4V/MOV  — translated track embedded into output file
   AVI               — embedded subs not supported; -mode mux/both fall back to srt
 
+The subtitle tracks found in the input are always listed before anything else,
+so you can see which -track to pass when a track carries no language tag.
+
 Flags:
-  -from    source language code (default: en)
+  -from    source language code (required; prompted for if omitted)
   -to      target language code (required; prompted for if omitted)
   -track   subtitle stream index, -1 = auto-detect by -from lang (default: -1)
   -mode    output mode: srt, mux or both (default: srt)
@@ -46,7 +48,7 @@ Examples:
 `
 
 func main() {
-	from := flag.String("from", "en", "source language")
+	from := flag.String("from", "", "source language (required)")
 	to := flag.String("to", "", "target language (required)")
 	track := flag.Int("track", -1, "subtitle stream index (-1 = auto)")
 	modeFlag := flag.String("mode", "srt", "output mode: srt, mux or both")
@@ -74,10 +76,6 @@ func main() {
 		fatalf("input file not found: %s", input)
 	}
 
-	if *to = strings.TrimSpace(*to); *to == "" {
-		*to = promptTargetLang()
-	}
-
 	// Detect subtitle track
 	fmt.Printf("Probing %s...\n", filepath.Base(input))
 	streams, err := media.Probe(input)
@@ -88,6 +86,17 @@ func main() {
 	subs := media.SubtitleStreams(streams)
 	if len(subs) == 0 {
 		fatalf("no subtitle tracks in %s — nothing to translate", filepath.Base(input))
+	}
+
+	// Always show what's in the file: many releases ship untagged tracks, and
+	// the listing is what tells you which -track to pass.
+	fmt.Print(formatTracks(subs))
+
+	if *from = strings.TrimSpace(*from); *from == "" {
+		*from = promptLang("Source")
+	}
+	if *to = strings.TrimSpace(*to); *to == "" {
+		*to = promptLang("Target")
 	}
 
 	var srcStream media.Stream
@@ -107,11 +116,7 @@ func main() {
 		var ok bool
 		srcStream, ok = media.FindSubtitleByLang(subs, *from)
 		if !ok {
-			fmt.Fprintf(os.Stderr, "available subtitle tracks:\n")
-			for _, s := range subs {
-				fmt.Fprintf(os.Stderr, "  #%d  lang=%-6s  %s\n", s.Index, s.Tags.Language, s.Tags.Title)
-			}
-			fatalf("no subtitle track found for lang=%s (use -track to specify)", *from)
+			fatalf("no subtitle track tagged lang=%s — pick one from the list above with -track", *from)
 		}
 	}
 	fmt.Printf("Source: #%d  lang=%s  %q\n", srcStream.Index, srcStream.Tags.Language, srcStream.Tags.Title)
@@ -203,24 +208,6 @@ func main() {
 		fatalf("mux: %v", err)
 	}
 	fmt.Printf("Done: %s\n", outMKV)
-}
-
-// promptTargetLang asks for the target language on stdin. -to has no default:
-// silently translating to some arbitrary language is worse than asking.
-func promptTargetLang() string {
-	reader := bufio.NewReader(os.Stdin)
-	for {
-		fmt.Print("Target language code (e.g. es, fr, de, ja): ")
-		line, err := reader.ReadString('\n')
-		if lang := strings.TrimSpace(line); lang != "" {
-			return lang
-		}
-		if err != nil {
-			// Non-interactive stdin (pipe, CI) — nothing left to read.
-			fmt.Println()
-			fatalf("-to is required: no target language given")
-		}
-	}
 }
 
 func fatalf(format string, args ...any) {
