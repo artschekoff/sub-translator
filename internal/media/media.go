@@ -132,6 +132,11 @@ func muxArgs(input, srtPath, lang, title, output, subCodec string, subCount int)
 	// "the Nth subtitle stream" is itself "s:N" — hence the doubled s:s:.
 	meta := fmt.Sprintf("-metadata:s:s:%d", subCount)
 
+	// Matroska's Language element is ISO 639-2, so a 2-letter -to code has to be
+	// widened: a track tagged "es" is invisible to language selectors expecting
+	// "spa", and players report it as an unidentified language.
+	lang = normLang(lang)
+
 	return []string{
 		"-y",
 		"-i", input,

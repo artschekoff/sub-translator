@@ -33,6 +33,26 @@ func TestMuxArgsSubtitleIndexFollowsSubCount(t *testing.T) {
 	}
 }
 
+// Matroska's Language element is ISO 639-2 (3 letters). A 2-letter code is
+// invalid there: ffmpeg's own -map 0:m:language:spa selector cannot find such a
+// track, and players show it as an unidentified language.
+func TestMuxArgsNormalizesLanguageToISO6392(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"es", "language=spa"},
+		{"fr", "language=fra"},
+		{"ja", "language=jpn"},
+		{"spa", "language=spa"}, // already 3-letter, left alone
+		{"ES", "language=spa"},  // case-insensitive
+	}
+
+	for _, tt := range tests {
+		args := muxArgs("in.mkv", "dst.srt", tt.in, "Spanish", "out.mkv", "copy", 2)
+		if !slices.Contains(args, tt.want) {
+			t.Errorf("muxArgs(lang=%q): want %q\ngot: %v", tt.in, tt.want, args)
+		}
+	}
+}
+
 func TestMuxArgsCarriesSubCodecAndOutput(t *testing.T) {
 	args := muxArgs("in.mp4", "dst.srt", "fra", "French", "out.mp4", "mov_text", 0)
 
