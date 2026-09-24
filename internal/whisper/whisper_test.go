@@ -254,3 +254,59 @@ exit 1
 		t.Fatal("Run() hung for 30 seconds; scanner error was not handled and deadlocked on stderr pipe")
 	}
 }
+
+// TestRunEndToEndWithStubBinary exercises the one seam no other test reaches:
+// every other Run test stops at a failure branch, so nothing pins the contract
+// between the extension-less path handed to -of and the OutBase + ".srt" that
+// Run then reads back, nor that progress is reported, nor that the language
+// from the JSON sidecar reaches Result. The spec asks for an end-to-end run
+// gated on the real binary, but the binary is only a producer of those three
+// artefacts — a stub that produces them the same way tests the same seam and
+// keeps CI green on machines without whisper.cpp.
+func TestRunEndToEndWithStubBinary(t *testing.T) {
+	dir := t.TempDir()
+	stub := filepath.Join(dir, "stub-whisper")
+
+	// $OUTBASE is read out of the argument list exactly as whisper-cli reads
+	// -of: the test would not catch an extension slipping into it otherwise.
+	script := `#!/bin/sh
+outbase=""
+while [ $# -gt 0 ]; do
+  if [ "$1" = "-of" ]; then outbase="$2"; fi
+  shift
+done
+echo "whisper_print_progress_callback: progress =  25%" >&2
+echo "whisper_print_progress_callback: progress = 100%" >&2
+printf '1\n00:00:00,000 --> 00:00:02,000\nhello there\n\n' > "$outbase.srt"
+printf '{"result":{"language":"en"}}' > "$outbase.json"
+exit 0
+`
+	if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	outBase := filepath.Join(dir, "transcript")
+	var pcts []int
+	res, err := Run(Options{
+		Bin:     stub,
+		Model:   filepath.Join(dir, "ggml-test.bin"),
+		Audio:   filepath.Join(dir, "audio.wav"),
+		OutBase: outBase,
+	}, func(pct int) { pcts = append(pcts, pct) })
+	if err != nil {
+		t.Fatalf("Run() = %v, want success", err)
+	}
+
+	if !slices.Equal(pcts, []int{25, 100}) {
+		t.Errorf("progress callback saw %v, want [25 100]", pcts)
+	}
+	if res.SRTPath != outBase+".srt" {
+		t.Errorf("SRTPath = %q, want %q", res.SRTPath, outBase+".srt")
+	}
+	if _, err := os.Stat(res.SRTPath); err != nil {
+		t.Errorf("SRTPath does not exist: %v", err)
+	}
+	if res.Language != "en" {
+		t.Errorf("Language = %q, want en (from the JSON sidecar)", res.Language)
+	}
+}
