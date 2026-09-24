@@ -64,3 +64,90 @@ func TestMuxArgsCarriesSubCodecAndOutput(t *testing.T) {
 		t.Errorf("output must be the last arg, got %q", args[len(args)-1])
 	}
 }
+
+func audioFixture() []Stream {
+	mk := func(idx int, codecType, lang string) Stream {
+		s := Stream{Index: idx, CodecType: codecType}
+		s.Tags.Language = lang
+		return s
+	}
+	return []Stream{
+		mk(0, "video", ""),
+		mk(1, "audio", "eng"),
+		mk(2, "audio", "rus"),
+		mk(3, "subtitle", "eng"),
+	}
+}
+
+func TestAudioStreamsSelectsOnlyAudio(t *testing.T) {
+	got := AudioStreams(audioFixture())
+	if len(got) != 2 {
+		t.Fatalf("got %d audio streams, want 2: %v", len(got), got)
+	}
+	for _, s := range got {
+		if s.CodecType != "audio" {
+			t.Errorf("stream #%d is %q, not audio", s.Index, s.CodecType)
+		}
+	}
+}
+
+// Audio tracks are tagged with ISO 639-2 in containers just as subtitles are,
+// so a 2-letter -from code has to match a 3-letter tag.
+func TestFindAudioByLangNormalizesCodes(t *testing.T) {
+	tests := []struct {
+		lang      string
+		wantIndex int
+		wantOK    bool
+	}{
+		{"en", 1, true},
+		{"eng", 1, true},
+		{"ru", 2, true},
+		{"RU", 2, true},
+		{"fr", 0, false},
+	}
+	for _, tt := range tests {
+		got, ok := FindAudioByLang(audioFixture(), tt.lang)
+		if ok != tt.wantOK {
+			t.Errorf("FindAudioByLang(%q) ok = %v, want %v", tt.lang, ok, tt.wantOK)
+			continue
+		}
+		if ok && got.Index != tt.wantIndex {
+			t.Errorf("FindAudioByLang(%q) = #%d, want #%d", tt.lang, got.Index, tt.wantIndex)
+		}
+	}
+}
+
+// A subtitle track tagged eng must never be returned as an audio track.
+func TestFindAudioByLangIgnoresNonAudioStreams(t *testing.T) {
+	got, ok := FindAudioByLang(audioFixture(), "en")
+	if !ok {
+		t.Fatal("want a match")
+	}
+	if got.CodecType != "audio" {
+		t.Errorf("returned a %q stream", got.CodecType)
+	}
+}
+
+// whisper.cpp's bundled decoder reads 16 kHz mono signed-16-bit PCM WAV and
+// nothing else. Any deviation here produces "read_wav: unsupported format".
+func TestExtractAudioArgsProduceWhisperReadyWAV(t *testing.T) {
+	args := extractAudioArgs("in.mkv", 2, "out.wav")
+
+	for _, pair := range [][2]string{
+		{"-map", "0:2"},
+		{"-ac", "1"},
+		{"-ar", "16000"},
+		{"-c:a", "pcm_s16le"},
+	} {
+		i := slices.Index(args, pair[0])
+		if i < 0 || i+1 >= len(args) || args[i+1] != pair[1] {
+			t.Errorf("want %s %s\ngot: %v", pair[0], pair[1], args)
+		}
+	}
+	if !slices.Contains(args, "-vn") {
+		t.Errorf("want -vn to drop the video stream\ngot: %v", args)
+	}
+	if args[len(args)-1] != "out.wav" {
+		t.Errorf("output must be the last arg, got %q", args[len(args)-1])
+	}
+}

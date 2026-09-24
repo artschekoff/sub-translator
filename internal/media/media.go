@@ -67,14 +67,20 @@ func normLang(lang string) string {
 	return l
 }
 
-func FindSubtitleByLang(streams []Stream, lang string) (Stream, bool) {
+// findByLang returns the first stream of the given codec type whose language
+// tag matches lang once both are normalised to ISO 639-2.
+func findByLang(streams []Stream, lang, codecType string) (Stream, bool) {
 	norm := normLang(lang)
 	for _, s := range streams {
-		if s.CodecType == "subtitle" && normLang(s.Tags.Language) == norm {
+		if s.CodecType == codecType && normLang(s.Tags.Language) == norm {
 			return s, true
 		}
 	}
 	return Stream{}, false
+}
+
+func FindSubtitleByLang(streams []Stream, lang string) (Stream, bool) {
+	return findByLang(streams, lang, "subtitle")
 }
 
 func ExtractSubtitle(input string, streamIndex int, outSRT string) error {
@@ -85,6 +91,42 @@ func ExtractSubtitle(input string, streamIndex int, outSRT string) error {
 	)
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+func AudioStreams(streams []Stream) []Stream {
+	var out []Stream
+	for _, s := range streams {
+		if s.CodecType == "audio" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func FindAudioByLang(streams []Stream, lang string) (Stream, bool) {
+	return findByLang(streams, lang, "audio")
+}
+
+// ExtractAudio decodes one audio stream to the only format whisper.cpp's
+// bundled WAV reader accepts: 16 kHz mono signed 16-bit PCM. Whisper resamples
+// to exactly this internally, so nothing is lost by doing it here.
+func ExtractAudio(input string, streamIndex int, outWAV string) error {
+	cmd := exec.Command("ffmpeg", extractAudioArgs(input, streamIndex, outWAV)...)
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func extractAudioArgs(input string, streamIndex int, outWAV string) []string {
+	return []string{
+		"-y",
+		"-i", input,
+		"-map", fmt.Sprintf("0:%d", streamIndex),
+		"-vn",
+		"-ac", "1",
+		"-ar", "16000",
+		"-c:a", "pcm_s16le",
+		outWAV,
+	}
 }
 
 // ContainerSupportsEmbeddedSubs returns false for containers that can't embed subtitle tracks.
