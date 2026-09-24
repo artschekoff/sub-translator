@@ -318,7 +318,7 @@ func resolveWhisper(c *config.Config, modelFlag, binFlag, vadFlag string) (whisp
 	}
 
 	dirs := models.SearchDirs(c.Models.Dir)
-	found, vads := models.Discover(dirs)
+	found, _ := models.Discover(dirs)
 
 	model := firstNonEmpty(modelFlag, c.Whisper.Model)
 	switch {
@@ -342,12 +342,13 @@ func resolveWhisper(c *config.Config, modelFlag, binFlag, vadFlag string) (whisp
 				"or set it: sub-translator config set whisper.model <path>")
 	}
 
-	// VAD is optional: whisper works without it, but on a feature film it keeps
-	// the decoder from looping over long silences.
+	// VAD is off unless explicitly asked for: measured against this same
+	// model, it merges speech into long (10-20s) unpunctuated chunks and
+	// measurably worsens transcription accuracy, which makes worse
+	// subtitles, not better ones. It stays available via -vad-model or
+	// config for material with long silent stretches where whisper's
+	// decoder can otherwise loop.
 	vad := firstNonEmpty(vadFlag, c.Whisper.VADModel)
-	if vad == "" && len(vads) > 0 {
-		vad = vads[0]
-	}
 
 	return whisper.Options{
 		Bin:          bin,

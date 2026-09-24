@@ -224,10 +224,14 @@ The source language is detected automatically, so `-from` is optional here. Pass
 
 The untranslated transcript is saved next to the video as `<video>.<lang>.srt`, so a second translation into another language does not re-run transcription.
 
-**Voice activity detection** is enabled automatically when a Silero VAD model is present. It stops whisper looping over long silent passages, which matters on feature-length input:
+**Voice activity detection** is off by default. It skips silence and can prevent whisper's decoder from looping on long quiet stretches, but measured against the same model it merges speech into longer, less punctuated subtitle blocks — so it is worth turning on only if you actually hit the looping problem, not as a general-purpose default. Enable it by pointing at a model explicitly, either for one run or persistently:
 
 ```bash
 sub-translator model pull silero-vad
+
+sub-translator -to es -source audio -vad-model ~/models/ggml-silero-v5.1.2.bin movie.mkv
+# or persistently:
+sub-translator config set whisper.vad-model ~/models/ggml-silero-v5.1.2.bin
 ```
 
 ## Configuration
@@ -246,7 +250,7 @@ sub-translator config path
 |---|---|
 | `whisper.bin` | Path to `whisper-cli`. Found on `$PATH` when unset. |
 | `whisper.model` | Path to a ggml transcription model. Discovered when unset. |
-| `whisper.vad-model` | Path to a Silero VAD model. Discovered when unset. |
+| `whisper.vad-model` | Path to a Silero VAD model. Off unless set here or with `-vad-model`. |
 | `whisper.vad-threshold` | Speech detection threshold, 0–1. whisper's default when unset. |
 | `whisper.threads` | Threads for transcription. whisper chooses when unset. |
 | `whisper.language` | Default source language. `auto` when unset. |
