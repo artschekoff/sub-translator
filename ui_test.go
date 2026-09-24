@@ -102,3 +102,50 @@ func TestReadLangTwiceFromOneReader(t *testing.T) {
 		t.Errorf("got (%q, %q), want (ru, en)", first, second)
 	}
 }
+
+func TestReadConfirmAcceptsYesForms(t *testing.T) {
+	for _, in := range []string{"y\n", "Y\n", "yes\n", "  yes  \n"} {
+		var out strings.Builder
+		got, err := readConfirm(bufio.NewReader(strings.NewReader(in)), &out, "Transcribe?")
+		if err != nil {
+			t.Errorf("readConfirm(%q): %v", in, err)
+			continue
+		}
+		if !got {
+			t.Errorf("readConfirm(%q) = false, want true", in)
+		}
+	}
+}
+
+// Anything that is not an explicit yes means no. Transcription is expensive and
+// must not start on a stray keypress.
+func TestReadConfirmTreatsEverythingElseAsNo(t *testing.T) {
+	for _, in := range []string{"n\n", "no\n", "\n", "maybe\n"} {
+		var out strings.Builder
+		got, err := readConfirm(bufio.NewReader(strings.NewReader(in)), &out, "Transcribe?")
+		if err != nil {
+			t.Errorf("readConfirm(%q): %v", in, err)
+			continue
+		}
+		if got {
+			t.Errorf("readConfirm(%q) = true, want false", in)
+		}
+	}
+}
+
+func TestReadConfirmShowsTheQuestion(t *testing.T) {
+	var out strings.Builder
+	if _, err := readConfirm(bufio.NewReader(strings.NewReader("y\n")), &out, "Transcribe?"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "Transcribe?") {
+		t.Errorf("prompt %q does not contain the question", out.String())
+	}
+}
+
+func TestReadConfirmErrorsOnExhaustedInput(t *testing.T) {
+	var out strings.Builder
+	if _, err := readConfirm(bufio.NewReader(strings.NewReader("")), &out, "Transcribe?"); err == nil {
+		t.Error("want an error when there is no answer to read")
+	}
+}
