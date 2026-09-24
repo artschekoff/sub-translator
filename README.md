@@ -13,7 +13,7 @@
 
 Extracts the subtitle track from a video file, translates it, and muxes the new track back in — no API keys, no accounts, no re-encoding.
 
-[The Problem](#the-problem) · [Installation](#installation) · [Usage](#usage) · [How It Works](#how-it-works) · [Development](#development)
+[The Problem](#the-problem) · [Installation](#installation) · [Usage](#usage) · [Transcription](#transcription) · [Configuration](#configuration) · [How It Works](#how-it-works) · [Development](#development)
 
 </div>
 
@@ -31,6 +31,7 @@ You have a video with subtitles in a language you don't read. Getting it into a 
 | **Slow, one-line-at-a-time translation.** Naive tools fire one request per subtitle block: thousands of round-trips for a feature film. | Batches ~40 blocks per request, with automatic per-block retry so one bad block can't poison the batch. |
 | **Re-muxing loses quality.** Re-encoding to add a subtitle track costs an hour of CPU and a generation of video quality. | Stream-copies everything. Video and audio are untouched; only a new subtitle track is added. Takes seconds. |
 | **AVI can't hold subtitles.** So the tool errors out and you're left with nothing. | Detects the container limitation and writes an external `.srt` next to the video instead — which is also what the default mode does for every container. |
+| **No subtitles at all.** A rip with a single audio track and no subtitle stream leaves subtitle tools with nothing to work on. | Transcribes the audio with whisper.cpp, then translates the transcript — the same one command. |
 
 The result is one command, a few seconds of waiting, and a file that plays with translated subs in any player.
 
@@ -45,6 +46,9 @@ The result is one command, a few seconds of waiting, and a file that plays with 
 - **Zero API keys** — no account, no credentials, no rate-limit dashboard
 - **Lossless** — stream copy only; your video and audio bits are never re-encoded
 - **Progress output** — live `%` counter so you know it's working
+- **Audio transcription** — no subtitle track? whisper.cpp transcribes the audio and the transcript is translated like any other subtitle file
+- **Shared model store** — reuses `ggml-*.bin` models other whisper.cpp front-ends already downloaded, so a 1.6 GB model is never fetched twice
+- **Remembered settings** — binary and model paths are configured once with `sub-translator config set`
 
 ## Supported Formats
 
@@ -97,12 +101,17 @@ sub-translator [flags] <input>
 
 ```
 Flags:
-  -from    source language code  (required — prompted for if omitted)
-  -to      target language code  (required — prompted for if omitted)
-  -track   subtitle stream index, -1 = auto-detect (default: -1)
-  -mode    output mode: srt, mux or both  (default: srt)
-  -out     output path (.srt in srt mode, container otherwise)
-  -version print version and exit
+  -from          source language code (prompted for if omitted; detected in audio mode)
+  -to            target language code (required; prompted for if omitted)
+  -source        subtitle source: sub, audio or auto (default: auto)
+  -track         subtitle stream index, -1 = auto-detect by -from lang (default: -1)
+  -atrack        audio stream index, -1 = auto (default: -1)
+  -mode          output mode: srt, mux or both (default: srt)
+  -out           output path (.srt in srt mode, container otherwise)
+  -whisper-model path to a whisper ggml model
+  -whisper-bin   path to the whisper-cli binary
+  -vad-model     path to a Silero VAD model
+  -version       print version and exit
 ```
 
 ### Output modes
@@ -167,7 +176,7 @@ Auto-detection by `-from` can't match those, so pick the track by its stream ind
 sub-translator -from ru -to en -track 2 movie.mkv
 ```
 
-`-track` takes the **absolute** ffprobe stream index shown in the listing, not the position among subtitle tracks. With `-track` set, `-from` no longer selects the track — it only tells the translator what language the text is in. If the file has no subtitle streams at all, the run exits with `nothing to translate`.
+`-track` takes the **absolute** ffprobe stream index shown in the listing, not the position among subtitle tracks. With `-track` set, `-from` no longer selects the track — it only tells the translator what language the text is in. If the file has no subtitle streams at all, `-source sub` exits with `nothing to translate`; the default `-source auto` instead offers to transcribe the audio — see [Transcription](#transcription).
 
 ### Output naming
 
@@ -178,6 +187,76 @@ sub-translator -from ru -to en -track 2 movie.mkv
 | `movie.mkv` | `-mode both` | `movie.ES.mkv` + `movie.es.srt` |
 | `movie.mp4` | `-to fr -mode mux` | `movie.FR.mp4` |
 | `movie.avi` | `-mode mux` | `movie.es.srt` *(downgraded)* |
+
+## Transcription
+
+When a video has no subtitle track, `sub-translator` can generate one from the audio using [whisper.cpp](https://github.com/ggml-org/whisper.cpp).
+
+**Prerequisites:**
+
+```bash
+brew install whisper.cpp              # provides the whisper-cli binary
+sub-translator model pull large-v3-turbo
+```
+
+`model pull` downloads to `~/Library/Application Support/sub-translator/models` (macOS) or `~/.local/share/sub-translator/models` (Linux). If another whisper.cpp front-end has already downloaded a model, it is found and reused — the files use the same `ggml-<name>.bin` format and these locations are searched:
+
+1. `models.dir` from the config, when set
+2. `sub-translator`'s own install directory (the platform default above)
+3. `~/Library/Application Support/net.slaive.app/models` (macOS)
+4. `~/.cache/whisper.cpp`
+5. `./models`
+
+**Usage:**
+
+```bash
+# auto: uses the subtitle track if there is one, otherwise offers to transcribe
+sub-translator -to es movie.mkv
+
+# force transcription even when subtitle tracks exist
+sub-translator -to es -source audio movie.mkv
+
+# pick a specific audio track and skip language detection
+sub-translator -to es -source audio -atrack 1 -from en movie.mkv
+```
+
+The source language is detected automatically, so `-from` is optional here. Passing it is faster and more reliable when you already know it.
+
+The untranslated transcript is saved next to the video as `<video>.<lang>.srt`, so you can read it, fix a mis-heard name in it, or feed it somewhere else by hand — transcription is the expensive step and its output is worth keeping.
+
+**Voice activity detection** is off by default. It skips silence and can prevent whisper's decoder from looping on long quiet stretches, but measured against the same model it merges speech into longer, less punctuated subtitle blocks — so it is worth turning on only if you actually hit the looping problem, not as a general-purpose default. The symptom is unmistakable: the progress counter stalls, the run takes far longer than the audio it is transcribing, and the same line repeats over and over in the output. Enable it by pointing at a model explicitly, either for one run or persistently:
+
+```bash
+sub-translator model pull silero-vad
+
+sub-translator -to es -source audio -vad-model ~/models/ggml-silero-v5.1.2.bin movie.mkv
+# or persistently:
+sub-translator config set whisper.vad-model ~/models/ggml-silero-v5.1.2.bin
+```
+
+## Configuration
+
+Settings live in `~/.config/sub-translator/config.json` and are managed from the command line:
+
+```bash
+sub-translator config list
+sub-translator config set whisper.model ~/models/ggml-large-v3-turbo.bin
+sub-translator config set whisper.bin /opt/homebrew/bin/whisper-cli
+sub-translator config get whisper.model
+sub-translator config path
+```
+
+| Key | Meaning |
+|---|---|
+| `whisper.bin` | Path to `whisper-cli`. Found on `$PATH` when unset. |
+| `whisper.model` | Path to a ggml transcription model. Discovered when unset. |
+| `whisper.vad-model` | Path to a Silero VAD model. Off unless set here or with `-vad-model`. |
+| `whisper.vad-threshold` | Speech detection threshold, 0–1. whisper's default when unset. |
+| `whisper.threads` | Threads for transcription. whisper chooses when unset. |
+| `whisper.language` | Default source language. `auto` when unset. |
+| `models.dir` | Where `model pull` writes, and the first directory searched. |
+
+The corresponding flags — `-whisper-model`, `-whisper-bin`, `-vad-model` — override the config for a single run.
 
 ## Languages
 
@@ -212,9 +291,17 @@ Timing lines (`00:00:00,000 --> 00:00:00,000`) are copied verbatim — translati
 
 ```
 main.go               flag parsing + pipeline orchestration
+source.go             subtitle source (sub / audio / auto) parsing and resolution
+mode.go               output mode (srt / mux / both) parsing and container fallback
+ui.go                 track listing, language and confirmation prompts
+cmd_config.go         `config list|get|set|path` subcommand
+cmd_model.go          `model list|pull` subcommand
 internal/media/       ffprobe / ffmpeg wrappers: probe, extract, mux, path naming
 internal/srt/         SRT parse, rebuild, write
 internal/translate/   batched Google Translate client
+internal/whisper/     whisper.cpp CLI wrapper: binary lookup, flags, progress
+internal/config/      ~/.config/sub-translator/config.json read, write, get, set
+internal/models/      ggml model catalog, search directories, discovery, download
 ```
 
 ## Development

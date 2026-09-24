@@ -60,3 +60,28 @@ func promptLang(label string) string {
 	}
 	return lang
 }
+
+// readConfirm asks a yes/no question and reads the answer from r. Only an
+// explicit yes counts: the caller uses this to guard work measured in minutes
+// of full-load CPU, where the safe default is to do nothing.
+func readConfirm(r *bufio.Reader, w io.Writer, question string) (bool, error) {
+	fmt.Fprintf(w, "%s [y/N]: ", question)
+	line, err := r.ReadString('\n')
+	answer := strings.ToLower(strings.TrimSpace(line))
+	if answer == "" && err != nil {
+		fmt.Fprintln(w)
+		return false, fmt.Errorf("no answer given")
+	}
+	return answer == "y" || answer == "yes", nil
+}
+
+// stdinIsTerminal reports whether there is a human to answer a prompt. When
+// stdin is a pipe or /dev/null, asking a question would block or silently read
+// EOF, so callers must decide without one.
+func stdinIsTerminal() bool {
+	fi, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
