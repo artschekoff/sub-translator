@@ -219,18 +219,27 @@ func main() {
 		if err != nil {
 			fatalf("%v", err)
 		}
-		if *from == "" {
-			*from = lang
+		// The language whisper actually worked in wins over the one that was
+		// asked for: transcribe drops -from when no audio track carries that
+		// tag, and translating from a language the transcript is not in would
+		// be worse than useless.
+		if lang != "" && lang != *from {
 			fmt.Printf("Detected language: %s\n", lang)
+			*from = lang
 		}
 
 		// Transcription is by far the most expensive step here; keeping its
-		// output costs one small file and saves repeating it.
+		// output costs one small file. A media library on a NAS share, an SMB
+		// mount or a read-only drive makes this write fail routinely, and
+		// throwing away up to an hour of CPU over a sidecar file would be
+		// indefensible — so it warns and carries on to the translation the
+		// user actually asked for.
 		transcriptPath := media.DefaultSRTPath(input, *from)
 		if err := srt.Write(transcriptPath, blocks); err != nil {
-			fatalf("write transcript: %v", err)
+			fmt.Fprintf(os.Stderr, "warning: could not save transcript to %s: %v\n", transcriptPath, err)
+		} else {
+			fmt.Printf("Saved transcript: %s\n", transcriptPath)
 		}
-		fmt.Printf("Saved transcript: %s\n", transcriptPath)
 	} else {
 		var srcStream media.Stream
 		if *track >= 0 {
@@ -424,6 +433,9 @@ func transcribe(input, tmpDir string, streams []media.Stream, atrack int, from s
 	}
 
 	var src media.Stream
+	// detect records that a requested language had to be abandoned, so the
+	// choice to let whisper detect one survives down to the options below.
+	detect := false
 	switch {
 	case atrack >= 0:
 		found := false
@@ -440,7 +452,14 @@ func transcribe(input, tmpDir string, streams []media.Stream, atrack int, from s
 		if s, ok := media.FindAudioByLang(audio, from); ok {
 			src = s
 		} else {
+			// Falling back to the first track is right — untagged audio is
+			// common — but forcing -l <from> onto it is not: whisper given the
+			// wrong language emits fluent nonsense in that language, which is
+			// then translated and written out as a finished subtitle file.
 			src = audio[0]
+			fmt.Fprintf(os.Stderr, "warning: no audio track tagged lang=%s; using #%d and letting whisper detect the language\n", from, src.Index)
+			from = ""
+			detect = true
 		}
 	default:
 		src = audio[0]
@@ -455,8 +474,13 @@ func transcribe(input, tmpDir string, streams []media.Stream, atrack int, from s
 
 	opts.Audio = wav
 	opts.OutBase = filepath.Join(tmpDir, "transcript")
-	if from != "" {
+	switch {
+	case from != "":
 		opts.Language = from
+	case detect:
+		// The requested language was dropped above; a language left over from
+		// config would be just as wrong for this track, so whisper decides.
+		opts.Language = ""
 	}
 
 	fmt.Printf("Transcribing with %s...\n", filepath.Base(opts.Model))
