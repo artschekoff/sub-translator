@@ -169,14 +169,32 @@ func main() {
 	if err != nil {
 		fatalf("%v", err)
 	}
+
+	// Whisper is resolved before anything is asked of the user: a missing
+	// binary or model is a prerequisite failure, and making someone answer a
+	// scary confirmation and type a language code first only to be told
+	// whisper-cli is not installed wastes their time.
+	var whisperOpts whisper.Options
+	if source == sourceAudio {
+		cfg, err := config.Load()
+		if err != nil {
+			fatalf("%v", err)
+		}
+		whisperOpts, err = resolveWhisper(cfg, *whisperModel, *whisperBin, *vadModel)
+		if err != nil {
+			fatalf("%v", err)
+		}
+	}
+
 	if needsConfirm {
 		fmt.Printf("No subtitle tracks in %s.\n", filepath.Base(input))
 		// stdinIsTerminal cannot tell a real terminal from /dev/null, because
 		// /dev/null is itself a character device, so the terminal check can
 		// report interactive when nobody is there to answer. The actionable
 		// message here must not depend on that guess being right.
-		ok, err := readConfirm(stdin, os.Stderr,
-			"Transcribe the audio track with whisper? This can take a while")
+		ok, err := readConfirm(stdin, os.Stderr, fmt.Sprintf(
+			"Transcribe the audio track with %s? This can take a while",
+			filepath.Base(whisperOpts.Model)))
 		if err != nil {
 			fatalf("no subtitle tracks, and the transcription prompt got no answer; " +
 				"pass -source audio to transcribe the audio track")
@@ -205,35 +223,25 @@ func main() {
 	var blocks []srt.Block
 
 	if source == sourceAudio {
-		cfg, err := config.Load()
-		if err != nil {
-			fatalf("%v", err)
-		}
-		opts, err := resolveWhisper(cfg, *whisperModel, *whisperBin, *vadModel)
-		if err != nil {
-			fatalf("%v", err)
-		}
-
 		var lang string
-		blocks, lang, err = transcribe(input, runTmpDir, streams, *atrack, *from, opts)
+		blocks, lang, err = transcribe(input, runTmpDir, streams, *atrack, *from, whisperOpts)
 		if err != nil {
 			fatalf("%v", err)
 		}
 		// The language whisper actually worked in wins over the one that was
-		// asked for: transcribe drops -from when no audio track carries that
-		// tag, and translating from a language the transcript is not in would
-		// be worse than useless.
+		// asked for: transcribe drops -from when no track carries that tag, and
+		// translating from a language the transcript is not in would be worse
+		// than useless.
 		if lang != "" && lang != *from {
 			fmt.Printf("Detected language: %s\n", lang)
 			*from = lang
 		}
 
 		// Transcription is by far the most expensive step here; keeping its
-		// output costs one small file. A media library on a NAS share, an SMB
-		// mount or a read-only drive makes this write fail routinely, and
-		// throwing away up to an hour of CPU over a sidecar file would be
-		// indefensible — so it warns and carries on to the translation the
-		// user actually asked for.
+		// output costs one small file. A media library on a NAS share or a
+		// read-only mount makes this write fail routinely, and throwing away an
+		// hour of CPU over a sidecar file would be indefensible — so it warns
+		// and carries on to the translation the user actually asked for.
 		transcriptPath := media.DefaultSRTPath(input, *from)
 		if err := srt.Write(transcriptPath, blocks); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: could not save transcript to %s: %v\n", transcriptPath, err)
@@ -454,8 +462,8 @@ func transcribe(input, tmpDir string, streams []media.Stream, atrack int, from s
 		} else {
 			// Falling back to the first track is right — untagged audio is
 			// common — but forcing -l <from> onto it is not: whisper given the
-			// wrong language emits fluent nonsense in that language, which is
-			// then translated and written out as a finished subtitle file.
+			// wrong language emits fluent nonsense in that language, which then
+			// translates into a finished, confidently wrong subtitle file.
 			src = audio[0]
 			fmt.Fprintf(os.Stderr, "warning: no audio track tagged lang=%s; using #%d and letting whisper detect the language\n", from, src.Index)
 			from = ""
