@@ -186,8 +186,12 @@ func (c *Config) Save() error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+	dir := filepath.Dir(p)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create config dir: %w", err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return fmt.Errorf("fix config dir mode: %w", err)
 	}
 	data, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
@@ -196,6 +200,9 @@ func (c *Config) Save() error {
 	data = append(data, '\n')
 	if err := os.WriteFile(p, data, 0o600); err != nil {
 		return fmt.Errorf("write config: %w", err)
+	}
+	if err := os.Chmod(p, 0o600); err != nil {
+		return fmt.Errorf("fix config file mode: %w", err)
 	}
 	return nil
 }
