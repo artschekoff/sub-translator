@@ -132,9 +132,23 @@ func main() {
 	}
 	if needsConfirm {
 		fmt.Printf("No subtitle tracks in %s.\n", filepath.Base(input))
-		if !confirm("Transcribe the audio track with whisper? This can take a while") {
+		// stdinIsTerminal cannot tell a real terminal from /dev/null, because
+		// /dev/null is itself a character device, so the terminal check can
+		// report interactive when nobody is there to answer. The actionable
+		// message here must not depend on that guess being right.
+		ok, err := readConfirm(stdin, os.Stderr,
+			"Transcribe the audio track with whisper? This can take a while")
+		if err != nil {
+			fatalf("no subtitle tracks, and the transcription prompt got no answer; " +
+				"pass -source audio to transcribe the audio track")
+		}
+		if !ok {
 			fatalf("nothing to do")
 		}
+	}
+
+	if source == sourceSub && len(subs) == 0 {
+		fatalf("no subtitle tracks in %s — nothing to translate", filepath.Base(input))
 	}
 
 	*from = strings.TrimSpace(*from)
@@ -179,10 +193,6 @@ func main() {
 		}
 		fmt.Printf("Saved transcript: %s\n", transcriptPath)
 	} else {
-		if len(subs) == 0 {
-			fatalf("no subtitle tracks in %s — nothing to translate", filepath.Base(input))
-		}
-
 		var srcStream media.Stream
 		if *track >= 0 {
 			found := false
