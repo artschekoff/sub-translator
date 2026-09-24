@@ -48,6 +48,13 @@ Examples:
 `
 
 func main() {
+	if handled, err := dispatchSubcommand(os.Args[1:], os.Stdout); handled {
+		if err != nil {
+			fatalf("%v", err)
+		}
+		return
+	}
+
 	from := flag.String("from", "", "source language (required)")
 	to := flag.String("to", "", "target language (required)")
 	track := flag.Int("track", -1, "subtitle stream index (-1 = auto)")
