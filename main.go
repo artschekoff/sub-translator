@@ -5,8 +5,10 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/artschekoff/sub-translator/internal/config"
 	"github.com/artschekoff/sub-translator/internal/media"
@@ -18,6 +20,40 @@ import (
 
 // version is injected at build time via -ldflags "-X main.version=..."
 var version = "dev"
+
+// runTmpDir is the one scratch directory a run owns: the extracted WAV, the
+// whisper output and the intermediate SRTs all live inside it. It is a package
+// variable because the two ways this program ends without unwinding the stack —
+// fatalf's os.Exit and a SIGINT — both have to be able to remove it, and a
+// feature film's 16 kHz WAV is well over a gigabyte to leave behind.
+var runTmpDir string
+
+// setupRunTmpDir creates the run-scoped scratch directory and arms the signal
+// handler that removes it. Go's default SIGINT disposition terminates the
+// process outright, so a deferred cleanup never runs when a user aborts a
+// twenty-minute transcription with Ctrl-C.
+func setupRunTmpDir() {
+	dir, err := os.MkdirTemp("", "sub-translator-*")
+	if err != nil {
+		fatalf("create temp dir: %v", err)
+	}
+	runTmpDir = dir
+
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigs
+		cleanupRunTmpDir()
+		// 128 + SIGINT: the shell convention for "terminated by a signal".
+		os.Exit(130)
+	}()
+}
+
+func cleanupRunTmpDir() {
+	if runTmpDir != "" {
+		os.RemoveAll(runTmpDir)
+	}
+}
 
 const usage = `sub-translator — subtitle translator for MKV, MP4, AVI and more
 
@@ -112,6 +148,9 @@ func main() {
 		fatalf("input file not found: %s", input)
 	}
 
+	setupRunTmpDir()
+	defer cleanupRunTmpDir()
+
 	// Detect subtitle track
 	fmt.Printf("Probing %s...\n", filepath.Base(input))
 	streams, err := media.Probe(input)
@@ -176,7 +215,7 @@ func main() {
 		}
 
 		var lang string
-		blocks, lang, err = transcribe(input, streams, *atrack, *from, opts)
+		blocks, lang, err = transcribe(input, runTmpDir, streams, *atrack, *from, opts)
 		if err != nil {
 			fatalf("%v", err)
 		}
@@ -215,8 +254,7 @@ func main() {
 		}
 		fmt.Printf("Source: #%d  lang=%s  %q\n", srcStream.Index, srcStream.Tags.Language, srcStream.Tags.Title)
 
-		tmpSRT := filepath.Join(os.TempDir(), "sub_translator_src.srt")
-		defer os.Remove(tmpSRT)
+		tmpSRT := filepath.Join(runTmpDir, "source.srt")
 		fmt.Printf("Extracting subtitle track #%d...\n", srcStream.Index)
 		if err := media.ExtractSubtitle(input, srcStream.Index, tmpSRT); err != nil {
 			fatalf("extract: %v", err)
@@ -257,8 +295,10 @@ func main() {
 		fmt.Println(note)
 	}
 
-	tmpTranslated := filepath.Join(os.TempDir(), "sub_translator_dst.srt")
-	defer os.Remove(tmpTranslated)
+	// Inside the run-scoped directory, not a fixed name in $TMPDIR: two runs on
+	// two different films would otherwise share the file, and a mux could pick
+	// up the other run's subtitles.
+	tmpTranslated := filepath.Join(runTmpDir, "translated.srt")
 
 	if mode.writesSRT() {
 		srtOut := media.DefaultSRTPath(input, *to)
@@ -305,6 +345,9 @@ func main() {
 
 func fatalf(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "error: "+format+"\n", args...)
+	// os.Exit skips deferred calls, so the scratch directory has to be removed
+	// here or every error path leaks it.
+	cleanupRunTmpDir()
 	os.Exit(1)
 }
 
@@ -370,10 +413,11 @@ func firstNonEmpty(values ...string) string {
 }
 
 // transcribe extracts one audio stream, runs whisper over it, and returns the
-// parsed transcript together with the language whisper used. Temporary files
-// live in a directory of their own: a feature film's 16 kHz WAV is over a
-// gigabyte and must not be left behind.
-func transcribe(input string, streams []media.Stream, atrack int, from string, opts whisper.Options) ([]srt.Block, string, error) {
+// parsed transcript together with the language whisper used. Its working files
+// go in tmpDir, the caller's run-scoped scratch directory, so that a single
+// owner removes them however the run ends: a feature film's 16 kHz WAV is over
+// a gigabyte and must not be left behind.
+func transcribe(input, tmpDir string, streams []media.Stream, atrack int, from string, opts whisper.Options) ([]srt.Block, string, error) {
 	audio := media.AudioStreams(streams)
 	if len(audio) == 0 {
 		return nil, "", fmt.Errorf("no audio tracks in %s — nothing to transcribe", filepath.Base(input))
@@ -402,12 +446,6 @@ func transcribe(input string, streams []media.Stream, atrack int, from string, o
 		src = audio[0]
 	}
 	fmt.Printf("Audio:  #%d  lang=%s  %q\n", src.Index, src.Tags.Language, src.Tags.Title)
-
-	tmpDir, err := os.MkdirTemp("", "sub-translator-*")
-	if err != nil {
-		return nil, "", fmt.Errorf("create temp dir: %w", err)
-	}
-	defer os.RemoveAll(tmpDir)
 
 	wav := filepath.Join(tmpDir, "audio.wav")
 	fmt.Printf("Extracting audio track #%d...\n", src.Index)
