@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -180,6 +181,65 @@ func TestPullWritesFileAndReportsProgress(t *testing.T) {
 	if lastTotal != int64(len("hello whisper")) || lastDone != lastTotal {
 		t.Errorf("progress ended at %d/%d, want %d/%d",
 			lastDone, lastTotal, lastTotal, lastTotal)
+	}
+}
+
+// TestPullConcurrentDownloadsProduceValidFile verifies that two downloads for
+// the same model can run concurrently without corrupting the result. A shared
+// temp name (like final + ".part") would let two writers interleave into one
+// inode at diverging offsets, producing a corrupt multi-gigabyte model that
+// Discover would happily hand to whisper. Using os.CreateTemp with a pattern
+// ensures each download gets its own temp file.
+func TestPullConcurrentDownloadsProduceValidFile(t *testing.T) {
+	dir := t.TempDir()
+	body := []byte("hello concurrent whisper")
+	srv := okServer(t, body)
+	m := Model{Name: "test", Filename: "ggml-test.bin", URL: srv, Kind: KindTranscribe}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	var path1, path2 string
+	var err1, err2 error
+
+	go func() {
+		defer wg.Done()
+		path1, err1 = Pull(m, dir, nil)
+	}()
+
+	go func() {
+		defer wg.Done()
+		path2, err2 = Pull(m, dir, nil)
+	}()
+
+	wg.Wait()
+
+	if err1 != nil {
+		t.Fatalf("first Pull: %v", err1)
+	}
+	if err2 != nil {
+		t.Fatalf("second Pull: %v", err2)
+	}
+
+	if path1 != path2 {
+		t.Errorf("paths differ: %q vs %q", path1, path2)
+	}
+
+	data, err := os.ReadFile(path1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(data, body) {
+		t.Errorf("file content mismatch: got %q, want %q", data, body)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".part") {
+			t.Errorf("found leftover .part file: %s", e.Name())
+		}
 	}
 }
 

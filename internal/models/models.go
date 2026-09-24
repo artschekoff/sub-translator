@@ -165,7 +165,6 @@ func Pull(m Model, destDir string, progress func(done, total int64)) (string, er
 		return "", fmt.Errorf("create %s: %w", destDir, err)
 	}
 	final := filepath.Join(destDir, m.Filename)
-	tmp := final + ".part"
 
 	resp, err := http.Get(m.URL)
 	if err != nil {
@@ -176,10 +175,11 @@ func Pull(m Model, destDir string, progress func(done, total int64)) (string, er
 		return "", fmt.Errorf("download %s: %s", m.Name, resp.Status)
 	}
 
-	f, err := os.Create(tmp)
+	f, err := os.CreateTemp(destDir, m.Filename+".*.part")
 	if err != nil {
-		return "", fmt.Errorf("create %s: %w", tmp, err)
+		return "", fmt.Errorf("create %s: %w", m.Filename+".part", err)
 	}
+	tmp := f.Name()
 	total := resp.ContentLength
 	written, err := io.Copy(f, &progressReader{r: resp.Body, total: total, report: progress})
 	closeErr := f.Close()
