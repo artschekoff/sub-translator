@@ -75,16 +75,6 @@ func readConfirm(r *bufio.Reader, w io.Writer, question string) (bool, error) {
 	return answer == "y" || answer == "yes", nil
 }
 
-// confirm is the interactive wrapper used by main: it reads from the shared
-// stdin and prompts on stderr so piped stdout stays clean.
-func confirm(question string) bool {
-	ok, err := readConfirm(stdin, os.Stderr, question)
-	if err != nil {
-		fatalf("%v", err)
-	}
-	return ok
-}
-
 // stdinIsTerminal reports whether there is a human to answer a prompt. When
 // stdin is a pipe or /dev/null, asking a question would block or silently read
 // EOF, so callers must decide without one.
