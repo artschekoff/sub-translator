@@ -176,7 +176,7 @@ Auto-detection by `-from` can't match those, so pick the track by its stream ind
 sub-translator -from ru -to en -track 2 movie.mkv
 ```
 
-`-track` takes the **absolute** ffprobe stream index shown in the listing, not the position among subtitle tracks. With `-track` set, `-from` no longer selects the track — it only tells the translator what language the text is in. If the file has no subtitle streams at all, the run exits with `nothing to translate`.
+`-track` takes the **absolute** ffprobe stream index shown in the listing, not the position among subtitle tracks. With `-track` set, `-from` no longer selects the track — it only tells the translator what language the text is in. If the file has no subtitle streams at all, `-source sub` exits with `nothing to translate`; the default `-source auto` instead offers to transcribe the audio — see [Transcription](#transcription).
 
 ### Output naming
 
@@ -222,9 +222,9 @@ sub-translator -to es -source audio -atrack 1 -from en movie.mkv
 
 The source language is detected automatically, so `-from` is optional here. Passing it is faster and more reliable when you already know it.
 
-The untranslated transcript is saved next to the video as `<video>.<lang>.srt`, so a second translation into another language does not re-run transcription.
+The untranslated transcript is saved next to the video as `<video>.<lang>.srt`, so you can read it, fix a mis-heard name in it, or feed it somewhere else by hand — transcription is the expensive step and its output is worth keeping.
 
-**Voice activity detection** is off by default. It skips silence and can prevent whisper's decoder from looping on long quiet stretches, but measured against the same model it merges speech into longer, less punctuated subtitle blocks — so it is worth turning on only if you actually hit the looping problem, not as a general-purpose default. Enable it by pointing at a model explicitly, either for one run or persistently:
+**Voice activity detection** is off by default. It skips silence and can prevent whisper's decoder from looping on long quiet stretches, but measured against the same model it merges speech into longer, less punctuated subtitle blocks — so it is worth turning on only if you actually hit the looping problem, not as a general-purpose default. The symptom is unmistakable: the progress counter stalls, the run takes far longer than the audio it is transcribing, and the same line repeats over and over in the output. Enable it by pointing at a model explicitly, either for one run or persistently:
 
 ```bash
 sub-translator model pull silero-vad
@@ -291,9 +291,17 @@ Timing lines (`00:00:00,000 --> 00:00:00,000`) are copied verbatim — translati
 
 ```
 main.go               flag parsing + pipeline orchestration
+source.go             subtitle source (sub / audio / auto) parsing and resolution
+mode.go               output mode (srt / mux / both) parsing and container fallback
+ui.go                 track listing, language and confirmation prompts
+cmd_config.go         `config list|get|set|path` subcommand
+cmd_model.go          `model list|pull` subcommand
 internal/media/       ffprobe / ffmpeg wrappers: probe, extract, mux, path naming
 internal/srt/         SRT parse, rebuild, write
 internal/translate/   batched Google Translate client
+internal/whisper/     whisper.cpp CLI wrapper: binary lookup, flags, progress
+internal/config/      ~/.config/sub-translator/config.json read, write, get, set
+internal/models/      ggml model catalog, search directories, discovery, download
 ```
 
 ## Development
