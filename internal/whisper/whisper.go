@@ -174,7 +174,12 @@ func Run(o Options, progress func(pct int)) (Result, error) {
 			// Include both the command error and the stderr read error
 			err = fmt.Errorf("%w (stderr read: %v)", err, scanErr)
 		}
-		return Result{}, fmt.Errorf("whisper: %w\n%s", err, strings.Join(tail, "\n"))
+		// A silent failure leaves the tail empty, and appending it then adds a
+		// trailing blank line where a diagnostic should be.
+		if t := strings.Join(tail, "\n"); t != "" {
+			return Result{}, fmt.Errorf("whisper: %w\n%s", err, t)
+		}
+		return Result{}, fmt.Errorf("whisper: %w", err)
 	}
 
 	srtPath := o.OutBase + ".srt"
