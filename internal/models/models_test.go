@@ -243,6 +243,31 @@ func TestPullConcurrentDownloadsProduceValidFile(t *testing.T) {
 	}
 }
 
+// TestPullCreatesReadableFile verifies that downloaded models are created
+// with readable permissions. os.CreateTemp hands out 0600 and os.Rename
+// preserves those permissions, so without an explicit chmod a pulled model
+// is unreadable to anything not running as the pulling user — which defeats
+// the model-sharing this package is built for.
+func TestPullCreatesReadableFile(t *testing.T) {
+	dir := t.TempDir()
+	srv := okServer(t, []byte("model data"))
+	m := Model{Name: "test", Filename: "ggml-test.bin", URL: srv, Kind: KindTranscribe}
+
+	path, err := Pull(m, dir, nil)
+	if err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if fi.Mode().Perm() != 0o644 {
+		t.Errorf("file permissions = %o, want 0644", fi.Mode().Perm())
+	}
+}
+
 func okServer(t *testing.T, body []byte) string {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -193,6 +193,10 @@ func Pull(m Model, destDir string, progress func(done, total int64)) (string, er
 		os.Remove(tmp)
 		return "", err
 	}
+	if err := os.Chmod(tmp, 0o644); err != nil {
+		os.Remove(tmp)
+		return "", fmt.Errorf("chmod %s: %w", tmp, err)
+	}
 	if err := os.Rename(tmp, final); err != nil {
 		os.Remove(tmp)
 		return "", fmt.Errorf("finalize %s: %w", final, err)
