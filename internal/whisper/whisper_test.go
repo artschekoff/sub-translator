@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func argValue(args []string, flag string) (string, bool) {
@@ -204,5 +205,52 @@ func TestRunRequiresInstalledBinary(t *testing.T) {
 	_, err := Run(Options{Bin: "/nonexistent-whisper", Model: "m", Audio: "a", OutBase: "o"}, nil)
 	if err == nil {
 		t.Fatal("want error when the binary cannot be executed")
+	}
+}
+
+// TestRunHandlesStderrReadError verifies that a scanner error on stderr (e.g.,
+// a line longer than the buffer) doesn't cause cmd.Wait to deadlock on a full
+// pipe. The Run function must drain the pipe even after a read error, otherwise
+// Wait() blocks forever waiting for the process to write its remaining stderr.
+func TestRunHandlesStderrReadError(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "bad-whisper")
+
+	// Create a shell script that writes a line longer than 1 MB to stderr.
+	// The scanner buffer is 1 MB, so this will trigger a read error.
+	scriptContent := `#!/bin/sh
+awk 'BEGIN{for(i=1;i<=2097152;i++) printf "x"}' >&2
+exit 1
+`
+	if err := os.WriteFile(script, []byte(scriptContent), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Run with a timeout to detect deadlocks. If the stderr drain is missing,
+	// this will hang indefinitely on cmd.Wait().
+	done := make(chan bool)
+	var err error
+
+	go func() {
+		_, err = Run(Options{
+			Bin:     script,
+			Model:   "dummy",
+			Audio:   "dummy",
+			OutBase: filepath.Join(dir, "out"),
+		}, nil)
+		done <- true
+	}()
+
+	select {
+	case <-done:
+		// Good, it returned. A scanner error should have been captured.
+		if err == nil {
+			t.Error("expected error from script with long stderr")
+		}
+		if !strings.Contains(err.Error(), "whisper") {
+			t.Errorf("error should mention whisper: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run() hung for 30 seconds; scanner error was not handled and deadlocked on stderr pipe")
 	}
 }

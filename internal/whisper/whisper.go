@@ -161,12 +161,29 @@ func Run(o Options, progress func(pct int)) (Result, error) {
 		}
 	}
 
+	// Check for scanner errors (e.g., stderr line longer than buffer). If the
+	// scanner hit an error, we must drain the pipe to prevent cmd.Wait() from
+	// deadlocking on a full buffer.
+	scanErr := scanner.Err()
+	if scanErr != nil {
+		io.Copy(io.Discard, stderr)
+	}
+
 	if err := cmd.Wait(); err != nil {
+		if scanErr != nil {
+			// Include both the command error and the stderr read error
+			err = fmt.Errorf("%w (stderr read: %v)", err, scanErr)
+		}
 		return Result{}, fmt.Errorf("whisper: %w\n%s", err, strings.Join(tail, "\n"))
 	}
 
 	srtPath := o.OutBase + ".srt"
 	if _, err := os.Stat(srtPath); err != nil {
+		// If there was a scanner error and no transcript was produced, report both
+		if scanErr != nil {
+			return Result{}, fmt.Errorf("whisper produced no transcript at %s (stderr read: %v)\n%s",
+				srtPath, scanErr, strings.Join(tail, "\n"))
+		}
 		return Result{}, fmt.Errorf("whisper produced no transcript at %s\n%s",
 			srtPath, strings.Join(tail, "\n"))
 	}
