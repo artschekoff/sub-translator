@@ -6,7 +6,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 )
 
 type Stream struct {
@@ -203,4 +205,43 @@ func DefaultSRTPath(input, lang string) string {
 	ext := filepath.Ext(input)
 	base := strings.TrimSuffix(input, ext)
 	return base + "." + lang + ".srt"
+}
+
+// SliceWAV cuts [start, start+dur) out of a WAV without re-encoding. The seek is
+// an input option so ffmpeg skips bytes rather than decoding and discarding them,
+// which matters when this runs once per chunk over a feature film.
+func SliceWAV(inWAV string, start, dur time.Duration, outWAV string) error {
+	cmd := exec.Command("ffmpeg", sliceWAVArgs(inWAV, start, dur, outWAV)...)
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func sliceWAVArgs(inWAV string, start, dur time.Duration, outWAV string) []string {
+	return []string{
+		"-y",
+		"-ss", fmt.Sprintf("%.3f", start.Seconds()),
+		"-t", fmt.Sprintf("%.3f", dur.Seconds()),
+		"-i", inWAV,
+		"-c", "copy",
+		outWAV,
+	}
+}
+
+// WAVDuration reports how long an audio file runs, which is what the chunk plan
+// is built from.
+func WAVDuration(path string) (time.Duration, error) {
+	out, err := exec.Command("ffprobe",
+		"-v", "error",
+		"-show_entries", "format=duration",
+		"-of", "csv=p=0",
+		path,
+	).Output()
+	if err != nil {
+		return 0, fmt.Errorf("ffprobe duration: %w", err)
+	}
+	secs, err := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse duration %q: %w", strings.TrimSpace(string(out)), err)
+	}
+	return time.Duration(secs * float64(time.Second)), nil
 }

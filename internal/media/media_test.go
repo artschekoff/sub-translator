@@ -4,6 +4,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 // A malformed metadata specifier (an extra "s:" prefix) makes ffmpeg abort with
@@ -149,5 +150,49 @@ func TestExtractAudioArgsProduceWhisperReadyWAV(t *testing.T) {
 	}
 	if args[len(args)-1] != "out.wav" {
 		t.Errorf("output must be the last arg, got %q", args[len(args)-1])
+	}
+}
+
+// The extracted WAV is 16 kHz mono s16 PCM — constant bitrate, no keyframes — so
+// an input-side -ss is an exact byte seek and -c copy avoids a second decode of a
+// multi-gigabyte source. Re-encoding here would cost more than the transcription
+// it feeds.
+func TestSliceWAVArgsSeekOnInputAndStreamCopy(t *testing.T) {
+	args := sliceWAVArgs("full.wav", 10*time.Minute, 5*time.Minute, "chunk.wav")
+
+	iInput := slices.Index(args, "-i")
+	iSS := slices.Index(args, "-ss")
+	iT := slices.Index(args, "-t")
+	if iSS < 0 || iT < 0 || iInput < 0 {
+		t.Fatalf("missing -ss/-t/-i: %v", args)
+	}
+	if iSS > iInput || iT > iInput {
+		t.Errorf("-ss and -t must precede -i to seek the input, got: %v", args)
+	}
+	if args[iSS+1] != "600.000" {
+		t.Errorf("-ss = %q, want 600.000", args[iSS+1])
+	}
+	if args[iT+1] != "300.000" {
+		t.Errorf("-t = %q, want 300.000", args[iT+1])
+	}
+
+	iC := slices.Index(args, "-c")
+	if iC < 0 || args[iC+1] != "copy" {
+		t.Errorf("want -c copy, got: %v", args)
+	}
+	if args[len(args)-1] != "chunk.wav" {
+		t.Errorf("output must be last, got %q", args[len(args)-1])
+	}
+}
+
+func TestSliceWAVArgsSubSecondPrecision(t *testing.T) {
+	args := sliceWAVArgs("in.wav", 1500*time.Millisecond, 250*time.Millisecond, "out.wav")
+	iSS := slices.Index(args, "-ss")
+	iT := slices.Index(args, "-t")
+	if args[iSS+1] != "1.500" {
+		t.Errorf("-ss = %q, want 1.500", args[iSS+1])
+	}
+	if args[iT+1] != "0.250" {
+		t.Errorf("-t = %q, want 0.250", args[iT+1])
 	}
 }
