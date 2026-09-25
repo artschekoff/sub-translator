@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/artschekoff/sub-translator/internal/config"
 	"github.com/artschekoff/sub-translator/internal/media"
@@ -120,6 +121,8 @@ func main() {
 	vadModel := flag.String("vad-model", "", "path to a Silero VAD model")
 	modeFlag := flag.String("mode", "srt", "output mode: srt, mux or both")
 	out := flag.String("out", "", "output path (.srt in srt mode, container otherwise)")
+	fast := flag.Bool("fast", false, "translate progressively so the opening is watchable within a minute")
+	chunkMin := flag.Int("chunk", 0, "chunk length in minutes for -fast (default 10, or whisper.chunk-minutes)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	flag.Parse()
@@ -208,6 +211,18 @@ func main() {
 		fatalf("no subtitle tracks in %s — nothing to translate", filepath.Base(input))
 	}
 
+	chunkMinutes := *chunkMin
+	if chunkMinutes == 0 {
+		if cfg, err := config.Load(); err == nil && cfg.Whisper.ChunkMinutes > 0 {
+			chunkMinutes = cfg.Whisper.ChunkMinutes
+		} else {
+			chunkMinutes = 10
+		}
+	}
+	if err := validateFast(*fast, source, mode, chunkMinutes); err != nil {
+		fatalf("%v", err)
+	}
+
 	*from = strings.TrimSpace(*from)
 	*to = strings.TrimSpace(*to)
 
@@ -223,6 +238,14 @@ func main() {
 	var blocks []srt.Block
 
 	if source == sourceAudio {
+		if *fast {
+			if err := runProgressive(input, runTmpDir, streams, *atrack, *from, *to,
+				time.Duration(chunkMinutes)*time.Minute, whisperOpts); err != nil {
+				fatalf("%v", err)
+			}
+			return
+		}
+
 		var lang string
 		blocks, lang, err = transcribe(input, runTmpDir, streams, *atrack, *from, whisperOpts)
 		if err != nil {
@@ -445,37 +468,24 @@ func transcribe(input, tmpDir string, streams []media.Stream, atrack int, from s
 		return nil, "", fmt.Errorf("no audio tracks in %s — nothing to transcribe", filepath.Base(input))
 	}
 
-	var src media.Stream
 	// detect records that a requested language had to be abandoned, so the
 	// choice to let whisper detect one survives down to the options below.
 	detect := false
-	switch {
-	case atrack >= 0:
-		found := false
-		for _, s := range audio {
-			if s.Index == atrack {
-				src, found = s, true
-				break
-			}
-		}
-		if !found {
-			return nil, "", fmt.Errorf("no audio stream at index %d", atrack)
-		}
-	case from != "":
-		if s, ok := media.FindAudioByLang(audio, from); ok {
-			src = s
-		} else {
+	if atrack < 0 && from != "" {
+		if _, ok := media.FindAudioByLang(audio, from); !ok {
 			// Falling back to the first track is right — untagged audio is
 			// common — but forcing -l <from> onto it is not: whisper given the
 			// wrong language emits fluent nonsense in that language, which then
 			// translates into a finished, confidently wrong subtitle file.
-			src = audio[0]
-			fmt.Fprintf(os.Stderr, "warning: no audio track tagged lang=%s; using #%d and letting whisper detect the language\n", from, src.Index)
+			fmt.Fprintf(os.Stderr, "warning: no audio track tagged lang=%s; using #%d and letting whisper detect the language\n", from, audio[0].Index)
 			from = ""
 			detect = true
 		}
-	default:
-		src = audio[0]
+	}
+
+	src, err := pickAudioStream(input, streams, atrack, from)
+	if err != nil {
+		return nil, "", err
 	}
 	fmt.Printf("Audio:  #%d  lang=%s  %q\n", src.Index, src.Tags.Language, src.Tags.Title)
 

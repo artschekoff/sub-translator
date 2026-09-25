@@ -216,7 +216,7 @@ func TestKeysAreSortedAndComplete(t *testing.T) {
 		t.Errorf("Keys() must be sorted for stable output, got %v", keys)
 	}
 	for _, want := range []string{
-		"models.dir", "whisper.bin", "whisper.language",
+		"models.dir", "whisper.bin", "whisper.chunk-minutes", "whisper.language",
 		"whisper.model", "whisper.threads", "whisper.vad-model",
 		"whisper.vad-threshold",
 	} {
