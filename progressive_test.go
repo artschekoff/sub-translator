@@ -98,6 +98,70 @@ func TestPickAudioStreamRejectsNoAudioTracks(t *testing.T) {
 	}
 }
 
+// resolveChunkLanguage is the fix for a regression that shipped twice: an empty
+// language out of pickAudioStream means either "-from was never given" or
+// "-from was given and deliberately cleared because no track carried it", and
+// those two must not be treated alike. firstNonEmpty(picked, configured) cannot
+// tell them apart, so it silently pulled the configured default back in right
+// after the user was warned that language would not be forced.
+func TestResolveChunkLanguage(t *testing.T) {
+	tests := []struct {
+		name       string
+		from       string
+		picked     string
+		configured string
+		want       string
+	}{
+		{
+			name:       "a matching -from is used as-is",
+			from:       "rus",
+			picked:     "rus",
+			configured: "fra",
+			want:       "rus",
+		},
+		{
+			// The regression: -from was given but pickAudioStream cleared it
+			// because no track carried it. The config default must not slip
+			// back in here — it may be the very same wrong language the user
+			// was just warned about.
+			name:       "a cleared -from must not fall back to a configured default",
+			from:       "ru",
+			picked:     "",
+			configured: "ru",
+			want:       "",
+		},
+		{
+			name:       "a cleared -from with no config still detects",
+			from:       "ru",
+			picked:     "",
+			configured: "",
+			want:       "",
+		},
+		{
+			name:       "no -from at all falls back to the configured default",
+			from:       "",
+			picked:     "",
+			configured: "de",
+			want:       "de",
+		},
+		{
+			name:       "no -from and no config detects",
+			from:       "",
+			picked:     "",
+			configured: "",
+			want:       "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := resolveChunkLanguage(tt.from, tt.picked, tt.configured); got != tt.want {
+				t.Errorf("resolveChunkLanguage(%q, %q, %q) = %q, want %q",
+					tt.from, tt.picked, tt.configured, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestPlanChunksEvenDivision(t *testing.T) {
 	got := planChunks(30*time.Minute, 10*time.Minute)
 	if len(got) != 3 {

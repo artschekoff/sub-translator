@@ -105,6 +105,27 @@ func pickAudioStream(input string, streams []media.Stream, atrack int, from stri
 	return audio[0], "", nil
 }
 
+// resolveChunkLanguage decides what language to hand whisper for every chunk.
+//
+// picked is what pickAudioStream returned: empty either because -from was never
+// given, or because it was given and deliberately cleared when no audio track
+// carried it. Those two cases must not be treated alike — falling back to the
+// configured default in the second one would tell whisper to hear a language the
+// track does not contain, right after warning the user we would not.
+func resolveChunkLanguage(from, picked, configured string) string {
+	if picked != "" {
+		return picked
+	}
+	if from != "" {
+		// -from was given but pickAudioStream cleared it: the user was already
+		// warned that track doesn't carry that language, so the configured
+		// default — which may be that very same language — must not slip back
+		// in behind the warning.
+		return ""
+	}
+	return configured
+}
+
 // notifyDone raises a desktop notification on macOS. It is best-effort by design:
 // a finished file is the deliverable, and a missing osascript must never turn a
 // successful run into a failed one.
@@ -145,12 +166,7 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 	fmt.Printf("Transcribing %s in %d chunks of up to %s...\n",
 		formatClock(total), len(plan), formatClock(chunkLen))
 
-	// pickAudioStream already cleared lang when -from didn't match any track,
-	// so this only ever pulls in the config default (which transcribe also
-	// honours) when -from was never given at all — never the config's own
-	// language onto a track whisper is about to be told to auto-detect for a
-	// different reason.
-	lang = firstNonEmpty(lang, opts.Language)
+	lang = resolveChunkLanguage(from, lang, opts.Language)
 
 	outPath := firstNonEmpty(out, media.DefaultSRTPath(input, to))
 
