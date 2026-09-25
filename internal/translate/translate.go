@@ -90,7 +90,11 @@ func (c *Client) TranslateAll(texts []string, progress func(done, total int)) ([
 			}
 		}
 		if progress != nil {
-			progress(end, len(texts))
+			// Blocks translated, not blocks attempted. Reporting the batch end
+			// made a wholly failed run print "progress: 1834/1834 (100%)" over an
+			// untranslated file, which is the exact bug this package was changed
+			// to stop telling.
+			progress(end-len(failed), len(texts))
 		}
 		time.Sleep(batchSleep)
 	}

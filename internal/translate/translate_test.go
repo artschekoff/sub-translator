@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -20,6 +22,12 @@ func init() {
 // jsonFor builds the shape Google's endpoint returns: [[[translated, original, ...]], ...]
 func jsonFor(text string) string {
 	return fmt.Sprintf(`[[[%q,%q,null,null,3]],null,"en"]`, "ES:"+text, text)
+}
+
+// jsonFor2 wraps an already-translated string in the endpoint's response shape,
+// for handlers that build the translation themselves.
+func jsonFor2(translated string) string {
+	return fmt.Sprintf(`[[[%q,"",null,null,3]],null,"en"]`, translated)
 }
 
 func clientFor(t *testing.T, h http.HandlerFunc) *Client {
@@ -193,5 +201,84 @@ func TestTranslateAllReportsProgress(t *testing.T) {
 	}
 	if lastDone != 2 || lastTotal != 2 {
 		t.Errorf("progress ended at %d/%d, want 2/2", lastDone, lastTotal)
+	}
+}
+
+// Every real film is dozens of batches, so the index arithmetic that splices a
+// batch's results back into the whole is the one code path that always runs —
+// and nothing crossed a batchSize boundary before this. A wrong offset here does
+// not merely mislabel the failures, it scrambles the subtitles: block 40's text
+// lands on block 0.
+func TestTranslateAllAcrossBatchBoundary(t *testing.T) {
+	texts := make([]string, 45)
+	for i := range texts {
+		texts[i] = fmt.Sprintf("line-%d", i)
+	}
+
+	c := clientFor(t, func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query().Get("q")
+		// The second batch is the five-element tail; fail it as a lump, the way a
+		// throttled endpoint does.
+		if strings.Contains(q, "line-44") {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		parts := strings.Split(q, strings.TrimSpace(separator))
+		for i, p := range parts {
+			parts[i] = "ES:" + strings.TrimSpace(p)
+		}
+		fmt.Fprint(w, jsonFor2(strings.Join(parts, separator)))
+	})
+
+	got, failed, err := c.TranslateAll(texts, nil)
+	if err != nil {
+		t.Fatalf("TranslateAll() = %v, want nil (only the second batch failed)", err)
+	}
+
+	wantFailed := []int{40, 41, 42, 43, 44}
+	if !slices.Equal(failed, wantFailed) {
+		t.Errorf("failed = %v, want %v", failed, wantFailed)
+	}
+	for i := 0; i < 40; i++ {
+		if want := "ES:line-" + strconv.Itoa(i); got[i] != want {
+			t.Errorf("results[%d] = %q, want %q", i, got[i], want)
+		}
+	}
+	for i := 40; i < 45; i++ {
+		if want := "line-" + strconv.Itoa(i); got[i] != want {
+			t.Errorf("results[%d] = %q, want the original %q", i, got[i], want)
+		}
+	}
+}
+
+// A failed batch must not be counted as done: the progress a user reads has to
+// be blocks translated, not blocks attempted.
+func TestTranslateAllProgressCountsOnlyTranslatedBlocks(t *testing.T) {
+	texts := make([]string, 45)
+	for i := range texts {
+		texts[i] = fmt.Sprintf("line-%d", i)
+	}
+	c := clientFor(t, func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query().Get("q")
+		if strings.Contains(q, "line-44") {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		parts := strings.Split(q, strings.TrimSpace(separator))
+		for i, p := range parts {
+			parts[i] = "ES:" + strings.TrimSpace(p)
+		}
+		fmt.Fprint(w, jsonFor2(strings.Join(parts, separator)))
+	})
+
+	var lastDone, lastTotal int
+	if _, _, err := c.TranslateAll(texts, func(done, total int) {
+		lastDone, lastTotal = done, total
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if lastDone != 40 || lastTotal != 45 {
+		t.Errorf("progress ended at %d/%d, want 40/45 — five blocks were never translated",
+			lastDone, lastTotal)
 	}
 }
