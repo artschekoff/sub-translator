@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -179,22 +180,21 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 			return fmt.Errorf("chunk %d: slice audio: %w", c.Index+1, err)
 		}
 
-		chunkOpts := opts
-		chunkOpts.Audio = chunkWAV
-		chunkOpts.OutBase = filepath.Join(tmpDir, fmt.Sprintf("chunk-%03d", c.Index))
+		fmt.Printf("Chunk %d/%d (%s–%s):\n", c.Index+1, len(plan),
+			formatClock(c.Start), formatClock(c.Start+c.Dur))
 		// The language is settled by the first chunk and then forced, so whisper
 		// cannot change its mind halfway and hand back a two-language file.
-		chunkOpts.Language = lang
-
-		result, err := whisper.Run(chunkOpts, func(pct int) {
-			fmt.Printf("\r  chunk %d/%d: %d%%   ", c.Index+1, len(plan), pct)
-		})
-		fmt.Println()
-		if err != nil {
+		parsed, detected, err := transcribeInto(opts, chunkWAV,
+			filepath.Join(tmpDir, fmt.Sprintf("chunk-%03d", c.Index)), lang)
+		switch {
+		case errors.Is(err, errEmptyTranscript) && c.Index > 0:
+			// Silence mid-film is ordinary — credits, a long wordless sequence.
+			// The chunk simply contributes nothing.
+		case err != nil:
 			return fmt.Errorf("chunk %d (%s): %w", c.Index+1, formatClock(c.Start), err)
 		}
-		if lang == "" {
-			lang = result.Language
+		if lang == "" && detected != "" {
+			lang = detected
 			fmt.Printf("Detected language: %s\n", lang)
 			// The client was built before anything was known about the audio,
 			// so its source language is only settled now — otherwise the first
@@ -202,10 +202,6 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 			client.From = lang
 		}
 
-		parsed, err := srt.Parse(result.SRTPath)
-		if err != nil {
-			return fmt.Errorf("chunk %d: parse transcript: %w", c.Index+1, err)
-		}
 		shifted, err := srt.Shift(parsed, c.Start)
 		if err != nil {
 			return fmt.Errorf("chunk %d: %w", c.Index+1, err)
@@ -245,6 +241,12 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 		} else {
 			fmt.Printf("  extended to %s\n", covered)
 		}
+	}
+
+	if len(srcBlocks) == 0 {
+		// Every chunk was silent. Without this the run would end by announcing
+		// that a file holding a single newline covers the whole film.
+		return errEmptyTranscript
 	}
 
 	fmt.Printf("Done: %s covers the full %s — reload subtitles in your player\n",

@@ -457,42 +457,21 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-// transcribe extracts one audio stream, runs whisper over it, and returns the
-// parsed transcript together with the language whisper used. Its working files
-// go in tmpDir, the caller's run-scoped scratch directory, so that a single
-// owner removes them however the run ends: a feature film's 16 kHz WAV is over
-// a gigabyte and must not be left behind.
-func transcribe(input, tmpDir string, streams []media.Stream, atrack int, from string, opts whisper.Options) ([]srt.Block, string, error) {
-	src, lang, err := pickAudioStream(input, streams, atrack, from)
-	if err != nil {
-		return nil, "", err
-	}
-	fmt.Printf("Audio:  #%d  lang=%s  %q\n", src.Index, src.Tags.Language, src.Tags.Title)
+// errEmptyTranscript is what whisper producing nothing at all comes back as.
+// The whole-file path treats it as fatal outright; the chunked path has to tell
+// a silent stretch mid-film (ordinary — credits, a long establishing shot) from
+// a silent film, so it needs to recognise this rather than match on a string.
+var errEmptyTranscript = errors.New("transcript is empty — the audio track may be silent")
 
-	wav := filepath.Join(tmpDir, "audio.wav")
-	fmt.Printf("Extracting audio track #%d...\n", src.Index)
-	if err := media.ExtractAudio(input, src.Index, wav); err != nil {
-		return nil, "", fmt.Errorf("extract audio: %w", err)
-	}
+// transcribeInto runs whisper over one audio file and returns its blocks and the
+// language actually used. Both the whole-file path and the chunked path go
+// through here, so the rule about what whisper is told to hear lives in exactly
+// one place.
+func transcribeInto(opts whisper.Options, audio, outBase, lang string) ([]srt.Block, string, error) {
+	opts.Audio = audio
+	opts.OutBase = outBase
+	opts.Language = lang
 
-	opts.Audio = wav
-	opts.OutBase = filepath.Join(tmpDir, "transcript")
-	switch {
-	case lang != "":
-		opts.Language = lang
-	case from != "":
-		// pickAudioStream had to fall back off the requested language; a
-		// language left over from config would be exactly as wrong for this
-		// track, so whisper decides instead.
-		opts.Language = ""
-	}
-	// Neither case: -from was never given, so opts.Language keeps whatever
-	// resolveWhisper already set from the whisper.language config key.
-
-	fmt.Printf("Transcribing with %s...\n", filepath.Base(opts.Model))
-	if opts.VADModel != "" {
-		fmt.Printf("  VAD: %s\n", filepath.Base(opts.VADModel))
-	}
 	result, err := whisper.Run(opts, func(pct int) {
 		fmt.Printf("\r  progress: %d%%   ", pct)
 	})
@@ -506,9 +485,35 @@ func transcribe(input, tmpDir string, streams []media.Stream, atrack int, from s
 		return nil, "", fmt.Errorf("parse transcript: %w", err)
 	}
 	if len(blocks) == 0 {
-		return nil, "", fmt.Errorf("transcript is empty — the audio track may be silent")
+		return nil, result.Language, errEmptyTranscript
 	}
 	return blocks, result.Language, nil
+}
+
+// transcribe extracts one audio stream, runs whisper over it, and returns the
+// parsed transcript together with the language whisper used. Its working files
+// go in tmpDir, the caller's run-scoped scratch directory, so that a single
+// owner removes them however the run ends: a feature film's 16 kHz WAV is over
+// a gigabyte and must not be left behind.
+func transcribe(input, tmpDir string, streams []media.Stream, atrack int, from string, opts whisper.Options) ([]srt.Block, string, error) {
+	src, picked, err := pickAudioStream(input, streams, atrack, from)
+	if err != nil {
+		return nil, "", err
+	}
+	fmt.Printf("Audio:  #%d  lang=%s  %q\n", src.Index, src.Tags.Language, src.Tags.Title)
+
+	wav := filepath.Join(tmpDir, "audio.wav")
+	fmt.Printf("Extracting audio track #%d...\n", src.Index)
+	if err := media.ExtractAudio(input, src.Index, wav); err != nil {
+		return nil, "", fmt.Errorf("extract audio: %w", err)
+	}
+
+	fmt.Printf("Transcribing with %s...\n", filepath.Base(opts.Model))
+	if opts.VADModel != "" {
+		fmt.Printf("  VAD: %s\n", filepath.Base(opts.VADModel))
+	}
+	return transcribeInto(opts, wav, filepath.Join(tmpDir, "transcript"),
+		resolveChunkLanguage(from, picked, opts.Language))
 }
 
 // firstFew renders the first n values of a list for an error message, with a
