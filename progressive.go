@@ -226,9 +226,13 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 		// on top of a full film's WAV that is already over a gigabyte.
 		os.Remove(chunkWAV)
 		switch {
-		case errors.Is(err, errEmptyTranscript) && c.Index > 0:
-			// Silence mid-film is ordinary — credits, a long wordless sequence.
-			// The chunk simply contributes nothing.
+		case errors.Is(err, errEmptyTranscript):
+			// Silence is ordinary anywhere in a film — an overture, a title
+			// sequence, a wordless stretch mid-reel — and the opening is no
+			// exception. The chunk simply contributes nothing. Refusing here
+			// would cost the user the entire film over a quiet first ten
+			// minutes; whether the film has any speech at all is a question
+			// only the whole run can answer, and it is answered after the loop.
 		case err != nil:
 			return fail("chunk %d (%s): %w", c.Index+1, formatClock(c.Start), err)
 		}
@@ -304,13 +308,23 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 			return fail("chunk %d: %w", c.Index+1, err)
 		}
 		outBlocks = append(outBlocks, chunkOut...)
+		if len(outBlocks) == 0 {
+			// Nothing has been heard yet — a silent overture, a title sequence.
+			// An empty file is not something to announce as ready to watch, and
+			// it covers nothing, so a failure in the next chunk must not claim
+			// it does.
+			continue
+		}
 
 		if err := srt.Write(outPath, srt.Renumber(outBlocks)); err != nil {
 			return fail("chunk %d: write %s: %w", c.Index+1, outPath, err)
 		}
 
+		// Whether this is the first watchable file, rather than whether this is
+		// the first chunk: a silent opening means the two are not the same.
+		firstWrite := covered == ""
 		covered = formatClock(c.Start + c.Dur)
-		if c.Index == 0 {
+		if firstWrite {
 			fmt.Printf("Saved SRT: %s — covers 0:00–%s, you can start watching\n", outPath, covered)
 		} else {
 			fmt.Printf("  extended to %s\n", covered)
@@ -318,9 +332,11 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 	}
 
 	if len(srcBlocks) == 0 {
-		// Every chunk was silent. Without this the run would end by announcing
-		// that a file holding a single newline covers the whole film.
-		return errEmptyTranscript
+		// Every chunk was silent, so the whole audio track is. Without this the
+		// run would end by announcing that a file holding a single newline
+		// covers the whole film. This is the guard; the per-chunk one above
+		// deliberately is not.
+		return fail("%w", errEmptyTranscript)
 	}
 
 	if len(failedAll) > 0 {
