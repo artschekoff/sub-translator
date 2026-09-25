@@ -134,23 +134,16 @@ func TestRenumberedFileIsSequential(t *testing.T) {
 }
 
 // Write stages its content in a temp file and renames it over the target, so a
-// player with the file already open never sees a half-written file. This
-// proves the visible half of that contract: no temp file survives a
-// successful write, the target ends up with the new content (so the rename
-// really did replace it), and the final file keeps the documented 0644 mode.
+// player with the file already open never sees a half-written file. This does
+// not itself prove the rename is atomic — that guarantee comes from the
+// operating system, not from this test — it proves the parts of the contract
+// that are cheap to observe: no temp file survives a successful write, the
+// target ends up with the new content (so the rename really did replace it),
+// and the final file keeps the documented 0644 mode.
 //
-// What this does not simulate: a write that is interrupted partway through
-// (a crash, a full disk, a killed process) after the temp file is created but
-// before the rename. Forcing that deterministically would mean failing a real
-// write(2) or rename(2) syscall mid-flight, which is not portable to do from
-// a Go test without either fault-injecting the filesystem or racing a real
-// process kill — both too flaky to assert on here. What Write's design
-// guarantees instead, by construction rather than by this test, is that
-// nothing ever truncates or opens the target path except the final Rename:
-// the previous file is only ever swapped out whole, never edited in place, so
-// an interrupted write leaves the previous complete file behind rather than a
-// partial one.
-func TestWriteIsAtomicAndLeavesNoTempFile(t *testing.T) {
+// TestWriteFailureBeforeRenameLeavesPreviousFileIntact below covers the other
+// half: a failure before the rename must not touch the existing file.
+func TestWriteLeavesNoTempFileAndReplacesTarget(t *testing.T) {
 	dir := t.TempDir()
 	path := dir + "/out.srt"
 
@@ -191,5 +184,53 @@ func TestWriteIsAtomicAndLeavesNoTempFile(t *testing.T) {
 	}
 	if len(parsed) != 2 {
 		t.Fatalf("got %d blocks after second write, want 2 — the rename did not replace the old file", len(parsed))
+	}
+}
+
+// Write never opens or truncates the target path itself — only the final
+// Rename does — so a failure before that point (a full disk, a NAS hiccup, a
+// directory that stops being writable) must leave whatever was already there
+// completely untouched. Forcing os.CreateTemp to fail by making the
+// containing directory read-only is the cheapest reliable way to prove that
+// without fault-injecting the filesystem.
+func TestWriteFailureBeforeRenameLeavesPreviousFileIntact(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root ignores directory permission bits")
+	}
+
+	dir := t.TempDir()
+	path := dir + "/out.srt"
+
+	original := []Block{
+		{Index: "1", Timing: "00:00:00,000 --> 00:00:01,000", Text: "first"},
+	}
+	if err := Write(path, original); err != nil {
+		t.Fatalf("first write: %v", err)
+	}
+
+	di, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat dir: %v", err)
+	}
+	originalMode := di.Mode().Perm()
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatalf("chmod dir: %v", err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, originalMode) })
+
+	updated := []Block{
+		{Index: "1", Timing: "00:00:00,000 --> 00:00:01,000", Text: "first"},
+		{Index: "2", Timing: "00:00:01,000 --> 00:00:02,000", Text: "second"},
+	}
+	if err := Write(path, updated); err == nil {
+		t.Fatal("want an error when the directory is not writable")
+	}
+
+	parsed, err := Parse(path)
+	if err != nil {
+		t.Fatalf("Parse after failed write: %v", err)
+	}
+	if len(parsed) != 1 || parsed[0].Text != "first" {
+		t.Errorf("previous file changed after a failed write: %+v", parsed)
 	}
 }

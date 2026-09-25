@@ -40,10 +40,13 @@ func Parse(path string) ([]Block, error) {
 // Write saves blocks to path. A viewer using -fast may have the file open in
 // their player while this runs, so it never truncates the target in place:
 // the content is staged in a temp file in the same directory and moved into
-// place with os.Rename, which POSIX guarantees is atomic. A reader only ever
-// sees the previous complete file or the next one, never a partial write, and
-// a failure partway through (a full disk, a NAS hiccup) leaves the existing
-// file untouched instead of destroying it.
+// place with os.Rename, which POSIX guarantees is atomic. That guarantees two
+// things: a reader opening path only ever sees the previous complete file or
+// the next one, never a partial write, and a failure before the rename (a
+// full disk, a NAS hiccup) leaves the existing file untouched. It does not
+// guarantee durability against power loss — there is no fsync on the temp
+// file or the directory entry — but that is outside what this was written
+// for, which is a player reloading mid-rewrite, not a crash.
 func Write(path string, blocks []Block) error {
 	var sb strings.Builder
 	for _, b := range blocks {
