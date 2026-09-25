@@ -168,7 +168,9 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 
 	lang = resolveChunkLanguage(from, lang, opts.Language)
 
-	outPath := firstNonEmpty(out, media.DefaultSRTPath(input, to))
+	// -fast is only reachable in srt mode, so the output path is the same one
+	// the ordinary run writes.
+	outPath := srtOutputPath(input, to, out, modeSRT)
 
 	client := newTranslateClient(lang, to)
 	var srcBlocks, outBlocks []srt.Block

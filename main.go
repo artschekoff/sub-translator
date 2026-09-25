@@ -266,7 +266,16 @@ func main() {
 		// hour of CPU over a sidecar file would be indefensible — so it warns
 		// and carries on to the translation the user actually asked for.
 		transcriptPath := media.DefaultSRTPath(input, *from)
-		if err := srt.Write(transcriptPath, blocks); err != nil {
+		if transcriptPath == srtOutputPath(input, *to, *out, mode) {
+			// Source and target are the same language — reachable by mis-guessing
+			// a film's language, or by -to en on an English film — so the sidecar
+			// and the translation want the same file. The sidecar is written
+			// first, so a fatal translate error below would leave untranslated
+			// source text under the translated filename: precisely the artifact
+			// this branch exists to make impossible.
+			fmt.Fprintf(os.Stderr, "warning: not saving the %s transcript to %s: "+
+				"that is where the translated subtitles go\n", *from, transcriptPath)
+		} else if err := srt.Write(transcriptPath, blocks); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: could not save transcript to %s: %v\n", transcriptPath, err)
 		} else {
 			fmt.Printf("Saved transcript: %s\n", transcriptPath)
@@ -346,10 +355,7 @@ func main() {
 	tmpTranslated := filepath.Join(runTmpDir, "translated.srt")
 
 	if mode.writesSRT() {
-		srtOut := media.DefaultSRTPath(input, *to)
-		if mode == modeSRT && *out != "" {
-			srtOut = *out
-		}
+		srtOut := srtOutputPath(input, *to, *out, mode)
 		if err := srt.Write(srtOut, outBlocks); err != nil {
 			fatalf("write SRT: %v", err)
 		}
@@ -455,6 +461,17 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// srtOutputPath is where the translated .srt will land: an explicit -out wins
+// in srt mode, otherwise it is the default <video>.<lang>.srt next to the input.
+// The transcript sidecar is compared against this, so the two sites must not
+// drift.
+func srtOutputPath(input, to, out string, mode outputMode) string {
+	if mode == modeSRT && out != "" {
+		return out
+	}
+	return media.DefaultSRTPath(input, to)
 }
 
 // newTranslateClient builds the client the run translates through. It is a
