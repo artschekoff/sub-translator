@@ -427,7 +427,6 @@ Create `internal/srt/srt_test.go`:
 package srt
 
 import (
-	"strings"
 	"testing"
 	"time"
 )
@@ -557,7 +556,6 @@ func TestRenumberedFileIsSequential(t *testing.T) {
 	if len(parsed) != 2 || parsed[0].Index != "1" || parsed[1].Index != "2" {
 		t.Errorf("round trip produced %v", parsed)
 	}
-	_ = strings.TrimSpace("")
 }
 ```
 
