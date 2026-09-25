@@ -291,13 +291,18 @@ func main() {
 	fmt.Printf("Translating %s → %s...\n", *from, *to)
 	client := translate.New(*from, *to)
 	texts := srt.Texts(blocks)
-	translated, err := client.TranslateAll(texts, func(done, total int) {
+	translated, failedBlocks, err := client.TranslateAll(texts, func(done, total int) {
 		pct := float64(done) / float64(total) * 100
 		fmt.Printf("\r  progress: %d/%d (%.0f%%)   ", done, total, pct)
 	})
 	fmt.Println()
 	if err != nil {
 		fatalf("translate: %v", err)
+	}
+	if len(failedBlocks) > 0 {
+		fmt.Fprintf(os.Stderr,
+			"warning: %d of %d blocks could not be translated and kept their original text (first: %v)\n",
+			len(failedBlocks), len(texts), firstFew(failedBlocks, 3))
 	}
 
 	// Rebuild blocks
@@ -511,4 +516,13 @@ func transcribe(input, tmpDir string, streams []media.Stream, atrack int, from s
 		return nil, "", fmt.Errorf("transcript is empty — the audio track may be silent")
 	}
 	return blocks, result.Language, nil
+}
+
+// firstFew renders the first n values of a list for an error message, with a
+// trailing ellipsis when there are more.
+func firstFew(v []int, n int) string {
+	if len(v) <= n {
+		return fmt.Sprint(v)
+	}
+	return fmt.Sprint(v[:n]) + "…"
 }

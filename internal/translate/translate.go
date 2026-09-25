@@ -2,6 +2,7 @@ package translate
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,59 +12,117 @@ import (
 )
 
 const (
-	apiURL    = "https://translate.googleapis.com/translate_a/single"
-	separator = " ||||| "
-	batchSize = 40
+	defaultAPIURL = "https://translate.googleapis.com/translate_a/single"
+	separator     = " ||||| "
+	batchSize     = 40
+	maxAttempts   = 4
 )
 
 type Client struct {
-	From string
-	To   string
-	http *http.Client
+	From    string
+	To      string
+	baseURL string
+	http    *http.Client
 }
 
 func New(from, to string) *Client {
 	return &Client{
-		From: from,
-		To:   to,
-		http: &http.Client{Timeout: 30 * time.Second},
+		From:    from,
+		To:      to,
+		baseURL: defaultAPIURL,
+		http:    &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
-func (c *Client) TranslateAll(texts []string, progress func(done, total int)) ([]string, error) {
+// TranslateAll translates every text, returning the results, the indices of any
+// blocks that could not be translated and kept their original text, and an error
+// only when nothing at all could be translated.
+//
+// Reporting a total failure as success is how an untranslated file used to end up
+// named .es.srt: every block silently kept its English text while the progress
+// counter reached 100%.
+func (c *Client) TranslateAll(texts []string, progress func(done, total int)) ([]string, []int, error) {
 	results := make([]string, len(texts))
+	var failed []int
+	var lastErr error
+
 	for i := 0; i < len(texts); i += batchSize {
-		end := i + batchSize
-		if end > len(texts) {
-			end = len(texts)
-		}
+		end := min(i+batchSize, len(texts))
 		batch := texts[i:end]
+
 		translated, err := c.translateBatch(batch)
-		if err != nil {
-			// fallback: one by one
+		if err == nil {
+			copy(results[i:], translated)
+		} else {
+			lastErr = err
+			// The batch separator can be mangled by the translator, which says
+			// nothing about the individual blocks — so retry them one by one.
 			for j, t := range batch {
-				r, err2 := c.translateOne(t)
-				if err2 != nil {
-					results[i+j] = t // keep original on error
+				r, err := c.translateWithRetry(t)
+				if err != nil {
+					results[i+j] = t
+					failed = append(failed, i+j)
+					lastErr = err
 				} else {
 					results[i+j] = r
 				}
 				time.Sleep(150 * time.Millisecond)
 			}
-		} else {
-			copy(results[i:], translated)
 		}
 		if progress != nil {
 			progress(end, len(texts))
 		}
 		time.Sleep(300 * time.Millisecond)
 	}
-	return results, nil
+
+	if len(failed) == len(texts) && len(texts) > 0 {
+		return results, failed, fmt.Errorf("all %d blocks failed: %w", len(texts), lastErr)
+	}
+	return results, failed, nil
+}
+
+// statusError carries the HTTP status so the retry logic can tell a transient
+// throttle from a request that will never succeed.
+type statusError struct{ code int }
+
+func (e statusError) Error() string {
+	if e.code == http.StatusTooManyRequests {
+		return fmt.Sprintf("rate limited by the translation service (HTTP %d)", e.code)
+	}
+	return fmt.Sprintf("translation service returned HTTP %d", e.code)
+}
+
+func (e statusError) retryable() bool {
+	return e.code == http.StatusTooManyRequests || e.code >= 500
+}
+
+// translateWithRetry retries throttling and server faults with a widening pause.
+// A 429 is usually a short burst; a 4xx that is not 429 will never succeed on a
+// repeat, so it fails immediately.
+func (c *Client) translateWithRetry(text string) (string, error) {
+	var lastErr error
+	delay := time.Second
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		out, err := c.translateOne(text)
+		if err == nil {
+			return out, nil
+		}
+		lastErr = err
+		var se statusError
+		if !errors.As(err, &se) || !se.retryable() {
+			return "", err
+		}
+		if attempt < maxAttempts {
+			time.Sleep(delay)
+			delay *= 2
+		}
+	}
+	return "", lastErr
 }
 
 func (c *Client) translateBatch(texts []string) ([]string, error) {
 	joined := strings.Join(texts, separator)
-	result, err := c.translateOne(joined)
+	result, err := c.translateWithRetry(joined)
 	if err != nil {
 		return nil, err
 	}
@@ -86,11 +145,14 @@ func (c *Client) translateOne(text string) (string, error) {
 		"dt":     {"t"},
 		"q":      {text},
 	}
-	resp, err := c.http.Get(apiURL + "?" + params.Encode())
+	resp, err := c.http.Get(c.baseURL + "?" + params.Encode())
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", statusError{code: resp.StatusCode}
+	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", err
