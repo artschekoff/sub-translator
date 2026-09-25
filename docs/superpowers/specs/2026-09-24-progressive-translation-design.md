@@ -89,10 +89,15 @@ func WAVDuration(path string) (time.Duration, error)
 ### `internal/srt`
 
 ```go
-func Shift(blocks []Block, by time.Duration) []Block
+func Shift(blocks []Block, by time.Duration) ([]Block, error)
+func Renumber(blocks []Block) []Block
 ```
 
-Chunk *n* is transcribed as if it began at zero, so its blocks are shifted by `n × chunkLen` before merging. Block numbers are renumbered on write, which `srt.Write` already does.
+Chunk *n* is transcribed as if it began at zero, so its blocks are shifted by `n × chunkLen` before merging.
+
+`Block.Timing` is an unparsed string (`00:01:23,456 --> 00:01:25,789`), so `Shift` parses it, offsets both ends and reformats; malformed input returns an error rather than silently corrupting timings.
+
+`Block.Index` is also a string, and `srt.Write` writes it verbatim — it does **not** renumber. Concatenating chunks would therefore produce a file that restarts at 1 at every boundary, which players reject. `Renumber` is applied to the merged set before every write.
 
 ### `main`
 
