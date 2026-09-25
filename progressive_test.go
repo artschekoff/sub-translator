@@ -7,8 +7,96 @@ import (
 	"testing"
 	"time"
 
+	"github.com/artschekoff/sub-translator/internal/media"
 	"github.com/artschekoff/sub-translator/internal/srt"
 )
+
+// audioStream builds a minimal audio Stream for pickAudioStream tests. Tags is
+// an inline anonymous struct on media.Stream, so it can't be set in a literal.
+func audioStream(index int, lang string) media.Stream {
+	s := media.Stream{Index: index, CodecType: "audio"}
+	s.Tags.Language = lang
+	return s
+}
+
+// pickAudioStream used to just choose a track; it now also settles the
+// language whisper is told to use, because forcing a -from that no track
+// actually carries makes whisper emit confident nonsense in the wrong
+// language instead of failing (that nonsense then survives translation into a
+// finished, entirely wrong subtitle file). This proves the three cases that
+// matter: an explicit -atrack wins outright, a matching -from passes through
+// unchanged, and a -from that matches nothing falls back to the first track
+// with the language cleared rather than forced.
+func TestPickAudioStreamLanguageSelection(t *testing.T) {
+	streams := []media.Stream{audioStream(1, "eng"), audioStream(2, "rus")}
+
+	tests := []struct {
+		name      string
+		atrack    int
+		from      string
+		wantIndex int
+		wantLang  string
+	}{
+		{
+			name:      "explicit atrack wins even over a mismatched -from",
+			atrack:    2,
+			from:      "eng",
+			wantIndex: 2,
+			wantLang:  "eng",
+		},
+		{
+			name:      "a -from that matches a track passes through unchanged",
+			atrack:    -1,
+			from:      "rus",
+			wantIndex: 2,
+			wantLang:  "rus",
+		},
+		{
+			name:      "a -from matching no track falls back to the first stream with language cleared",
+			atrack:    -1,
+			from:      "fra",
+			wantIndex: 1,
+			wantLang:  "",
+		},
+		{
+			name:      "no -from at all picks the first stream with no language forced",
+			atrack:    -1,
+			from:      "",
+			wantIndex: 1,
+			wantLang:  "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			src, lang, err := pickAudioStream("movie.mkv", streams, tt.atrack, tt.from)
+			if err != nil {
+				t.Fatalf("pickAudioStream: %v", err)
+			}
+			if src.Index != tt.wantIndex {
+				t.Errorf("stream index = %d, want %d", src.Index, tt.wantIndex)
+			}
+			if lang != tt.wantLang {
+				t.Errorf("language = %q, want %q", lang, tt.wantLang)
+			}
+		})
+	}
+}
+
+// An -atrack that names no audio stream at all must still error, exactly as
+// before the extraction.
+func TestPickAudioStreamRejectsUnknownExplicitTrack(t *testing.T) {
+	streams := []media.Stream{audioStream(1, "eng")}
+	if _, _, err := pickAudioStream("movie.mkv", streams, 9, ""); err == nil {
+		t.Error("want an error for an -atrack that matches nothing")
+	}
+}
+
+// A file with no audio streams at all has nothing to transcribe.
+func TestPickAudioStreamRejectsNoAudioTracks(t *testing.T) {
+	if _, _, err := pickAudioStream("movie.mkv", nil, -1, ""); err == nil {
+		t.Error("want an error when there are no audio tracks")
+	}
+}
 
 func TestPlanChunksEvenDivision(t *testing.T) {
 	got := planChunks(30*time.Minute, 10*time.Minute)

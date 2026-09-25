@@ -75,28 +75,34 @@ func resolveChunkMinutes(flagValue, configValue int) int {
 }
 
 // pickAudioStream chooses which audio track to transcribe: an explicit index
-// first, then a language-tag match, then the first track. A -from that matches no
-// track falls back with a warning and clears the language, so whisper detects it
-// rather than being told to hear a language that is not there.
-func pickAudioStream(input string, streams []media.Stream, atrack int, from string) (media.Stream, error) {
+// first, then a language-tag match, then the first track. It also settles the
+// language to hand whisper: an explicit -atrack or a matching -from passes
+// through unchanged, but a -from that matches no track warns to stderr, falls
+// back to the first track, and returns "" for the language instead — forcing
+// -l <from> onto a track that is not tagged that way makes whisper emit
+// fluent, confident nonsense in the wrong language rather than an error, and
+// that nonsense then translates into a finished, entirely wrong subtitle file.
+func pickAudioStream(input string, streams []media.Stream, atrack int, from string) (media.Stream, string, error) {
 	audio := media.AudioStreams(streams)
 	if len(audio) == 0 {
-		return media.Stream{}, fmt.Errorf("no audio tracks in %s — nothing to transcribe", filepath.Base(input))
+		return media.Stream{}, "", fmt.Errorf("no audio tracks in %s — nothing to transcribe", filepath.Base(input))
 	}
 	if atrack >= 0 {
 		for _, s := range audio {
 			if s.Index == atrack {
-				return s, nil
+				return s, from, nil
 			}
 		}
-		return media.Stream{}, fmt.Errorf("no audio stream at index %d", atrack)
+		return media.Stream{}, "", fmt.Errorf("no audio stream at index %d", atrack)
 	}
 	if from != "" {
 		if s, ok := media.FindAudioByLang(audio, from); ok {
-			return s, nil
+			return s, from, nil
 		}
+		fmt.Fprintf(os.Stderr, "warning: no audio track tagged lang=%s; using #%d and letting whisper detect the language\n", from, audio[0].Index)
+		return audio[0], "", nil
 	}
-	return audio[0], nil
+	return audio[0], "", nil
 }
 
 // notifyDone raises a desktop notification on macOS. It is best-effort by design:
@@ -114,9 +120,9 @@ func notifyDone(title, message string) {
 // output file after every chunk so the opening is watchable while the rest is
 // still being produced.
 func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, from, to string,
-	chunkLen time.Duration, opts whisper.Options) error {
+	chunkLen time.Duration, opts whisper.Options, out string) error {
 
-	src, err := pickAudioStream(input, streams, atrack, from)
+	src, lang, err := pickAudioStream(input, streams, atrack, from)
 	if err != nil {
 		return err
 	}
@@ -139,9 +145,17 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 	fmt.Printf("Transcribing %s in %d chunks of up to %s...\n",
 		formatClock(total), len(plan), formatClock(chunkLen))
 
-	client := translate.New(from, to)
+	// pickAudioStream already cleared lang when -from didn't match any track,
+	// so this only ever pulls in the config default (which transcribe also
+	// honours) when -from was never given at all — never the config's own
+	// language onto a track whisper is about to be told to auto-detect for a
+	// different reason.
+	lang = firstNonEmpty(lang, opts.Language)
+
+	outPath := firstNonEmpty(out, media.DefaultSRTPath(input, to))
+
+	client := translate.New(lang, to)
 	var srcBlocks, outBlocks []srt.Block
-	lang := from
 
 	for _, c := range plan {
 		chunkWAV := filepath.Join(tmpDir, fmt.Sprintf("chunk-%03d.wav", c.Index))
@@ -166,6 +180,10 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 		if lang == "" {
 			lang = result.Language
 			fmt.Printf("Detected language: %s\n", lang)
+			// The client was built before anything was known about the audio,
+			// so its source language is only settled now — otherwise the first
+			// chunk translates with an empty sl for the whole call.
+			client.From = lang
 		}
 
 		parsed, err := srt.Parse(result.SRTPath)
@@ -177,6 +195,14 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 			return fmt.Errorf("chunk %d: %w", c.Index+1, err)
 		}
 		srcBlocks = append(srcBlocks, shifted...)
+
+		// The transcript is saved before translation is even attempted: it is
+		// by far the most expensive step here, and a translation failure below
+		// must never throw away CPU time already spent transcribing.
+		transcriptPath := media.DefaultSRTPath(input, lang)
+		if err := srt.Write(transcriptPath, srt.Renumber(srcBlocks)); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not save transcript to %s: %v\n", transcriptPath, err)
+		}
 
 		translated, failed, err := client.TranslateAll(srt.Texts(shifted), nil)
 		if err != nil {
@@ -193,11 +219,6 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 		}
 		outBlocks = append(outBlocks, chunkOut...)
 
-		transcriptPath := media.DefaultSRTPath(input, lang)
-		if err := srt.Write(transcriptPath, srt.Renumber(srcBlocks)); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: could not save transcript to %s: %v\n", transcriptPath, err)
-		}
-		outPath := media.DefaultSRTPath(input, to)
 		if err := srt.Write(outPath, srt.Renumber(outBlocks)); err != nil {
 			return fmt.Errorf("chunk %d: write %s: %w", c.Index+1, outPath, err)
 		}
@@ -210,7 +231,6 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 		}
 	}
 
-	outPath := media.DefaultSRTPath(input, to)
 	fmt.Printf("Done: %s covers the full %s — reload subtitles in your player\n",
 		outPath, formatClock(total))
 	notifyDone("Subtitles ready", filepath.Base(outPath))

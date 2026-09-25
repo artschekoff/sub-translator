@@ -89,6 +89,8 @@ Flags:
   -atrack        audio stream index, -1 = auto (default: -1)
   -mode          output mode: srt, mux or both (default: srt)
   -out           output path (.srt in srt mode, container otherwise)
+  -fast          translate progressively so the opening is watchable within a minute
+  -chunk         chunk length in minutes for -fast (default 10, or whisper.chunk-minutes)
   -whisper-model path to a whisper ggml model
   -whisper-bin   path to the whisper-cli binary
   -vad-model     path to a Silero VAD model
@@ -99,6 +101,7 @@ Examples:
   sub-translator -to es -source audio movie.mkv
   sub-translator -to fr -mode mux movie.mp4
   sub-translator -to ru -track 3 movie.mkv
+  sub-translator -to es -source audio -fast movie.mkv
   sub-translator config set whisper.model ~/models/ggml-large-v3-turbo.bin
   sub-translator model pull large-v3-turbo
 `
@@ -237,7 +240,7 @@ func main() {
 	if source == sourceAudio {
 		if *fast {
 			if err := runProgressive(input, runTmpDir, streams, *atrack, *from, *to,
-				time.Duration(chunkMinutes)*time.Minute, whisperOpts); err != nil {
+				time.Duration(chunkMinutes)*time.Minute, whisperOpts, *out); err != nil {
 				fatalf("%v", err)
 			}
 			return
@@ -460,27 +463,7 @@ func firstNonEmpty(values ...string) string {
 // owner removes them however the run ends: a feature film's 16 kHz WAV is over
 // a gigabyte and must not be left behind.
 func transcribe(input, tmpDir string, streams []media.Stream, atrack int, from string, opts whisper.Options) ([]srt.Block, string, error) {
-	audio := media.AudioStreams(streams)
-	if len(audio) == 0 {
-		return nil, "", fmt.Errorf("no audio tracks in %s — nothing to transcribe", filepath.Base(input))
-	}
-
-	// detect records that a requested language had to be abandoned, so the
-	// choice to let whisper detect one survives down to the options below.
-	detect := false
-	if atrack < 0 && from != "" {
-		if _, ok := media.FindAudioByLang(audio, from); !ok {
-			// Falling back to the first track is right — untagged audio is
-			// common — but forcing -l <from> onto it is not: whisper given the
-			// wrong language emits fluent nonsense in that language, which then
-			// translates into a finished, confidently wrong subtitle file.
-			fmt.Fprintf(os.Stderr, "warning: no audio track tagged lang=%s; using #%d and letting whisper detect the language\n", from, audio[0].Index)
-			from = ""
-			detect = true
-		}
-	}
-
-	src, err := pickAudioStream(input, streams, atrack, from)
+	src, lang, err := pickAudioStream(input, streams, atrack, from)
 	if err != nil {
 		return nil, "", err
 	}
@@ -495,13 +478,16 @@ func transcribe(input, tmpDir string, streams []media.Stream, atrack int, from s
 	opts.Audio = wav
 	opts.OutBase = filepath.Join(tmpDir, "transcript")
 	switch {
+	case lang != "":
+		opts.Language = lang
 	case from != "":
-		opts.Language = from
-	case detect:
-		// The requested language was dropped above; a language left over from
-		// config would be just as wrong for this track, so whisper decides.
+		// pickAudioStream had to fall back off the requested language; a
+		// language left over from config would be exactly as wrong for this
+		// track, so whisper decides instead.
 		opts.Language = ""
 	}
+	// Neither case: -from was never given, so opts.Language keeps whatever
+	// resolveWhisper already set from the whisper.language config key.
 
 	fmt.Printf("Transcribing with %s...\n", filepath.Base(opts.Model))
 	if opts.VADModel != "" {
