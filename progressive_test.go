@@ -1,9 +1,13 @@
 package main
 
 import (
+	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/artschekoff/sub-translator/internal/srt"
 )
 
 func TestPlanChunksEvenDivision(t *testing.T) {
@@ -144,4 +148,89 @@ func TestResolveChunkMinutes(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Merging chunks is where progressive output goes wrong: the second chunk's
+// timings are relative to its own start, and its numbering restarts at 1. This
+// reproduces the merge the loop performs and pins both.
+func TestChunkMergeProducesOneContinuousFile(t *testing.T) {
+	chunk0 := []srt.Block{
+		{Index: "1", Timing: "00:00:01,000 --> 00:00:03,000", Text: "opening line"},
+		{Index: "2", Timing: "00:09:50,000 --> 00:09:55,000", Text: "end of first chunk"},
+	}
+	chunk1 := []srt.Block{
+		{Index: "1", Timing: "00:00:02,000 --> 00:00:04,500", Text: "second chunk opens"},
+	}
+
+	var merged []srt.Block
+	for i, c := range [][]srt.Block{chunk0, chunk1} {
+		shifted, err := srt.Shift(c, time.Duration(i)*10*time.Minute)
+		if err != nil {
+			t.Fatalf("chunk %d: %v", i, err)
+		}
+		merged = append(merged, shifted...)
+	}
+	merged = srt.Renumber(merged)
+
+	if len(merged) != 3 {
+		t.Fatalf("merged %d blocks, want 3", len(merged))
+	}
+	for i, want := range []string{"1", "2", "3"} {
+		if merged[i].Index != want {
+			t.Errorf("block %d index = %q, want %q", i, merged[i].Index, want)
+		}
+	}
+	// The second chunk's first line is 2 s into a chunk that starts at 10:00.
+	if got := merged[2].Timing; got != "00:10:02,000 --> 00:10:04,500" {
+		t.Errorf("second chunk timing = %q, want 00:10:02,000 --> 00:10:04,500", got)
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "out.srt")
+	if err := srt.Write(path, merged); err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := srt.Parse(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed) != 3 {
+		t.Errorf("wrote a file that parses back as %d blocks", len(parsed))
+	}
+}
+
+// The plan and the merge must agree: every chunk's blocks land inside that
+// chunk's window, so no line is attributed to the wrong part of the film.
+func TestPlanAndShiftAgreeOnChunkWindows(t *testing.T) {
+	total := 25 * time.Minute
+	chunkLen := 10 * time.Minute
+	for _, c := range planChunks(total, chunkLen) {
+		block := []srt.Block{{Index: "1", Timing: "00:00:00,500 --> 00:00:01,500", Text: "x"}}
+		shifted, err := srt.Shift(block, c.Start)
+		if err != nil {
+			t.Fatal(err)
+		}
+		start, err := firstStart(shifted[0].Timing)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if start < c.Start || start >= c.Start+c.Dur {
+			t.Errorf("chunk %d: a block at %v falls outside [%v, %v)",
+				c.Index, start, c.Start, c.Start+c.Dur)
+		}
+	}
+}
+
+// firstStart reads the left-hand timestamp out of an SRT timing line.
+func firstStart(timing string) (time.Duration, error) {
+	left, _, ok := strings.Cut(timing, "-->")
+	if !ok {
+		return 0, fmt.Errorf("malformed timing %q", timing)
+	}
+	var h, m, s, ms int
+	if _, err := fmt.Sscanf(strings.TrimSpace(left), "%d:%d:%d,%d", &h, &m, &s, &ms); err != nil {
+		return 0, err
+	}
+	return time.Duration(h)*time.Hour + time.Duration(m)*time.Minute +
+		time.Duration(s)*time.Second + time.Duration(ms)*time.Millisecond, nil
 }
