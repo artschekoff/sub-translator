@@ -11,7 +11,6 @@ import (
 
 	"github.com/artschekoff/sub-translator/internal/media"
 	"github.com/artschekoff/sub-translator/internal/srt"
-	"github.com/artschekoff/sub-translator/internal/translate"
 	"github.com/artschekoff/sub-translator/internal/whisper"
 )
 
@@ -171,13 +170,35 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 
 	outPath := firstNonEmpty(out, media.DefaultSRTPath(input, to))
 
-	client := translate.New(lang, to)
+	client := newTranslateClient(lang, to)
 	var srcBlocks, outBlocks []srt.Block
+	// Failed block numbers accumulate across the whole run in absolute,
+	// post-merge numbering, because that is the only numbering the finished file
+	// has. Per-chunk warnings alone scroll past behind fourteen chunks of
+	// \r-rewritten progress, and the run then closes with an unqualified "Done".
+	var failedAll []int
+	// What outPath already covers, empty until the first successful write. Every
+	// fatal error below carries it, because a bare "error:" reads as "nothing
+	// was produced" while a perfectly good hour of subtitles sits next to the
+	// film.
+	covered := ""
+	langMissingWarned := false
+	sidecarSkipWarned := false
+
+	// fail attaches the surviving coverage to an error, so no failure can leave
+	// the user guessing whether the file next to the film is worth anything.
+	fail := func(format string, args ...any) error {
+		err := fmt.Errorf(format, args...)
+		if covered == "" {
+			return err
+		}
+		return fmt.Errorf("%w; %s already covers 0:00–%s", err, outPath, covered)
+	}
 
 	for _, c := range plan {
 		chunkWAV := filepath.Join(tmpDir, fmt.Sprintf("chunk-%03d.wav", c.Index))
 		if err := media.SliceWAV(fullWAV, c.Start, c.Dur, chunkWAV); err != nil {
-			return fmt.Errorf("chunk %d: slice audio: %w", c.Index+1, err)
+			return fail("chunk %d: slice audio: %w", c.Index+1, err)
 		}
 
 		fmt.Printf("Chunk %d/%d (%s–%s):\n", c.Index+1, len(plan),
@@ -186,56 +207,95 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 		// cannot change its mind halfway and hand back a two-language file.
 		parsed, detected, err := transcribeInto(opts, chunkWAV,
 			filepath.Join(tmpDir, fmt.Sprintf("chunk-%03d", c.Index)), lang)
+		// The slice has done its job the moment whisper has read it. Keeping
+		// every chunk to the end of the run roughly doubles peak scratch usage,
+		// on top of a full film's WAV that is already over a gigabyte.
+		os.Remove(chunkWAV)
 		switch {
 		case errors.Is(err, errEmptyTranscript) && c.Index > 0:
 			// Silence mid-film is ordinary — credits, a long wordless sequence.
 			// The chunk simply contributes nothing.
 		case err != nil:
-			return fmt.Errorf("chunk %d (%s): %w", c.Index+1, formatClock(c.Start), err)
+			return fail("chunk %d (%s): %w", c.Index+1, formatClock(c.Start), err)
 		}
-		if lang == "" && detected != "" {
+		switch {
+		case lang != "":
+			// Already settled; nothing to announce.
+		case detected != "":
 			lang = detected
 			fmt.Printf("Detected language: %s\n", lang)
 			// The client was built before anything was known about the audio,
 			// so its source language is only settled now — otherwise the first
 			// chunk translates with an empty sl for the whole call.
 			client.From = lang
+		case !langMissingWarned:
+			// whisper.Run falls back to the *requested* language when its JSON
+			// sidecar is missing or unparseable, and the requested value is
+			// empty here — so there is nothing to settle and nothing to force.
+			// Say so once rather than printing a blank detection line per chunk
+			// and building a "movie..srt" sidecar out of the empty code.
+			langMissingWarned = true
+			fmt.Fprintln(os.Stderr, "warning: whisper reported no detected language; "+
+				"every chunk will detect its own and no source transcript will be saved — "+
+				"pass -from to settle it")
 		}
 
 		shifted, err := srt.Shift(parsed, c.Start)
 		if err != nil {
-			return fmt.Errorf("chunk %d: %w", c.Index+1, err)
+			return fail("chunk %d: %w", c.Index+1, err)
 		}
 		srcBlocks = append(srcBlocks, shifted...)
 
 		// The transcript is saved before translation is even attempted: it is
 		// by far the most expensive step here, and a translation failure below
 		// must never throw away CPU time already spent transcribing.
-		transcriptPath := media.DefaultSRTPath(input, lang)
-		if err := srt.Write(transcriptPath, srt.Renumber(srcBlocks)); err != nil {
+		if transcriptPath := media.DefaultSRTPath(input, lang); lang == "" {
+			// No language, no filename: "movie..srt" is not a transcript path.
+		} else if transcriptPath == outPath {
+			// Source and target are the same language, so the sidecar and the
+			// translation want the same file. The sidecar goes in first, which
+			// would leave untranslated source text under the translated name if
+			// the translation then failed — the one artifact this must not make.
+			if !sidecarSkipWarned {
+				sidecarSkipWarned = true
+				fmt.Fprintf(os.Stderr, "warning: not saving the %s transcript to %s: "+
+					"that is where the translated subtitles go\n", lang, transcriptPath)
+			}
+		} else if err := srt.Write(transcriptPath, srt.Renumber(srcBlocks)); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: could not save transcript to %s: %v\n", transcriptPath, err)
 		}
 
-		translated, failed, err := client.TranslateAll(srt.Texts(shifted), nil)
+		// A -fast run is watched while it happens, so minutes of silence between
+		// the transcription bar and the next "extended to" line read as a hang —
+		// longer still when the endpoint is throttling and every batch retries.
+		translated, failed, err := client.TranslateAll(srt.Texts(shifted), func(done, total int) {
+			fmt.Printf("\r  translating: %d/%d   ", done, total)
+		})
+		fmt.Println()
 		if err != nil {
-			return fmt.Errorf("chunk %d: translate: %w", c.Index+1, err)
+			return fail("chunk %d: translate: %w", c.Index+1, err)
 		}
 		if len(failed) > 0 {
 			fmt.Fprintf(os.Stderr,
 				"warning: chunk %d: %d of %d blocks kept their original text\n",
 				c.Index+1, len(failed), len(shifted))
 		}
+		base := len(outBlocks)
+		for _, f := range failed {
+			failedAll = append(failedAll, base+f)
+		}
+
 		chunkOut, err := srt.WithTexts(shifted, translated)
 		if err != nil {
-			return fmt.Errorf("chunk %d: %w", c.Index+1, err)
+			return fail("chunk %d: %w", c.Index+1, err)
 		}
 		outBlocks = append(outBlocks, chunkOut...)
 
 		if err := srt.Write(outPath, srt.Renumber(outBlocks)); err != nil {
-			return fmt.Errorf("chunk %d: write %s: %w", c.Index+1, outPath, err)
+			return fail("chunk %d: write %s: %w", c.Index+1, outPath, err)
 		}
 
-		covered := formatClock(c.Start + c.Dur)
+		covered = formatClock(c.Start + c.Dur)
 		if c.Index == 0 {
 			fmt.Printf("Saved SRT: %s — covers 0:00–%s, you can start watching\n", outPath, covered)
 		} else {
@@ -247,6 +307,15 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 		// Every chunk was silent. Without this the run would end by announcing
 		// that a file holding a single newline covers the whole film.
 		return errEmptyTranscript
+	}
+
+	if len(failedAll) > 0 {
+		fmt.Printf("Done: %s covers the full %s, but %d of %d blocks could not be "+
+			"translated and kept their original text (first: %v) — reload subtitles in your player\n",
+			outPath, formatClock(total), len(failedAll), len(outBlocks), firstFew(failedAll, 3))
+		notifyDone("Subtitles ready, with gaps",
+			fmt.Sprintf("%s — %d blocks untranslated", filepath.Base(outPath), len(failedAll)))
+		return nil
 	}
 
 	fmt.Printf("Done: %s covers the full %s — reload subtitles in your player\n",

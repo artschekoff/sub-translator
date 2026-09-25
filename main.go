@@ -312,7 +312,7 @@ func main() {
 
 	// Translate
 	fmt.Printf("Translating %s → %s...\n", *from, *to)
-	client := translate.New(*from, *to)
+	client := newTranslateClient(*from, *to)
 	texts := srt.Texts(blocks)
 	translated, failedBlocks, err := client.TranslateAll(texts, func(done, total int) {
 		pct := float64(done) / float64(total) * 100
@@ -455,6 +455,13 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// newTranslateClient builds the client the run translates through. It is a
+// variable so the end-to-end test can point a whole progressive run at an
+// httptest server instead of the real endpoint; production never replaces it.
+var newTranslateClient = func(from, to string) *translate.Client {
+	return translate.New(from, to)
 }
 
 // errEmptyTranscript is what whisper producing nothing at all comes back as.
