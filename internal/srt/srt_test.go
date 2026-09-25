@@ -1,6 +1,7 @@
 package srt
 
 import (
+	"os"
 	"testing"
 	"time"
 )
@@ -129,5 +130,66 @@ func TestRenumberedFileIsSequential(t *testing.T) {
 	}
 	if len(parsed) != 2 || parsed[0].Index != "1" || parsed[1].Index != "2" {
 		t.Errorf("round trip produced %v", parsed)
+	}
+}
+
+// Write stages its content in a temp file and renames it over the target, so a
+// player with the file already open never sees a half-written file. This
+// proves the visible half of that contract: no temp file survives a
+// successful write, the target ends up with the new content (so the rename
+// really did replace it), and the final file keeps the documented 0644 mode.
+//
+// What this does not simulate: a write that is interrupted partway through
+// (a crash, a full disk, a killed process) after the temp file is created but
+// before the rename. Forcing that deterministically would mean failing a real
+// write(2) or rename(2) syscall mid-flight, which is not portable to do from
+// a Go test without either fault-injecting the filesystem or racing a real
+// process kill — both too flaky to assert on here. What Write's design
+// guarantees instead, by construction rather than by this test, is that
+// nothing ever truncates or opens the target path except the final Rename:
+// the previous file is only ever swapped out whole, never edited in place, so
+// an interrupted write leaves the previous complete file behind rather than a
+// partial one.
+func TestWriteIsAtomicAndLeavesNoTempFile(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/out.srt"
+
+	original := []Block{
+		{Index: "1", Timing: "00:00:00,000 --> 00:00:01,000", Text: "first"},
+	}
+	if err := Write(path, original); err != nil {
+		t.Fatalf("first write: %v", err)
+	}
+
+	updated := []Block{
+		{Index: "1", Timing: "00:00:00,000 --> 00:00:01,000", Text: "first"},
+		{Index: "2", Timing: "00:00:01,000 --> 00:00:02,000", Text: "second"},
+	}
+	if err := Write(path, updated); err != nil {
+		t.Fatalf("second write: %v", err)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "out.srt" {
+		t.Fatalf("directory after Write = %v, want exactly [out.srt] — no leftover temp file", entries)
+	}
+
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o644 {
+		t.Errorf("mode = %o, want 644", perm)
+	}
+
+	parsed, err := Parse(path)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(parsed) != 2 {
+		t.Fatalf("got %d blocks after second write, want 2 — the rename did not replace the old file", len(parsed))
 	}
 }

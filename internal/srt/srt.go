@@ -3,6 +3,7 @@ package srt
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -36,18 +37,48 @@ func Parse(path string) ([]Block, error) {
 	return blocks, nil
 }
 
+// Write saves blocks to path. A viewer using -fast may have the file open in
+// their player while this runs, so it never truncates the target in place:
+// the content is staged in a temp file in the same directory and moved into
+// place with os.Rename, which POSIX guarantees is atomic. A reader only ever
+// sees the previous complete file or the next one, never a partial write, and
+// a failure partway through (a full disk, a NAS hiccup) leaves the existing
+// file untouched instead of destroying it.
 func Write(path string, blocks []Block) error {
 	var sb strings.Builder
-	for i, b := range blocks {
+	for _, b := range blocks {
 		sb.WriteString(b.Index)
 		sb.WriteByte('\n')
 		sb.WriteString(b.Timing)
 		sb.WriteByte('\n')
 		sb.WriteString(b.Text)
 		sb.WriteString("\n\n")
-		_ = i
 	}
-	return os.WriteFile(path, []byte(strings.TrimRight(sb.String(), "\n")+"\n"), 0644)
+	data := []byte(strings.TrimRight(sb.String(), "\n") + "\n")
+
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".srt-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	// Whatever happens below, a stray temp file must not survive this call: a
+	// leftover .tmp next to the target would defeat the point of the rename if
+	// Write is retried or the directory is inspected. Remove is a no-op once
+	// Rename has already moved the file away.
+	defer os.Remove(tmpName)
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpName, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 func Texts(blocks []Block) []string {
