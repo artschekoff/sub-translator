@@ -235,7 +235,7 @@ sub-translator -to es -source audio -fast movie.mkv
 ```
 
 ```
-Saved SRT: movie.es.srt — covers 0:00–10:00, you can start watching
+Saved SRT: movie.es.srt — covers 0:00–0:10:00, you can start watching
   extended to 0:20:00
   extended to 0:30:00
 Done: movie.es.srt covers the full 2:19:08 — reload subtitles in your player
