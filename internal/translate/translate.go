@@ -41,6 +41,15 @@ func New(from, to string) *Client {
 	}
 }
 
+// NewWithBaseURL is New with the endpoint overridden. It exists so a caller's
+// end-to-end test can drive a whole run against an httptest server instead of
+// reaching the real translation service; production always uses New.
+func NewWithBaseURL(from, to, baseURL string) *Client {
+	c := New(from, to)
+	c.baseURL = baseURL
+	return c
+}
+
 // TranslateAll translates every text, returning the results, the indices of any
 // blocks that could not be translated and kept their original text, and an error
 // only when nothing at all could be translated.
