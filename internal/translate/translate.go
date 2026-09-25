@@ -18,6 +18,13 @@ const (
 	maxAttempts   = 4
 )
 
+// Package-level vars allow tests to override timing without changing production behavior.
+var (
+	retryBaseDelay = time.Second
+	perBlockSleep  = 150 * time.Millisecond
+	batchSleep     = 300 * time.Millisecond
+)
+
 type Client struct {
 	From    string
 	To      string
@@ -55,24 +62,37 @@ func (c *Client) TranslateAll(texts []string, progress func(done, total int)) ([
 			copy(results[i:], translated)
 		} else {
 			lastErr = err
-			// The batch separator can be mangled by the translator, which says
-			// nothing about the individual blocks — so retry them one by one.
-			for j, t := range batch {
-				r, err := c.translateWithRetry(t)
-				if err != nil {
-					results[i+j] = t
+			// Distinguish: if the batch failed with a status error (429, 5xx),
+			// the endpoint is down or throttling us. Per-block retries cannot
+			// succeed where the batch just failed four times. Mark the entire
+			// batch as failed and move on. Only attempt per-block retries if
+			// the batch failed for a different reason (e.g., separator mismatch).
+			var se statusError
+			if errors.As(err, &se) {
+				// Status-level failure already retried; don't retry per-block
+				for j := range batch {
+					results[i+j] = batch[j]
 					failed = append(failed, i+j)
-					lastErr = err
-				} else {
-					results[i+j] = r
 				}
-				time.Sleep(150 * time.Millisecond)
+			} else {
+				// Other failure (e.g., separator mismatch); try per-block retries
+				for j, t := range batch {
+					r, err := c.translateWithRetry(t)
+					if err != nil {
+						results[i+j] = t
+						failed = append(failed, i+j)
+						lastErr = err
+					} else {
+						results[i+j] = r
+					}
+					time.Sleep(perBlockSleep)
+				}
 			}
 		}
 		if progress != nil {
 			progress(end, len(texts))
 		}
-		time.Sleep(300 * time.Millisecond)
+		time.Sleep(batchSleep)
 	}
 
 	if len(failed) == len(texts) && len(texts) > 0 {
@@ -101,7 +121,7 @@ func (e statusError) retryable() bool {
 // repeat, so it fails immediately.
 func (c *Client) translateWithRetry(text string) (string, error) {
 	var lastErr error
-	delay := time.Second
+	delay := retryBaseDelay
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		out, err := c.translateOne(text)
 		if err == nil {

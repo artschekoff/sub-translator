@@ -7,7 +7,15 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
+
+func init() {
+	// Tests run with millisecond-scale timing to avoid 48-second overhead.
+	retryBaseDelay = time.Millisecond
+	perBlockSleep = time.Millisecond
+	batchSleep = time.Millisecond
+}
 
 // jsonFor builds the shape Google's endpoint returns: [[[translated, original, ...]], ...]
 func jsonFor(text string) string {
@@ -52,7 +60,14 @@ func TestTranslateAllTotalFailureIsAnError(t *testing.T) {
 func TestTranslateAllPartialFailureReportsIndices(t *testing.T) {
 	c := clientFor(t, func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query().Get("q")
-		if strings.Contains(q, "BOOM") {
+		if strings.Contains(q, "|||") {
+			// Batch request: return malformed response to trigger separator mismatch
+			// (this causes per-block retries rather than marking all as failed)
+			fmt.Fprint(w, jsonFor("malformed"))
+			return
+		}
+		// Per-block request: BOOM fails, others succeed
+		if q == "BOOM" {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
@@ -115,6 +130,39 @@ func TestTranslateAllDoesNotRetryClientErrors(t *testing.T) {
 	// One batch attempt plus one per-block attempt; a retry loop would multiply this.
 	if n := calls.Load(); n > 2 {
 		t.Errorf("%d requests for a 400 — it was retried", n)
+	}
+}
+
+// A batch that fails with a status error after exhausting retries must not fan out
+// to per-block retries: that would turn a rate limit into a multi-hour hang.
+// When the endpoint is throttling us, individual blocks cannot succeed where the
+// batch just failed four times.
+func TestTranslateAllStatusErrorBatchDoesNotRetryPerBlock(t *testing.T) {
+	var calls atomic.Int32
+	c := clientFor(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusTooManyRequests)
+	})
+
+	texts := []string{"one", "two", "three", "four", "five"}
+	got, failed, err := c.TranslateAll(texts, nil)
+	if err == nil {
+		t.Fatal("want an error when batch fails with 429")
+	}
+	if len(failed) != len(texts) {
+		t.Errorf("failed = %d blocks, want all %d", len(failed), len(texts))
+	}
+	for i := range texts {
+		if got[i] != texts[i] {
+			t.Errorf("block %d: want original kept, got %q", i, got[i])
+		}
+	}
+	// maxAttempts retries on the joined batch only; no per-block attempts.
+	// Total should be around 4 (batch retries), not 4 + 5*4 (batch + per-block retries).
+	n := calls.Load()
+	if n > int32(maxAttempts+1) {
+		t.Errorf("%d requests for a status failure — per-block retries happened (%d > %d)",
+			n, n, maxAttempts+1)
 	}
 }
 
