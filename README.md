@@ -108,6 +108,8 @@ Flags:
   -atrack        audio stream index, -1 = auto (default: -1)
   -mode          output mode: srt, mux or both (default: srt)
   -out           output path (.srt in srt mode, container otherwise)
+  -fast          write subtitles progressively so the opening is watchable within a minute
+  -chunk         chunk length in minutes for -fast (default: 10)
   -whisper-model path to a whisper ggml model
   -whisper-bin   path to the whisper-cli binary
   -vad-model     path to a Silero VAD model
@@ -224,6 +226,29 @@ The source language is detected automatically, so `-from` is optional here. Pass
 
 The untranslated transcript is saved next to the video as `<video>.<lang>.srt`, so you can read it, fix a mis-heard name in it, or feed it somewhere else by hand — transcription is the expensive step and its output is worth keeping.
 
+### Watching before it finishes
+
+Transcription runs far faster than playback — about 14× real time on an M1 Pro — but the normal mode still writes nothing until the last block is done. `-fast` changes that: it transcribes and translates the film in ten-minute chunks and rewrites the subtitle file after each one, so the opening is watchable within a minute.
+
+```bash
+sub-translator -to es -source audio -fast movie.mkv
+```
+
+```
+Saved SRT: movie.es.srt — covers 0:00–10:00, you can start watching
+  extended to 0:20:00
+  extended to 0:30:00
+Done: movie.es.srt covers the full 2:19:08 — reload subtitles in your player
+```
+
+Your lead grows as you watch: by the time you reach minute ten of the film, the file already covers minute one hundred and twenty.
+
+**Reload the subtitles once at the end.** Players read a `.srt` when they load it and do not notice the file growing, so the track you started with covers only the first chunk. Re-selecting the subtitle track picks up the finished file. On macOS a desktop notification fires when it is complete.
+
+Chunk length is `-chunk N` minutes, or `whisper.chunk-minutes` in the config; both default to 10. A line spoken across a chunk boundary is split into two, which is the cost of not waiting.
+
+`-fast` requires `-source audio` (there is nothing to wait for when a subtitle track already exists) and the default `-mode srt` (a video container cannot be rewritten piece by piece).
+
 **Voice activity detection** is off by default. It skips silence and can prevent whisper's decoder from looping on long quiet stretches, but measured against the same model it merges speech into longer, less punctuated subtitle blocks — so it is worth turning on only if you actually hit the looping problem, not as a general-purpose default. The symptom is unmistakable: the progress counter stalls, the run takes far longer than the audio it is transcribing, and the same line repeats over and over in the output. Enable it by pointing at a model explicitly, either for one run or persistently:
 
 ```bash
@@ -254,9 +279,10 @@ sub-translator config path
 | `whisper.vad-threshold` | Speech detection threshold, 0–1. whisper's default when unset. |
 | `whisper.threads` | Threads for transcription. whisper chooses when unset. |
 | `whisper.language` | Default source language. `auto` when unset. |
+| `whisper.chunk-minutes` | Chunk length for `-fast`, in minutes. 10 when unset. |
 | `models.dir` | Where `model pull` writes, and the first directory searched. |
 
-The corresponding flags — `-whisper-model`, `-whisper-bin`, `-vad-model` — override the config for a single run.
+The corresponding flags — `-whisper-model`, `-whisper-bin`, `-vad-model`, `-chunk` — override the config for a single run.
 
 ## Languages
 
