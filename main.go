@@ -122,7 +122,7 @@ func main() {
 	modeFlag := flag.String("mode", "srt", "output mode: srt, mux or both")
 	out := flag.String("out", "", "output path (.srt in srt mode, container otherwise)")
 	fast := flag.Bool("fast", false, "translate progressively so the opening is watchable within a minute")
-	chunkMin := flag.Int("chunk", 0, "chunk length in minutes for -fast (default 10, or whisper.chunk-minutes)")
+	chunkMin := flag.Int("chunk", -1, "chunk length in minutes for -fast (default 10, or whisper.chunk-minutes)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	flag.Parse()
@@ -211,14 +211,11 @@ func main() {
 		fatalf("no subtitle tracks in %s — nothing to translate", filepath.Base(input))
 	}
 
-	chunkMinutes := *chunkMin
-	if chunkMinutes == 0 {
-		if cfg, err := config.Load(); err == nil && cfg.Whisper.ChunkMinutes > 0 {
-			chunkMinutes = cfg.Whisper.ChunkMinutes
-		} else {
-			chunkMinutes = 10
-		}
+	configChunkMinutes := 0
+	if cfg, err := config.Load(); err == nil {
+		configChunkMinutes = cfg.Whisper.ChunkMinutes
 	}
+	chunkMinutes := resolveChunkMinutes(*chunkMin, configChunkMinutes)
 	if err := validateFast(*fast, source, mode, chunkMinutes); err != nil {
 		fatalf("%v", err)
 	}

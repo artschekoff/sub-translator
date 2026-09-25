@@ -117,3 +117,31 @@ func TestValidateFastIgnoresEverythingWhenOff(t *testing.T) {
 		}
 	}
 }
+
+// resolveChunkMinutes is what stands between the -chunk flag and validateFast. A
+// plain 0 default there would make "-chunk 0" indistinguishable from omitting the
+// flag, silently handing the user a 10-minute chunk instead of the error
+// validateFast promises — so only the -1 sentinel may be treated as "not given";
+// 0 and every other value must pass through untouched for validateFast to see.
+func TestResolveChunkMinutes(t *testing.T) {
+	tests := []struct {
+		name        string
+		flagValue   int
+		configValue int
+		want        int
+	}{
+		{"unset, no config, falls back to 10", -1, 0, 10},
+		{"unset, config set, uses config", -1, 5, 5},
+		{"explicit zero survives for validateFast to reject", 0, 5, 0},
+		{"explicit negative survives for validateFast to reject", -2, 5, -2},
+		{"explicit value wins over config", 7, 5, 7},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := resolveChunkMinutes(tt.flagValue, tt.configValue); got != tt.want {
+				t.Errorf("resolveChunkMinutes(%d, %d) = %d, want %d",
+					tt.flagValue, tt.configValue, got, tt.want)
+			}
+		})
+	}
+}

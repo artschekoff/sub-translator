@@ -61,6 +61,19 @@ func validateFast(fast bool, source sourceMode, mode outputMode, chunkMinutes in
 	return nil
 }
 
+// resolveChunkMinutes turns the -chunk flag into the value validateFast sees.
+// Only the sentinel -1 means "not given"; 0 and negatives must survive so the
+// validation can reject them, which is exactly what a plain 0 default prevented.
+func resolveChunkMinutes(flagValue, configValue int) int {
+	if flagValue != -1 {
+		return flagValue
+	}
+	if configValue > 0 {
+		return configValue
+	}
+	return 10
+}
+
 // pickAudioStream chooses which audio track to transcribe: an explicit index
 // first, then a language-tag match, then the first track. A -from that matches no
 // track falls back with a warning and clears the language, so whisper detects it
