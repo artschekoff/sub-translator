@@ -40,16 +40,15 @@ func planChunks(total, chunkLen time.Duration) []chunkPlan {
 	return out
 }
 
-// validateFast rejects the combinations where a progressive run cannot deliver
-// what it promises. It is a no-op when -fast is off, so the ordinary path is
-// untouched.
-func validateFast(fast bool, source sourceMode, mode outputMode, chunkMinutes int) error {
+// validateFastFlags rejects the -fast combinations that depend on nothing but
+// the flags. They are split out from the source check so they can be raised
+// before any work: -fast -mode mux used to probe the container, resolve whisper,
+// ask "Transcribe the audio track? This can take a while", wait for the user to
+// type y, and only then refuse. Both are a no-op when -fast is off, so the
+// ordinary path is untouched.
+func validateFastFlags(fast bool, mode outputMode, chunkMinutes int) error {
 	if !fast {
 		return nil
-	}
-	if source != sourceAudio {
-		return fmt.Errorf("-fast only applies to transcription; there is nothing to wait for " +
-			"when reading an existing subtitle track — use -source audio")
 	}
 	if mode != modeSRT {
 		return fmt.Errorf("-fast cannot be combined with -mode %s: a video container "+
@@ -57,6 +56,19 @@ func validateFast(fast bool, source sourceMode, mode outputMode, chunkMinutes in
 	}
 	if chunkMinutes < 1 {
 		return fmt.Errorf("-chunk must be at least 1 minute, got %d", chunkMinutes)
+	}
+	return nil
+}
+
+// validateFastSource is the rest of the -fast validation: the part that cannot
+// run until resolveSource has decided whether "auto" found a subtitle track.
+func validateFastSource(fast bool, source sourceMode) error {
+	if !fast {
+		return nil
+	}
+	if source != sourceAudio {
+		return fmt.Errorf("-fast only applies to transcription; there is nothing to wait for " +
+			"when reading an existing subtitle track — use -source audio")
 	}
 	return nil
 }

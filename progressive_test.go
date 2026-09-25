@@ -225,7 +225,7 @@ func TestPlanChunksDegenerateInputs(t *testing.T) {
 // -fast only makes sense when there is a slow step to hide. A subtitle track is
 // already on disk.
 func TestValidateFastRejectsSubtitleSource(t *testing.T) {
-	err := validateFast(true, sourceSub, modeSRT, 10)
+	err := validateFastSource(true, sourceSub)
 	if err == nil {
 		t.Fatal("want an error")
 	}
@@ -238,7 +238,7 @@ func TestValidateFastRejectsSubtitleSource(t *testing.T) {
 // cannot be kept in mux modes.
 func TestValidateFastRejectsContainerModes(t *testing.T) {
 	for _, m := range []outputMode{modeMux, modeBoth} {
-		err := validateFast(true, sourceAudio, m, 10)
+		err := validateFastFlags(true, m, 10)
 		if err == nil {
 			t.Errorf("mode %v: want an error", m)
 			continue
@@ -251,14 +251,17 @@ func TestValidateFastRejectsContainerModes(t *testing.T) {
 
 func TestValidateFastRejectsBadChunkLength(t *testing.T) {
 	for _, n := range []int{0, -5} {
-		if err := validateFast(true, sourceAudio, modeSRT, n); err == nil {
+		if err := validateFastFlags(true, modeSRT, n); err == nil {
 			t.Errorf("chunk %d: want an error", n)
 		}
 	}
 }
 
 func TestValidateFastAcceptsTheWorkingCombination(t *testing.T) {
-	if err := validateFast(true, sourceAudio, modeSRT, 10); err != nil {
+	if err := validateFastFlags(true, modeSRT, 10); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if err := validateFastSource(true, sourceAudio); err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
 }
@@ -267,18 +270,22 @@ func TestValidateFastAcceptsTheWorkingCombination(t *testing.T) {
 func TestValidateFastIgnoresEverythingWhenOff(t *testing.T) {
 	for _, m := range []outputMode{modeSRT, modeMux, modeBoth} {
 		for _, s := range []sourceMode{sourceSub, sourceAudio} {
-			if err := validateFast(false, s, m, 0); err != nil {
+			if err := validateFastFlags(false, m, 0); err != nil {
+				t.Errorf("fast=false must never error, got %v", err)
+			}
+			if err := validateFastSource(false, s); err != nil {
 				t.Errorf("fast=false must never error, got %v", err)
 			}
 		}
 	}
 }
 
-// resolveChunkMinutes is what stands between the -chunk flag and validateFast. A
-// plain 0 default there would make "-chunk 0" indistinguishable from omitting the
-// flag, silently handing the user a 10-minute chunk instead of the error
-// validateFast promises — so only the -1 sentinel may be treated as "not given";
-// 0 and every other value must pass through untouched for validateFast to see.
+// resolveChunkMinutes is what stands between the -chunk flag and
+// validateFastFlags. A plain 0 default there would make "-chunk 0"
+// indistinguishable from omitting the flag, silently handing the user a
+// 10-minute chunk instead of the error validateFastFlags promises — so only the
+// -1 sentinel may be treated as "not given"; 0 and every other value must pass
+// through untouched for validateFastFlags to see.
 func TestResolveChunkMinutes(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -288,8 +295,8 @@ func TestResolveChunkMinutes(t *testing.T) {
 	}{
 		{"unset, no config, falls back to 10", -1, 0, 10},
 		{"unset, config set, uses config", -1, 5, 5},
-		{"explicit zero survives for validateFast to reject", 0, 5, 0},
-		{"explicit negative survives for validateFast to reject", -2, 5, -2},
+		{"explicit zero survives for validateFastFlags to reject", 0, 5, 0},
+		{"explicit negative survives for validateFastFlags to reject", -2, 5, -2},
 		{"explicit value wins over config", 7, 5, 7},
 	}
 	for _, tt := range tests {

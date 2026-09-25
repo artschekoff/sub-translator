@@ -145,6 +145,19 @@ func main() {
 		fatalf("%v", err)
 	}
 
+	// The mode and chunk checks depend on nothing but the flags, so they belong
+	// here rather than behind a container probe, a whisper lookup and an
+	// interactive "this can take a while" prompt the user answers only to be
+	// told the combination was never going to work.
+	configChunkMinutes := 0
+	if cfg, err := config.Load(); err == nil {
+		configChunkMinutes = cfg.Whisper.ChunkMinutes
+	}
+	chunkMinutes := resolveChunkMinutes(*chunkMin, configChunkMinutes)
+	if err := validateFastFlags(*fast, mode, chunkMinutes); err != nil {
+		fatalf("%v", err)
+	}
+
 	if flag.NArg() < 1 {
 		flag.Usage()
 		os.Exit(1)
@@ -173,6 +186,12 @@ func main() {
 
 	source, needsConfirm, err := resolveSource(source, len(subs) > 0, stdinIsTerminal())
 	if err != nil {
+		fatalf("%v", err)
+	}
+
+	// The one -fast check that genuinely needs resolveSource to have run: only
+	// now is it known whether "auto" found a subtitle track.
+	if err := validateFastSource(*fast, source); err != nil {
 		fatalf("%v", err)
 	}
 
@@ -212,15 +231,6 @@ func main() {
 
 	if source == sourceSub && len(subs) == 0 {
 		fatalf("no subtitle tracks in %s — nothing to translate", filepath.Base(input))
-	}
-
-	configChunkMinutes := 0
-	if cfg, err := config.Load(); err == nil {
-		configChunkMinutes = cfg.Whisper.ChunkMinutes
-	}
-	chunkMinutes := resolveChunkMinutes(*chunkMin, configChunkMinutes)
-	if err := validateFast(*fast, source, mode, chunkMinutes); err != nil {
-		fatalf("%v", err)
 	}
 
 	*from = strings.TrimSpace(*from)
