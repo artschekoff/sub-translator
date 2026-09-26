@@ -11,7 +11,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 )
 
 // capturedRequest is one request the fake endpoint saw, decoded far enough to
@@ -72,12 +71,11 @@ func openAIFor(t *testing.T, h func(w http.ResponseWriter, body capturedRequest)
 	t.Cleanup(srv.Close)
 
 	c := newOpenAI(Options{
-		Provider: ProviderOpenAI,
-		From:     "en",
-		To:       "es",
-		APIKey:   "sk-test-key",
-		Workers:  1,
-		BaseURL:  srv.URL,
+		From:    "en",
+		To:      "es",
+		APIKey:  "sk-test-key",
+		Workers: 1,
+		BaseURL: srv.URL,
 	})
 	return c, func() []capturedRequest {
 		mu.Lock()
@@ -224,8 +222,7 @@ func TestOpenAIWellFormedResponseMapsToTheRightIndices(t *testing.T) {
 
 // A reply whose key set is not the requested one cannot be trusted at all: there
 // is no way to tell which line a shifted key belongs to. The batch fails and the
-// blocks are retried one at a time, which is what the Google path does when the
-// separator comes back mangled.
+// blocks are retried one at a time.
 func TestOpenAIMalformedResponseFallsThroughToPerBlock(t *testing.T) {
 	for _, tt := range []struct {
 		name  string
@@ -334,43 +331,6 @@ func TestOpenAIRetriesTheBatchBeforeFanningOut(t *testing.T) {
 	}
 }
 
-// A 429 that carries Retry-After must be waited out, and a batch that fails with
-// a status error must not fan out into per-block retries.
-func TestOpenAIHonoursRetryAfter(t *testing.T) {
-	oldUnit := retryAfterUnit
-	retryAfterUnit = 20 * time.Millisecond
-	t.Cleanup(func() { retryAfterUnit = oldUnit })
-
-	var calls atomic.Int32
-	c, requests := openAIFor(t, func(w http.ResponseWriter, got capturedRequest) {
-		if calls.Add(1) == 1 {
-			w.Header().Set("Retry-After", "3")
-			w.WriteHeader(http.StatusTooManyRequests)
-			return
-		}
-		var p batchPayload
-		json.Unmarshal([]byte(got.Message[1].Content), &p)
-		echoTranslation(w, p)
-	})
-
-	start := time.Now()
-	got, failed, err := c.TranslateAll([]string{"one", "two"}, nil)
-	elapsed := time.Since(start)
-
-	if err != nil || len(failed) != 0 {
-		t.Fatalf("want success after the retry: err=%v failed=%v", err, failed)
-	}
-	if got[0] != "ES:one" || got[1] != "ES:two" {
-		t.Errorf("got %v, want the translations", got)
-	}
-	if want := 3 * retryAfterUnit; elapsed < want {
-		t.Errorf("retried after %s, want at least %s — Retry-After was ignored", elapsed, want)
-	}
-	if n := len(requests()); n != 2 {
-		t.Errorf("%d requests, want 2: the throttled one and the retry", n)
-	}
-}
-
 // A 400 will fail identically however many times it is sent. Repeating it, or
 // fanning it out per block, only delays the error the user needs to see.
 func TestOpenAIDoesNotRetryClientErrors(t *testing.T) {
@@ -411,106 +371,49 @@ func TestOpenAISustainedRateLimitDoesNotFanOut(t *testing.T) {
 	}
 }
 
-// The pool is shared, so order under concurrency is worth proving through the
-// provider that answers out of order most readily. Run under -race.
-func TestOpenAIPreservesOrderUnderConcurrency(t *testing.T) {
-	texts := lines(180)
-	var inFlight, peak atomic.Int32
-
-	c, _ := openAIFor(t, func(w http.ResponseWriter, got capturedRequest) {
-		if n := inFlight.Add(1); n > peak.Load() {
-			peak.Store(n)
-		}
-		defer inFlight.Add(-1)
-
-		var p batchPayload
-		json.Unmarshal([]byte(got.Message[1].Content), &p)
-		// Jitter keyed on the batch's first line, so earlier batches answer last.
-		n, _ := strconv.Atoi(strings.TrimPrefix(p.Translate["0"], "line-"))
-		time.Sleep(time.Duration(5-n/batchSize) * 8 * time.Millisecond)
-		echoTranslation(w, p)
-	})
-	c.workers = 4
-
-	got, failed, err := c.TranslateAll(texts, nil)
-	if err != nil || len(failed) != 0 {
-		t.Fatalf("err=%v failed=%v", err, failed)
-	}
-	for i := range texts {
-		if want := "ES:line-" + strconv.Itoa(i); got[i] != want {
-			t.Fatalf("results[%d] = %q, want %q — the order was not preserved", i, got[i], want)
-		}
-	}
-	if peak.Load() < 2 {
-		t.Errorf("peak concurrency was %d: nothing overlapped, so this proves nothing", peak.Load())
-	}
-}
-
-func TestDefaultWorkersForIsProviderSpecific(t *testing.T) {
-	if got := DefaultWorkersFor(ProviderGoogle); got != 1 {
-		t.Errorf("DefaultWorkersFor(google) = %d, want 1", got)
-	}
-	if got := DefaultWorkersFor(""); got != 1 {
-		t.Errorf("DefaultWorkersFor(\"\") = %d, want 1 — an unset provider is google", got)
-	}
-	if got := DefaultWorkersFor(ProviderOpenAI); got != 4 {
-		t.Errorf("DefaultWorkersFor(openai) = %d, want 4", got)
-	}
-}
-
-func TestNewTranslatorChoosesTheProvider(t *testing.T) {
-	g, err := NewTranslator(Options{From: "en", To: "es"})
+// NewTranslator is a constructor, not a factory: there is one endpoint. What it
+// still has to get right is the defaults, because a partially configured machine
+// must run rather than translate one batch at a time or against no model at all.
+func TestNewTranslatorAppliesTheDefaults(t *testing.T) {
+	d, err := NewTranslator(Options{From: "en", To: "es", APIKey: "sk-x"})
 	if err != nil {
-		t.Fatalf("default provider: %v", err)
+		t.Fatalf("defaults: %v", err)
 	}
-	gc, ok := g.(*Client)
+	dc, ok := d.(*openAIClient)
 	if !ok {
-		t.Fatalf("default provider built %T, want the Google *Client", g)
+		t.Fatalf("NewTranslator built %T, want *openAIClient", d)
 	}
-	// One worker against the free public endpoint, whatever the openai default is.
-	if gc.Workers != defaultGoogleWorkers {
-		t.Errorf("Workers = %d, want the Google default %d", gc.Workers, defaultGoogleWorkers)
+	if dc.model != DefaultModel {
+		t.Errorf("model = %q, want the default %q", dc.model, DefaultModel)
 	}
-	if defaultGoogleWorkers != 1 {
-		t.Errorf("defaultGoogleWorkers = %d: four batches in flight against a free "+
-			"endpoint is what got this host blocked for nineteen minutes",
-			defaultGoogleWorkers)
+	if dc.baseURL != defaultOpenAIURL {
+		t.Errorf("baseURL = %q, want %q", dc.baseURL, defaultOpenAIURL)
+	}
+	if dc.workers != DefaultWorkers {
+		t.Errorf("workers = %d, want the default %d", dc.workers, DefaultWorkers)
+	}
+	if DefaultWorkers != 4 {
+		t.Errorf("DefaultWorkers = %d, want 4 — enough to hide the round-trip "+
+			"latency that otherwise dominates a run", DefaultWorkers)
 	}
 
-	// And the openai default is the parallel one, applied when nothing asks.
-	o4, err := NewTranslator(Options{Provider: ProviderOpenAI, To: "es", APIKey: "sk-x"})
+	// And what the caller does ask for is not overridden.
+	o, err := NewTranslator(Options{To: "es", APIKey: "sk-x", Model: "gpt-6-sol", Workers: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := o4.(*openAIClient).workers; got != defaultOpenAIWorkers {
-		t.Errorf("openai workers = %d, want the default %d", got, defaultOpenAIWorkers)
+	oc := o.(*openAIClient)
+	if oc.model != "gpt-6-sol" || oc.workers != 2 {
+		t.Errorf("model = %q workers = %d, want the ones asked for", oc.model, oc.workers)
 	}
 
-	o, err := NewTranslator(Options{Provider: ProviderOpenAI, To: "es", APIKey: "sk-x", Workers: 2})
-	if err != nil {
-		t.Fatalf("openai provider: %v", err)
-	}
-	oc, ok := o.(*openAIClient)
-	if !ok {
-		t.Fatalf("openai provider built %T, want *openAIClient", o)
-	}
-	if oc.model != DefaultModel {
-		t.Errorf("model = %q, want the default %q", oc.model, DefaultModel)
-	}
-	if oc.baseURL != defaultOpenAIURL {
-		t.Errorf("baseURL = %q, want %q", oc.baseURL, defaultOpenAIURL)
-	}
-	if oc.workers != 2 {
-		t.Errorf("workers = %d, want the 2 asked for", oc.workers)
-	}
-
-	// A Google client with an explicit base URL keeps the seam the end-to-end
-	// tests drive a whole run through.
-	g2, err := NewTranslator(Options{Provider: ProviderGoogle, From: "en", To: "es", BaseURL: "http://127.0.0.1:1"})
+	// An explicit base URL keeps the seam the end-to-end tests drive a whole run
+	// through.
+	g, err := NewTranslator(Options{From: "en", To: "es", APIKey: "sk-x", BaseURL: "http://127.0.0.1:1"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := g2.(*Client).baseURL; got != "http://127.0.0.1:1" {
+	if got := g.(*openAIClient).baseURL; got != "http://127.0.0.1:1" {
 		t.Errorf("baseURL = %q, want the override", got)
 	}
 }
@@ -518,9 +421,9 @@ func TestNewTranslatorChoosesTheProvider(t *testing.T) {
 // Without a key there is nothing to try, so the error has to name both ways of
 // supplying one rather than surfacing as a 401 forty minutes in.
 func TestNewTranslatorMissingAPIKeyIsActionable(t *testing.T) {
-	_, err := NewTranslator(Options{Provider: ProviderOpenAI, From: "en", To: "es"})
+	_, err := NewTranslator(Options{From: "en", To: "es"})
 	if err == nil {
-		t.Fatal("want an error for the openai provider with no key")
+		t.Fatal("want an error with no key")
 	}
 	for _, want := range []string{"OPENAI_API_KEY", "translate.api-key"} {
 		if !strings.Contains(err.Error(), want) {
@@ -529,20 +432,13 @@ func TestNewTranslatorMissingAPIKeyIsActionable(t *testing.T) {
 	}
 
 	// Whitespace is not a key.
-	if _, err := NewTranslator(Options{Provider: ProviderOpenAI, APIKey: "   "}); err == nil {
+	if _, err := NewTranslator(Options{APIKey: "   "}); err == nil {
 		t.Error("want an error for a blank key")
 	}
-}
-
-func TestNewTranslatorRejectsUnknownProvider(t *testing.T) {
-	_, err := NewTranslator(Options{Provider: "deepl", From: "en", To: "es"})
-	if err == nil {
-		t.Fatal("want an error for an unknown provider")
-	}
-	for _, want := range []string{"deepl", ProviderGoogle, ProviderOpenAI} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("error %q does not name %s", err, want)
-		}
+	// And Validate says the same thing on its own, because main calls it before
+	// the video is probed or a second of audio is extracted.
+	if err := (Options{To: "es"}).Validate(); err == nil {
+		t.Error("Options.Validate() accepted a missing key")
 	}
 }
 

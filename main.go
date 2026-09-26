@@ -81,6 +81,10 @@ Transcription needs whisper.cpp (brew install whisper.cpp) and a ggml model.
 Models already downloaded by other whisper.cpp front-ends are found
 automatically; otherwise run: sub-translator model pull large-v3-turbo
 
+Translation goes through the OpenAI API and needs a key. Supply it either way:
+  export OPENAI_API_KEY=sk-...
+  sub-translator config set translate.api-key sk-...
+
 Flags:
   -from          source language code (prompted for if omitted; detected in audio mode)
   -to            target language code (required; prompted for if omitted)
@@ -91,8 +95,7 @@ Flags:
   -out           output path (.srt in srt mode, container otherwise)
   -fast          translate progressively so the opening is watchable within a minute
   -chunk         chunk length in minutes for -fast (default 10, or whisper.chunk-minutes)
-  -provider      translation provider: google or openai (default: google)
-  -workers       batches translated at once (default 1 for google, 4 for openai)
+  -workers       batches translated at once (default 4, or translate.workers)
   -whisper-model path to a whisper ggml model
   -whisper-bin   path to the whisper-cli binary
   -vad-model     path to a Silero VAD model
@@ -126,7 +129,6 @@ func main() {
 	vadModel := flag.String("vad-model", "", "path to a Silero VAD model")
 	modeFlag := flag.String("mode", "srt", "output mode: srt, mux or both")
 	out := flag.String("out", "", "output path (.srt in srt mode, container otherwise)")
-	provider := flag.String("provider", "", "translation provider: google or openai")
 	workers := flag.Int("workers", -1, "batches translated at once (default 4, or translate.workers)")
 	fast := flag.Bool("fast", false, "translate progressively so the opening is watchable within a minute")
 	chunkMin := flag.Int("chunk", -1, "chunk length in minutes for -fast (default 10, or whisper.chunk-minutes)")
@@ -175,13 +177,14 @@ func main() {
 		fatalf("input file not found: %s", input)
 	}
 
-	// The provider is settled for the same reason, and before any work happens:
-	// an openai run with no key has to be refused now, not discovered after an
-	// hour of transcription.
+	// The translation settings are settled for the same reason, and before any
+	// work happens: a run with no API key has to be refused now, not discovered
+	// after an hour of transcription. This covers the progressive path too — both
+	// -fast and the ordinary run reach translation only through here.
 	if *workers != -1 && *workers < 1 {
 		fatalf("-workers must be at least 1, got %d", *workers)
 	}
-	translateOpts := resolveTranslateOptions(settings, *provider, *workers)
+	translateOpts := resolveTranslateOptions(settings, *workers)
 	if err := translateOpts.Validate(); err != nil {
 		fatalf("%v", err)
 	}
@@ -518,31 +521,25 @@ var newTranslateClient = func(o translate.Options) (translate.Translator, error)
 // friends follow. The key is read from the environment first: an exported
 // OPENAI_API_KEY is how a shared machine or a CI job supplies one without
 // writing it to disk.
-//
-// The default provider stays google. Moving someone onto a paid API because they
-// upgraded is not a decision this program gets to make.
-func resolveTranslateOptions(c *config.Config, providerFlag string, workersFlag int) translate.Options {
-	provider := firstNonEmpty(providerFlag, c.Translate.Provider, translate.ProviderGoogle)
+func resolveTranslateOptions(c *config.Config, workersFlag int) translate.Options {
 	return translate.Options{
-		Provider: provider,
-		APIKey:   firstNonEmpty(os.Getenv("OPENAI_API_KEY"), c.Translate.APIKey),
-		Model:    firstNonEmpty(c.Translate.Model, translate.DefaultModel),
-		Workers:  resolveWorkers(workersFlag, c.Translate.Workers, provider),
+		APIKey:  firstNonEmpty(os.Getenv("OPENAI_API_KEY"), c.Translate.APIKey),
+		Model:   firstNonEmpty(c.Translate.Model, translate.DefaultModel),
+		Workers: resolveWorkers(workersFlag, c.Translate.Workers),
 	}
 }
 
 // resolveWorkers turns the -workers flag into a worker count. Only the sentinel
 // -1 means "not given", so a 0 the user typed survives to be rejected instead of
-// quietly becoming the default. The default itself depends on the provider: one
-// against Google's free endpoint, four against a paid API.
-func resolveWorkers(flagValue, configValue int, provider string) int {
+// quietly becoming the default.
+func resolveWorkers(flagValue, configValue int) int {
 	if flagValue != -1 {
 		return flagValue
 	}
 	if configValue > 0 {
 		return configValue
 	}
-	return translate.DefaultWorkersFor(provider)
+	return translate.DefaultWorkers
 }
 
 // withLangs is o with the languages this run settled on. In audio mode the source
@@ -553,20 +550,23 @@ func withLangs(o translate.Options, from, to string) translate.Options {
 	return o
 }
 
-// describeProvider names what is about to be spent: which endpoint, which model
-// when there is one, and how many batches go out at once.
+// describeProvider names what is about to be spent: which model, and how many
+// batches go out at once. The defaults are filled in here as well as in the
+// package, because the line is printed before the client is built and a run that
+// says "openai , 0 workers" is a run nobody can check.
 func describeProvider(o translate.Options) string {
-	name := o.Provider
-	if name == "" {
-		name = translate.ProviderGoogle
+	model := o.Model
+	if model == "" {
+		model = translate.DefaultModel
 	}
-	if o.Provider == translate.ProviderOpenAI {
-		name += " " + o.Model
+	workers := o.Workers
+	if workers < 1 {
+		workers = translate.DefaultWorkers
 	}
-	if o.Workers == 1 {
-		return name
+	if workers == 1 {
+		return "openai " + model
 	}
-	return fmt.Sprintf("%s, %d workers", name, o.Workers)
+	return fmt.Sprintf("openai %s, %d workers", model, workers)
 }
 
 // errEmptyTranscript is what whisper producing nothing at all comes back as.

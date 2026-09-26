@@ -15,17 +15,12 @@ import (
 // turn every subtitle text into its translation, say which blocks it could not
 // do, and report progress while it works.
 //
-// Both providers implement it, so main.go and the progressive run are written
-// against this and never against a particular endpoint.
+// main.go and the progressive run are written against this rather than against
+// the endpoint behind it, which is what lets the end-to-end tests drive a whole
+// run without going near the network.
 type Translator interface {
 	TranslateAll(texts []string, progress func(done, total int)) ([]string, []int, error)
 }
-
-// Provider names, as the -provider flag and translate.provider config accept them.
-const (
-	ProviderGoogle = "google"
-	ProviderOpenAI = "openai"
-)
 
 const (
 	// DefaultModel is the OpenAI model subtitle translation defaults to. Of the
@@ -34,103 +29,83 @@ const (
 	// low-reasoning case, which is Luna.
 	DefaultModel = "gpt-6-luna"
 
-	// defaultGoogleWorkers is one on purpose. Google's endpoint is free and
-	// public, it rate-limited this host for over nineteen minutes during
-	// development, and four batches in flight is four times the request rate
-	// against it. Parallelism is for an API with a quota you are paying for.
-	defaultGoogleWorkers = 1
+	// DefaultWorkers is how many batches are translated at once when neither
+	// -workers nor translate.workers says otherwise. Four is enough to hide the
+	// round-trip latency that otherwise dominates a run, against a paid endpoint
+	// with real, documented rate limits.
+	DefaultWorkers = 4
 
-	// defaultOpenAIWorkers is four: enough to hide the round-trip latency that
-	// otherwise dominates a run, against a paid endpoint with real, documented
-	// rate limits.
-	defaultOpenAIWorkers = 4
-
-	// contextLines is how many already-seen source lines are handed to an LLM
-	// provider as context. Three is enough to carry who is addressing whom,
-	// names and formality across a batch boundary.
+	// contextLines is how many already-seen source lines are handed to the model
+	// as context. Three is enough to carry who is addressing whom, names and
+	// formality across a batch boundary.
 	contextLines = 3
+
+	// batchSize is how many subtitle blocks travel in one request.
+	batchSize = 40
+
+	// maxAttempts is how many times one request is sent before a retryable
+	// failure is treated as final.
+	maxAttempts = 4
+)
+
+// Package-level vars allow tests to override timing without changing production
+// behaviour.
+var (
+	retryBaseDelay = time.Second
+	perBlockSleep  = 150 * time.Millisecond
+	batchSleep     = 300 * time.Millisecond
 )
 
 // Options describes the translator a run wants. It is deliberately a plain
 // struct: main.go resolves flags over config over defaults into one of these,
 // and the end-to-end tests fill in BaseURL to keep a whole run off the network.
 type Options struct {
-	Provider string // "google" or "openai"
 	From, To string
 	APIKey   string
 	Model    string
 	Workers  int
-	BaseURL  string // test seam; empty means the provider's real endpoint
+	BaseURL  string // test seam; empty means the real endpoint
 }
 
 // Validate reports the option errors worth raising before any work happens. It
 // is exported separately from NewTranslator so a run can refuse a missing API
 // key up front, rather than after an hour of transcription.
 func (o Options) Validate() error {
-	switch o.Provider {
-	case "", ProviderGoogle:
-		return nil
-	case ProviderOpenAI:
-		if strings.TrimSpace(o.APIKey) == "" {
-			return errors.New("the openai provider needs an API key: " +
-				"set OPENAI_API_KEY in the environment, or run " +
-				"`sub-translator config set translate.api-key <key>`")
-		}
-		return nil
-	default:
-		return fmt.Errorf("unknown translation provider %q; valid providers: %s, %s",
-			o.Provider, ProviderGoogle, ProviderOpenAI)
+	if strings.TrimSpace(o.APIKey) == "" {
+		return errors.New("translation needs an OpenAI API key: " +
+			"set OPENAI_API_KEY in the environment, or run " +
+			"`sub-translator config set translate.api-key <key>`")
 	}
+	return nil
 }
 
-// DefaultWorkersFor is how many batches a provider translates at once when
-// neither -workers nor translate.workers says otherwise. It differs by provider
-// deliberately: see the constants.
-func DefaultWorkersFor(provider string) int {
-	if provider == ProviderOpenAI {
-		return defaultOpenAIWorkers
-	}
-	return defaultGoogleWorkers
-}
-
-// NewTranslator builds the provider the options name. An empty provider, model
-// or worker count takes the default, so a partially configured machine still
-// runs.
+// NewTranslator builds the translator the options describe. An empty model or
+// worker count takes the default, so a partially configured machine still runs.
 func NewTranslator(o Options) (Translator, error) {
 	if err := o.Validate(); err != nil {
 		return nil, err
 	}
 	if o.Workers < 1 {
-		o.Workers = DefaultWorkersFor(o.Provider)
+		o.Workers = DefaultWorkers
 	}
-	switch o.Provider {
-	case "", ProviderGoogle:
-		c := New(o.From, o.To)
-		if o.BaseURL != "" {
-			c.baseURL = o.BaseURL
-		}
-		c.Workers = o.Workers
-		return c, nil
-	default: // Validate has already rejected anything but openai here.
-		return newOpenAI(o), nil
-	}
+	return newOpenAI(o), nil
 }
 
-// provider is one backend as the worker pool sees it. Keeping the pool blind to
-// which endpoint is behind it is what lets the ordering, progress and
-// failure-accounting rules be written once.
+// provider is the backend as the worker pool sees it. Keeping the pool blind to
+// the endpoint behind it is what lets the ordering, progress and
+// failure-accounting rules be written once — and lets them be tested against a
+// scripted provider no real endpoint would imitate.
 type provider interface {
 	// batch translates every text in one request, retries included. before holds
-	// the source lines immediately preceding the batch, as context for a provider
-	// that can use it.
+	// the source lines immediately preceding the batch, as context for the model.
 	batch(texts, before []string) ([]string, error)
 	// one translates a single text, for when a batch comes back unusable.
 	one(text string, before []string) (string, error)
 }
 
-// translateAll is the shared body of every provider's TranslateAll: it splits
-// the texts into batches, translates up to workers of them at a time, and
-// accounts for what failed.
+// translateAll is the body of the provider's TranslateAll: it splits the texts
+// into batches, translates up to workers of them at a time, and accounts for
+// what failed.
 //
 // Four rules are load-bearing here and each of them was a bug once:
 //   - results are written by index, never appended, because the order of the
@@ -219,8 +194,8 @@ func runBatch(p provider, results []string, start int, batch, before []string) (
 		// The pool's whole safety argument is that a worker writes only inside
 		// its own range. A provider handing back more strings than it was given
 		// would write into the next worker's range — a real data race and a
-		// scrambled file, with progress still reading 100%. Both providers check
-		// their own counts, so this is a backstop, and a cheap one.
+		// scrambled file, with progress still reading 100%. The provider checks its
+		// own counts, so this is a backstop, and a cheap one.
 		err = fmt.Errorf("provider returned %d translations for %d blocks",
 			len(translated), len(batch))
 	}
@@ -250,11 +225,11 @@ func runBatch(p provider, results []string, start int, batch, before []string) (
 		return 0, giveUp(0), err
 	}
 
-	// Any other failure — a mangled separator on the Google side, a key set that
-	// does not match on the OpenAI side — says nothing about the endpoint's
-	// health, so each block gets its own attempt. This is the expensive path, not
-	// the cheap one: a provider that can retry its own batch more cheaply than
-	// len(batch) single requests does so before handing the failure back here.
+	// Any other failure — a reply whose key set is not the one the batch asked
+	// about — says nothing about the endpoint's health, so each block gets its own
+	// attempt. This is the expensive path, not the cheap one: the provider retries
+	// its own batch first, because one more batch request is far cheaper than
+	// len(batch) single ones.
 	lastErr := err
 	n := 0
 	// statusFailures bounds what the fan-out will tolerate before deciding the

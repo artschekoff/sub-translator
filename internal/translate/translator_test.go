@@ -1,6 +1,7 @@
 package translate
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"slices"
@@ -12,6 +13,13 @@ import (
 	"time"
 )
 
+func init() {
+	// Tests run with millisecond-scale timing to avoid 48-second overhead.
+	retryBaseDelay = time.Millisecond
+	perBlockSleep = time.Millisecond
+	batchSleep = time.Millisecond
+}
+
 // lines builds n numbered source texts, which is enough to cross several
 // batchSize boundaries.
 func lines(n int) []string {
@@ -22,16 +30,21 @@ func lines(n int) []string {
 	return out
 }
 
-// batchOf answers a Google-shaped batch request by prefixing every line, and
-// returns the index the batch started at so a handler can key its behaviour on
-// which batch it is looking at.
-func batchOf(q string) (start int, reply string) {
-	parts := strings.Split(q, strings.TrimSpace(separator))
-	start, _ = strconv.Atoi(strings.TrimPrefix(strings.TrimSpace(parts[0]), "line-"))
-	for i, p := range parts {
-		parts[i] = "ES:" + strings.TrimSpace(p)
+// batchOf decodes the batch one request carries and returns it together with the
+// index it starts at, parsed from its first line, so a handler can key its
+// behaviour on which batch it is looking at.
+//
+// It takes no *testing.T on purpose: it runs on the test server's goroutine,
+// where t.Fatal would abort the wrong goroutine and hang the run.
+func batchOf(r capturedRequest) (batchPayload, int) {
+	var p batchPayload
+	for _, m := range r.Message {
+		if m.Role == "user" {
+			_ = json.Unmarshal([]byte(m.Content), &p)
+		}
 	}
-	return start, jsonFor2(strings.Join(parts, separator))
+	start, _ := strconv.Atoi(strings.TrimPrefix(p.Translate["0"], "line-"))
+	return p, start
 }
 
 // The pool finishes batches in whatever order the endpoint answers them, and a
@@ -42,19 +55,19 @@ func TestTranslateAllPreservesOrderUnderConcurrency(t *testing.T) {
 	texts := lines(180) // five batches: 40, 40, 40, 40, 20
 
 	var inFlight, peak atomic.Int32
-	c := clientFor(t, func(w http.ResponseWriter, r *http.Request) {
+	c, _ := openAIFor(t, func(w http.ResponseWriter, got capturedRequest) {
 		if n := inFlight.Add(1); n > peak.Load() {
 			peak.Store(n)
 		}
 		defer inFlight.Add(-1)
 
-		start, reply := batchOf(r.URL.Query().Get("q"))
+		p, start := batchOf(got)
 		// Earlier batches are slower, so completion order is the reverse of
 		// request order.
 		time.Sleep(time.Duration(5-start/batchSize) * 8 * time.Millisecond)
-		fmt.Fprint(w, reply)
+		echoTranslation(w, p)
 	})
-	c.Workers = 4
+	c.workers = 4
 
 	got, failed, err := c.TranslateAll(texts, nil)
 	if err != nil || len(failed) != 0 {
@@ -71,7 +84,7 @@ func TestTranslateAllPreservesOrderUnderConcurrency(t *testing.T) {
 	}
 }
 
-// Workers: 1 must reproduce the sequential run this package always did: one
+// workers: 1 must reproduce the sequential run this package always did: one
 // batch in flight at a time, in ascending order.
 func TestTranslateAllWorkersOneIsSequential(t *testing.T) {
 	texts := lines(100)
@@ -79,20 +92,20 @@ func TestTranslateAllWorkersOneIsSequential(t *testing.T) {
 	var mu sync.Mutex
 	var order []int
 	var inFlight, peak atomic.Int32
-	c := clientFor(t, func(w http.ResponseWriter, r *http.Request) {
+	c, _ := openAIFor(t, func(w http.ResponseWriter, got capturedRequest) {
 		if n := inFlight.Add(1); n > peak.Load() {
 			peak.Store(n)
 		}
 		defer inFlight.Add(-1)
 
-		start, reply := batchOf(r.URL.Query().Get("q"))
+		p, start := batchOf(got)
 		mu.Lock()
 		order = append(order, start)
 		mu.Unlock()
 		time.Sleep(2 * time.Millisecond)
-		fmt.Fprint(w, reply)
+		echoTranslation(w, p)
 	})
-	c.Workers = 1
+	c.workers = 1
 
 	if _, failed, err := c.TranslateAll(texts, nil); err != nil || len(failed) != 0 {
 		t.Fatalf("err=%v failed=%v", err, failed)
@@ -101,7 +114,7 @@ func TestTranslateAllWorkersOneIsSequential(t *testing.T) {
 		t.Errorf("batches were requested in order %v, want %v", order, want)
 	}
 	if peak.Load() != 1 {
-		t.Errorf("peak concurrency was %d with Workers: 1, want 1", peak.Load())
+		t.Errorf("peak concurrency was %d with workers: 1, want 1", peak.Load())
 	}
 }
 
@@ -112,18 +125,17 @@ func TestTranslateAllWorkersOneIsSequential(t *testing.T) {
 func TestTranslateAllProgressIsMonotonicAndCountsTranslated(t *testing.T) {
 	texts := lines(180)
 
-	c := clientFor(t, func(w http.ResponseWriter, r *http.Request) {
-		q := r.URL.Query().Get("q")
-		start, reply := batchOf(q)
+	c, _ := openAIFor(t, func(w http.ResponseWriter, got capturedRequest) {
+		p, start := batchOf(got)
 		// The third batch is throttled into failure; the rest answer out of order.
 		if start == 80 {
 			w.WriteHeader(http.StatusTooManyRequests)
 			return
 		}
 		time.Sleep(time.Duration(5-start/batchSize) * 4 * time.Millisecond)
-		fmt.Fprint(w, reply)
+		echoTranslation(w, p)
 	})
-	c.Workers = 4
+	c.workers = 4
 
 	var mu sync.Mutex
 	var seen [][2]int
@@ -170,13 +182,14 @@ func TestRetryHonoursRetryAfter(t *testing.T) {
 	t.Cleanup(func() { retryAfterUnit = oldUnit })
 
 	var calls atomic.Int32
-	c := clientFor(t, func(w http.ResponseWriter, r *http.Request) {
+	c, requests := openAIFor(t, func(w http.ResponseWriter, got capturedRequest) {
 		if calls.Add(1) == 1 {
 			w.Header().Set("Retry-After", "3")
 			w.WriteHeader(http.StatusTooManyRequests)
 			return
 		}
-		fmt.Fprint(w, jsonFor(r.URL.Query().Get("q")))
+		p, _ := batchOf(got)
+		echoTranslation(w, p)
 	})
 
 	start := time.Now()
@@ -193,6 +206,9 @@ func TestRetryHonoursRetryAfter(t *testing.T) {
 	// account for a wait of three units.
 	if want := 3 * retryAfterUnit; elapsed < want {
 		t.Errorf("retried after %s, want at least %s — Retry-After was ignored", elapsed, want)
+	}
+	if n := len(requests()); n != 2 {
+		t.Errorf("%d requests, want 2: the throttled one and the retry that worked", n)
 	}
 }
 
@@ -224,14 +240,51 @@ func TestParseRetryAfterIgnoresWhatItCannotUse(t *testing.T) {
 	}
 }
 
+// One bad block must not throw away the other 1833. The batch fails for a reason
+// that says nothing about the endpoint, the blocks are retried one at a time, and
+// the single block that keeps failing is reported by index while its neighbours
+// come back translated.
+func TestTranslateAllPartialFailureReportsIndices(t *testing.T) {
+	c, _ := openAIFor(t, func(w http.ResponseWriter, got capturedRequest) {
+		p, _ := batchOf(got)
+		if len(p.Translate) > 1 {
+			// The batch: a reply about blocks nobody asked about, which is not the
+			// endpoint's health and so falls through to the per-block path.
+			reply(w, `{"999":"ES:invented"}`)
+			return
+		}
+		if p.Translate["0"] == "BOOM" {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		echoTranslation(w, p)
+	})
+
+	texts := []string{"one", "BOOM", "three"}
+	got, failed, err := c.TranslateAll(texts, nil)
+	if err != nil {
+		t.Fatalf("partial failure must not be fatal: %v", err)
+	}
+	if len(failed) != 1 || failed[0] != 1 {
+		t.Fatalf("failed = %v, want [1]", failed)
+	}
+	if got[1] != "BOOM" {
+		t.Errorf("failed block must keep its original, got %q", got[1])
+	}
+	if got[0] != "ES:one" || got[2] != "ES:three" {
+		t.Errorf("surviving blocks were not translated: %q, %q", got[0], got[2])
+	}
+}
+
 // The per-block path must not outlive the endpoint's health. A batch can fail
-// for a reason that says nothing about the server — a mangled separator here —
-// and the blocks are then retried one at a time; but once those single blocks
-// start coming back refused, the rest cannot possibly succeed. Continuing is
-// what turns a rate limit into hours of silence: 40 blocks × maxAttempts
-// requests, each attempt able to honour a Retry-After, four workers deep, with
-// the user watching "progress: 0/1834" and no error at all. Measured at 161
-// requests and 120 seconds for one batch before this was bounded.
+// for a reason that says nothing about the server — a reply whose keys are not
+// the ones it was asked about — and the blocks are then retried one at a time;
+// but once those single blocks start coming back refused, the rest cannot
+// possibly succeed. Continuing is what turns a rate limit into hours of silence:
+// 40 blocks × maxAttempts requests, each attempt able to honour a Retry-After,
+// four workers deep, with the user watching "progress: 0/1834" and no error at
+// all. Measured at 161 requests and 120 seconds for one batch before this was
+// bounded.
 func TestTranslateAllStopsFanningOutWhenTheEndpointRefuses(t *testing.T) {
 	// The header is honoured for real; only the unit is shrunk, or asserting the
 	// request count would cost the suite three seconds of genuine sleeping.
@@ -243,35 +296,35 @@ func TestTranslateAllStopsFanningOutWhenTheEndpointRefuses(t *testing.T) {
 		name string
 		// status is what every per-block request comes back as.
 		status int
-		// wantAtMost is the request budget: the batch, plus the blocks it took to
-		// establish that the endpoint is refusing. Never a multiple of len(batch).
-		wantAtMost int32
+		// wantAtMost is the request budget: the batch attempts, plus the blocks it
+		// took to establish that the endpoint is refusing. Never a multiple of
+		// len(batch).
+		wantAtMost int
 	}{
 		// Throttling is about us, so the first one ends the batch.
-		{"throttled", http.StatusTooManyRequests, 1 + maxAttempts},
+		{"throttled", http.StatusTooManyRequests, malformedAttempts + maxAttempts},
 		// A server fault may be about one block's content, so one is tolerated —
 		// but not forty.
-		{"faulting", http.StatusInternalServerError, 1 + 2*maxAttempts},
+		{"faulting", http.StatusInternalServerError, malformedAttempts + 2*maxAttempts},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			texts := lines(batchSize)
 
-			var calls atomic.Int32
-			c := clientFor(t, func(w http.ResponseWriter, r *http.Request) {
-				calls.Add(1)
-				if strings.Contains(r.URL.Query().Get("q"), strings.TrimSpace(separator)) {
-					// The batch: answered 200, but with the separator eaten, so the
-					// result cannot be split back apart.
-					fmt.Fprint(w, jsonFor2("one two three"))
+			c, requests := openAIFor(t, func(w http.ResponseWriter, got capturedRequest) {
+				p, _ := batchOf(got)
+				if len(p.Translate) > 1 {
+					// The batch: answered 200, but about a block it was never given, so
+					// the reply cannot be mapped back onto anything.
+					reply(w, `{"999":"ES:invented"}`)
 					return
 				}
 				// Every single block: refused, for as long as anyone cares to ask.
 				w.Header().Set("Retry-After", "1")
 				w.WriteHeader(tt.status)
 			})
-			c.Workers = 1
+			c.workers = 1
 
 			got, failed, err := c.TranslateAll(texts, nil)
 			if err == nil {
@@ -288,13 +341,13 @@ func TestTranslateAllStopsFanningOutWhenTheEndpointRefuses(t *testing.T) {
 					t.Errorf("block %d: want the original kept, got %q", i, got[i])
 				}
 			}
-			if calls.Load() > tt.wantAtMost {
+			if n := len(requests()); n > tt.wantAtMost {
 				t.Errorf("%d requests for one refused batch, want at most %d — the "+
 					"fan-out kept going after the endpoint started refusing",
-					calls.Load(), tt.wantAtMost)
+					n, tt.wantAtMost)
 			}
 			t.Logf("requests: %d (unbounded shape would be %d)",
-				calls.Load(), 1+maxAttempts*len(texts))
+				len(requests()), malformedAttempts+maxAttempts*len(texts))
 		})
 	}
 }
@@ -306,20 +359,20 @@ func TestTranslateAllStopsFanningOutWhenTheEndpointRefuses(t *testing.T) {
 func TestTranslateAllSortsFailedIndicesWhateverTheCompletionOrder(t *testing.T) {
 	texts := lines(3 * batchSize)
 
-	c := clientFor(t, func(w http.ResponseWriter, r *http.Request) {
-		start, reply := batchOf(r.URL.Query().Get("q"))
+	c, _ := openAIFor(t, func(w http.ResponseWriter, got capturedRequest) {
+		p, start := batchOf(got)
 		switch start {
 		case 0:
 			// Fails last, though it was requested first.
-			time.Sleep(40 * time.Millisecond)
+			time.Sleep(10 * time.Millisecond)
 			w.WriteHeader(http.StatusTooManyRequests)
 		case batchSize:
 			w.WriteHeader(http.StatusTooManyRequests)
 		default:
-			fmt.Fprint(w, reply)
+			echoTranslation(w, p)
 		}
 	})
-	c.Workers = 4
+	c.workers = 4
 
 	_, failed, err := c.TranslateAll(texts, nil)
 	if err != nil {
@@ -374,7 +427,7 @@ func (p *countingProvider) one(text string, _ []string) (string, error) {
 }
 
 // A provider that returns the wrong number of strings must not be trusted with
-// the results slice. Both providers count their own replies today, so this is a
+// the results slice. The provider counts its own replies today, so this is a
 // backstop — but the pool's safety argument is that a worker writes only inside
 // its own range, and the cost of being wrong is a data race plus a scrambled
 // film that still reports 100%.
