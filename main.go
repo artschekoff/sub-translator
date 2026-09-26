@@ -554,10 +554,14 @@ func withLangs(o translate.Options, from, to string) translate.Options {
 // describeProvider names what is about to be spent: which endpoint, which model
 // when there is one, and how many batches go out at once.
 func describeProvider(o translate.Options) string {
+	name := o.Provider
 	if o.Provider == translate.ProviderOpenAI {
-		return fmt.Sprintf("openai %s, %d workers", o.Model, o.Workers)
+		name += " " + o.Model
 	}
-	return fmt.Sprintf("google, %d workers", o.Workers)
+	if o.Workers == 1 {
+		return name
+	}
+	return fmt.Sprintf("%s, %d workers", name, o.Workers)
 }
 
 // errEmptyTranscript is what whisper producing nothing at all comes back as.

@@ -75,6 +75,14 @@ func TestRunConfigMasksTheAPIKeyInListButNotInGet(t *testing.T) {
 		t.Fatalf("set: %v", err)
 	}
 
+	var set strings.Builder
+	if err := runConfig([]string{"set", "translate.api-key", key}, &set); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	if strings.Contains(set.String(), key) {
+		t.Errorf("config set echoed the key in full: %q", set.String())
+	}
+
 	var list strings.Builder
 	if err := runConfig([]string{"list"}, &list); err != nil {
 		t.Fatalf("list: %v", err)
