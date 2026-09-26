@@ -52,7 +52,6 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 		"whisper.threads":       "8",
 		"whisper.language":      "auto",
 		"models.dir":            "/models",
-		"translate.provider":    "openai",
 		"translate.api-key":     "sk-abcdefghijklmnop-a4f2",
 		"translate.model":       "gpt-6-luna",
 		"translate.workers":     "6",
@@ -214,16 +213,14 @@ func TestSetRejectsMalformedNumbers(t *testing.T) {
 	}
 }
 
-// A provider that does not exist, a worker count that cannot run and an empty
-// model are all mistakes worth catching at `config set`, where the message can
-// still name what is acceptable, rather than in the middle of a film.
+// A worker count that cannot run and an empty model are both mistakes worth
+// catching at `config set`, where the message can still name what is acceptable,
+// rather than in the middle of a film.
 func TestSetValidatesTranslateSettings(t *testing.T) {
 	c := &Config{}
 	for _, tt := range []struct {
 		key, value, mustName string
 	}{
-		{"translate.provider", "deepl", "openai"},
-		{"translate.provider", "", "google"},
 		{"translate.workers", "0", "positive"},
 		{"translate.workers", "-2", "positive"},
 		{"translate.workers", "lots", "positive"},
@@ -240,9 +237,9 @@ func TestSetValidatesTranslateSettings(t *testing.T) {
 				tt.key, tt.value, err, tt.mustName)
 		}
 	}
-	for _, provider := range []string{"google", "openai"} {
-		if err := c.Set("translate.provider", provider); err != nil {
-			t.Errorf("Set(translate.provider, %q): %v", provider, err)
+	for _, ok := range []string{"1", "4", "16"} {
+		if err := c.Set("translate.workers", ok); err != nil {
+			t.Errorf("Set(translate.workers, %q): %v", ok, err)
 		}
 	}
 }
@@ -308,7 +305,7 @@ func TestKeysAreSortedAndComplete(t *testing.T) {
 		t.Errorf("Keys() must be sorted for stable output, got %v", keys)
 	}
 	for _, want := range []string{
-		"models.dir", "translate.api-key", "translate.model", "translate.provider",
+		"models.dir", "translate.api-key", "translate.model",
 		"translate.workers", "whisper.bin", "whisper.chunk-minutes",
 		"whisper.language", "whisper.model", "whisper.threads", "whisper.vad-model",
 		"whisper.vad-threshold",
