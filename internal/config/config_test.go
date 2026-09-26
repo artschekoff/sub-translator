@@ -300,18 +300,20 @@ func TestMask(t *testing.T) {
 }
 
 func TestKeysAreSortedAndComplete(t *testing.T) {
-	keys := Keys()
-	if !slices.IsSorted(keys) {
-		t.Errorf("Keys() must be sorted for stable output, got %v", keys)
-	}
-	for _, want := range []string{
+	// The comparison is exact in both directions on purpose. Checking only that
+	// every expected key is present cannot notice a key that should have gone —
+	// translate.provider was removed here, and a per-key Contains would have kept
+	// saying so if it came back.
+	want := []string{
 		"models.dir", "translate.api-key", "translate.model",
 		"translate.workers", "whisper.bin", "whisper.chunk-minutes",
 		"whisper.language", "whisper.model", "whisper.threads", "whisper.vad-model",
 		"whisper.vad-threshold",
-	} {
-		if !slices.Contains(keys, want) {
-			t.Errorf("Keys() missing %q", want)
-		}
+	}
+	if !slices.IsSorted(want) {
+		t.Fatalf("the expected list is itself unsorted: %v", want)
+	}
+	if keys := Keys(); !slices.Equal(keys, want) {
+		t.Errorf("Keys() = %v, want exactly %v", keys, want)
 	}
 }
