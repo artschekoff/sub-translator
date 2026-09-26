@@ -21,12 +21,84 @@ type Translator interface {
 	TranslateAll(texts []string, progress func(done, total int)) ([]string, []int, error)
 }
 
+// Provider names, as the -provider flag and translate.provider config accept them.
 const (
+	ProviderGoogle = "google"
+	ProviderOpenAI = "openai"
+)
+
+const (
+	// DefaultModel is the OpenAI model subtitle translation defaults to. Of the
+	// current line — Astra (flagship, complex reasoning), Sol (balanced), Luna
+	// (cost-sensitive, high volume) — subtitles are the high-volume,
+	// low-reasoning case, which is Luna.
+	DefaultModel = "gpt-6-luna"
+
+	// DefaultWorkers is how many batches are translated at once. Four is enough
+	// to hide the round-trip latency that used to dominate a run without turning
+	// a free endpoint's rate limit into a wall.
+	DefaultWorkers = 4
+
 	// contextLines is how many already-seen source lines are handed to an LLM
 	// provider as context. Three is enough to carry who is addressing whom,
 	// names and formality across a batch boundary.
 	contextLines = 3
 )
+
+// Options describes the translator a run wants. It is deliberately a plain
+// struct: main.go resolves flags over config over defaults into one of these,
+// and the end-to-end tests fill in BaseURL to keep a whole run off the network.
+type Options struct {
+	Provider string // "google" or "openai"
+	From, To string
+	APIKey   string
+	Model    string
+	Workers  int
+	BaseURL  string // test seam; empty means the provider's real endpoint
+}
+
+// Validate reports the option errors worth raising before any work happens. It
+// is exported separately from NewTranslator so a run can refuse a missing API
+// key up front, rather than after an hour of transcription.
+func (o Options) Validate() error {
+	switch o.Provider {
+	case "", ProviderGoogle:
+		return nil
+	case ProviderOpenAI:
+		if strings.TrimSpace(o.APIKey) == "" {
+			return errors.New("the openai provider needs an API key: " +
+				"set OPENAI_API_KEY in the environment, or run " +
+				"`sub-translator config set translate.api-key <key>`")
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown translation provider %q; valid providers: %s, %s",
+			o.Provider, ProviderGoogle, ProviderOpenAI)
+	}
+}
+
+// NewTranslator builds the provider the options name. An empty provider, model
+// or worker count takes the default, so a partially configured machine still
+// runs.
+func NewTranslator(o Options) (Translator, error) {
+	if err := o.Validate(); err != nil {
+		return nil, err
+	}
+	if o.Workers < 1 {
+		o.Workers = DefaultWorkers
+	}
+	switch o.Provider {
+	case "", ProviderGoogle:
+		c := New(o.From, o.To)
+		if o.BaseURL != "" {
+			c.baseURL = o.BaseURL
+		}
+		c.Workers = o.Workers
+		return c, nil
+	default: // Validate has already rejected anything but openai here.
+		return newOpenAI(o), nil
+	}
+}
 
 // provider is one backend as the worker pool sees it. Keeping the pool blind to
 // which endpoint is behind it is what lets the ordering, progress and
