@@ -30,10 +30,9 @@ type ModelsConfig struct {
 }
 
 type TranslateConfig struct {
-	Provider string `json:"provider,omitempty"`
-	APIKey   string `json:"apiKey,omitempty"`
-	Model    string `json:"model,omitempty"`
-	Workers  int    `json:"workers,omitempty"`
+	APIKey  string `json:"apiKey,omitempty"`
+	Model   string `json:"model,omitempty"`
+	Workers int    `json:"workers,omitempty"`
 }
 
 type Config struct {
@@ -119,18 +118,6 @@ var fields = map[string]field{
 	"models.dir": {
 		get: func(c *Config) string { return c.Models.Dir },
 		set: func(c *Config, v string) error { c.Models.Dir = expandPath(v); return nil },
-	},
-	"translate.provider": {
-		get: func(c *Config) string { return c.Translate.Provider },
-		set: func(c *Config, v string) error {
-			switch v = strings.TrimSpace(v); v {
-			case "google", "openai":
-				c.Translate.Provider = v
-				return nil
-			default:
-				return fmt.Errorf("translate.provider must be google or openai, got %q", v)
-			}
-		},
 	},
 	// The key is the one setting here that is genuinely a secret. It is stored in
 	// the same 0600 file as everything else, and masked by Display so that the

@@ -13,7 +13,7 @@ import (
 
 // defaultOpenAIURL is the chat completions endpoint. The whole URL is
 // overridable rather than just a host, so a test server needs no route of a
-// particular shape — the same arrangement Options.BaseURL makes for Google.
+// particular shape — that is the seam Options.BaseURL exists for.
 const defaultOpenAIURL = "https://api.openai.com/v1/chat/completions"
 
 // openAIClient translates through an OpenAI chat model. The reason to pay for a
@@ -37,8 +37,8 @@ func newOpenAI(o Options) *openAIClient {
 		apiKey:  strings.TrimSpace(o.APIKey),
 		baseURL: o.BaseURL,
 		workers: o.Workers,
-		// Well above the Google client's 30 seconds: forty lines through a chat
-		// model is a slower round trip, and a timeout here fails a whole batch.
+		// Generous on purpose: forty lines through a chat model is a slow round
+		// trip, and a timeout here fails a whole batch.
 		http: &http.Client{Timeout: 120 * time.Second},
 	}
 	if c.model == "" {
@@ -48,7 +48,7 @@ func newOpenAI(o Options) *openAIClient {
 		c.baseURL = defaultOpenAIURL
 	}
 	if c.workers < 1 {
-		c.workers = defaultOpenAIWorkers
+		c.workers = DefaultWorkers
 	}
 	return c
 }
@@ -83,17 +83,17 @@ type batchPayload struct {
 // to fall back to one request per block.
 //
 // One retry, not none: a model's reply is sampled, so the same prompt can come
-// back well-formed on a second look. And the arithmetic is the opposite way round
-// from the Google path — fanning out is 40 requests, each re-sending the system
-// prompt and the context lines, against one request to ask the batch again. The
-// cheap recovery here is the retry; the fan-out is the expensive last resort.
+// back well-formed on a second look. And the arithmetic favours it — fanning out
+// is 40 requests, each re-sending the system prompt and the context lines,
+// against one request to ask the batch again. The cheap recovery here is the
+// retry; the fan-out is the expensive last resort.
 const malformedAttempts = 2
 
 // batch translates one batch in a single request. The blocks go out as a JSON
 // object keyed by index and must come back as an object with exactly those keys.
 // Anything else — a missing key, an extra key, a renumbered set, a body that will
 // not parse — is retried once and then fails the batch, which falls through to
-// the per-block path exactly as a mangled separator does on the Google side.
+// the pool's per-block path.
 func (c *openAIClient) batch(texts, before []string) ([]string, error) {
 	keys := make([]string, len(texts))
 	src := make(map[string]string, len(texts))

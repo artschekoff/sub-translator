@@ -109,7 +109,7 @@ func TestRunConfigRejectsBadUsage(t *testing.T) {
 		{},
 		{"frobnicate"},
 		{"set", "whisper.threads"},
-		{"set", "translate.provider", "deepl"},
+		{"set", "translate.model", "   "},
 		{"set", "translate.workers", "0"},
 		{"set"},
 		{"get"},

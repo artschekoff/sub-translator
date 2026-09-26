@@ -1,8 +1,11 @@
 package main
 
 import (
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -197,8 +200,7 @@ func TestResolveWhisperFlagsBeatConfigForBinaryAndVAD(t *testing.T) {
 }
 
 // The translation settings follow the same precedence as -whisper-model and
-// friends: flag, then config, then default. The default provider in particular
-// must stay google — nobody should start spending money because they upgraded.
+// friends: flag, then config, then default.
 func TestResolveTranslateOptions(t *testing.T) {
 	// A key exported in the caller's environment must not leak into the cases
 	// that are about config.
@@ -207,10 +209,9 @@ func TestResolveTranslateOptions(t *testing.T) {
 	empty := &config.Config{}
 	configured := &config.Config{}
 	for key, value := range map[string]string{
-		"translate.provider": "openai",
-		"translate.api-key":  "sk-from-config",
-		"translate.model":    "gpt-6-sol",
-		"translate.workers":  "8",
+		"translate.api-key": "sk-from-config",
+		"translate.model":   "gpt-6-sol",
+		"translate.workers": "8",
 	} {
 		if err := configured.Set(key, value); err != nil {
 			t.Fatalf("Set(%q): %v", key, err)
@@ -218,48 +219,44 @@ func TestResolveTranslateOptions(t *testing.T) {
 	}
 
 	tests := []struct {
-		name         string
-		cfg          *config.Config
-		providerFlag string
-		workersFlag  int
-		env          string
-		want         translate.Options
+		name        string
+		cfg         *config.Config
+		workersFlag int
+		env         string
+		want        translate.Options
 	}{
 		{
+			// No key anywhere: the defaults still resolve, and Validate is what
+			// refuses the run — see TestResolveTranslateOptionsWithoutAKeyIsRefused.
 			name: "nothing configured", cfg: empty, workersFlag: -1,
 			want: translate.Options{
-				Provider: translate.ProviderGoogle,
-				Model:    translate.DefaultModel,
-				Workers:  translate.DefaultWorkersFor(translate.ProviderGoogle),
+				Model:   translate.DefaultModel,
+				Workers: translate.DefaultWorkers,
 			},
 		},
 		{
 			name: "config supplies everything", cfg: configured, workersFlag: -1,
 			want: translate.Options{
-				Provider: translate.ProviderOpenAI,
-				APIKey:   "sk-from-config",
-				Model:    "gpt-6-sol",
-				Workers:  8,
+				APIKey:  "sk-from-config",
+				Model:   "gpt-6-sol",
+				Workers: 8,
 			},
 		},
 		{
-			name: "flags beat config", cfg: configured,
-			providerFlag: "google", workersFlag: 2,
+			name: "flags beat config", cfg: configured, workersFlag: 2,
 			want: translate.Options{
-				Provider: translate.ProviderGoogle,
-				APIKey:   "sk-from-config",
-				Model:    "gpt-6-sol",
-				Workers:  2,
+				APIKey:  "sk-from-config",
+				Model:   "gpt-6-sol",
+				Workers: 2,
 			},
 		},
 		{
 			name: "the environment beats the config file", cfg: configured,
 			workersFlag: -1, env: "sk-from-env",
 			want: translate.Options{
-				Provider: translate.ProviderOpenAI,
-				APIKey:   "sk-from-env",
-				Model:    "gpt-6-sol",
-				Workers:  8,
+				APIKey:  "sk-from-env",
+				Model:   "gpt-6-sol",
+				Workers: 8,
 			},
 		},
 	}
@@ -267,9 +264,12 @@ func TestResolveTranslateOptions(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Setenv("OPENAI_API_KEY", tt.env)
-			got := resolveTranslateOptions(tt.cfg, tt.providerFlag, tt.workersFlag)
+			got := resolveTranslateOptions(tt.cfg, tt.workersFlag)
 			if got != tt.want {
 				t.Errorf("resolveTranslateOptions() = %+v, want %+v", got, tt.want)
+			}
+			if tt.want.APIKey == "" {
+				return
 			}
 			if err := got.Validate(); err != nil {
 				t.Errorf("the resolved options do not validate: %v", err)
@@ -278,18 +278,14 @@ func TestResolveTranslateOptions(t *testing.T) {
 	}
 }
 
-// An openai run with no key anywhere must fail with a message that names both
-// ways of supplying one, and it must fail before anything expensive happens.
+// A run with no key anywhere must fail with a message that names both ways of
+// supplying one, and it must fail before anything expensive happens.
 func TestResolveTranslateOptionsWithoutAKeyIsRefused(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", "")
-	c := &config.Config{}
-	if err := c.Set("translate.provider", "openai"); err != nil {
-		t.Fatal(err)
-	}
 
-	err := resolveTranslateOptions(c, "", -1).Validate()
+	err := resolveTranslateOptions(&config.Config{}, -1).Validate()
 	if err == nil {
-		t.Fatal("want an error for the openai provider with no key")
+		t.Fatal("want an error when there is no API key anywhere")
 	}
 	for _, want := range []string{"OPENAI_API_KEY", "translate.api-key"} {
 		if !strings.Contains(err.Error(), want) {
@@ -300,41 +296,131 @@ func TestResolveTranslateOptionsWithoutAKeyIsRefused(t *testing.T) {
 
 func TestResolveWorkers(t *testing.T) {
 	for _, tt := range []struct {
-		flagValue, configValue int
-		provider               string
-		want                   int
+		flagValue, configValue, want int
 	}{
-		// Nothing given: the default follows the provider, because one batch at a
-		// time is what a free public endpoint tolerates.
-		{-1, 0, translate.ProviderGoogle, 1},
-		{-1, 0, translate.ProviderOpenAI, 4},
-		{-1, 6, translate.ProviderGoogle, 6}, // config
-		{2, 6, translate.ProviderGoogle, 2},  // flag wins
-		{4, 0, translate.ProviderGoogle, 4},  // including asking Google for four
-		{1, 6, translate.ProviderOpenAI, 1},  // and asking openai for the sequential run
-		{0, 6, translate.ProviderGoogle, 0},  // a typed 0 survives, for main to reject
+		{-1, 0, translate.DefaultWorkers}, // nothing given
+		{-1, 6, 6},                        // config
+		{2, 6, 2},                         // flag wins
+		{1, 6, 1},                         // including asking for the sequential run
+		{0, 6, 0},                         // a typed 0 survives, for main to reject
 	} {
-		if got := resolveWorkers(tt.flagValue, tt.configValue, tt.provider); got != tt.want {
-			t.Errorf("resolveWorkers(%d, %d, %q) = %d, want %d",
-				tt.flagValue, tt.configValue, tt.provider, got, tt.want)
+		if got := resolveWorkers(tt.flagValue, tt.configValue); got != tt.want {
+			t.Errorf("resolveWorkers(%d, %d) = %d, want %d",
+				tt.flagValue, tt.configValue, got, tt.want)
 		}
 	}
 }
 
 // describeProvider is printed before a run spends anything, so it has to name
-// the model when there is one to pay for.
+// the model being paid for and how many batches are in flight — including when
+// the options have not been through NewTranslator yet and still hold zeroes.
 func TestDescribeProviderNamesWhatIsBeingSpent(t *testing.T) {
-	got := describeProvider(translate.Options{
-		Provider: translate.ProviderOpenAI, Model: "gpt-6-luna", Workers: 4,
-	})
+	got := describeProvider(translate.Options{Model: "gpt-6-luna", Workers: 4})
 	for _, want := range []string{"openai", "gpt-6-luna", "4"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("describeProvider() = %q, does not mention %s", got, want)
 		}
 	}
-	if got := describeProvider(translate.Options{
-		Provider: translate.ProviderGoogle, Model: translate.DefaultModel, Workers: 1,
-	}); strings.Contains(got, translate.DefaultModel) {
-		t.Errorf("describeProvider() = %q: the Google path has no model to name", got)
+	if got := describeProvider(translate.Options{}); !strings.Contains(got, translate.DefaultModel) ||
+		strings.Contains(got, "0 workers") {
+		t.Errorf("describeProvider() = %q, want the defaults named rather than zeroes", got)
 	}
+}
+
+// buildCLI compiles the real binary, so a test can assert on the order main does
+// things in. Nothing else can: the ordering lives in main(), which ends in
+// os.Exit, and calling the pieces in the right order from a test only proves the
+// test knows the order.
+func buildCLI(t *testing.T) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("the ffprobe stub is a POSIX shell script")
+	}
+	bin := filepath.Join(t.TempDir(), "sub-translator")
+	out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput()
+	if err != nil {
+		t.Fatalf("go build: %v\n%s", err, out)
+	}
+	return bin
+}
+
+// A missing API key must be refused before the video is probed. With no fallback
+// provider there is nothing a keyless run can produce, and under -source audio
+// the alternative is transcribing a whole film and only then discovering there is
+// no key — which is the waste this ordering exists to prevent.
+//
+// The proof has to be a real subprocess with a real ffprobe on PATH: only an
+// ffprobe that was never called can show the probe did not happen.
+func TestCLIRefusesAMissingAPIKeyBeforeProbing(t *testing.T) {
+	bin := buildCLI(t)
+
+	for _, tt := range []struct {
+		name string
+		args []string
+	}{
+		{"ordinary run", []string{"-to", "es"}},
+		{"progressive run", []string{"-to", "es", "-source", "audio", "-fast"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			binDir := filepath.Join(dir, "bin")
+			cfgDir := filepath.Join(dir, "config") // empty: no translate.api-key
+			for _, d := range []string{binDir, cfgDir} {
+				if err := os.MkdirAll(d, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			probeLog := filepath.Join(dir, "ffprobe.log")
+			writeStub(t, filepath.Join(binDir, "ffprobe"), "#!/bin/sh\necho called >> "+probeLog+"\nexit 1\n")
+
+			input := filepath.Join(dir, "movie.mkv")
+			if err := os.WriteFile(input, []byte("not really a film"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			cmd := exec.Command(bin, append(tt.args, input)...)
+			cmd.Env = append(envWithout(os.Environ(), "OPENAI_API_KEY"),
+				"XDG_CONFIG_HOME="+cfgDir,
+				"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			var stderr strings.Builder
+			cmd.Stderr = &stderr
+			var stdout strings.Builder
+			cmd.Stdout = &stdout
+			err := cmd.Run()
+
+			if err == nil {
+				t.Fatalf("the run succeeded with no API key:\n%s", stdout.String())
+			}
+			var exit *exec.ExitError
+			if !errors.As(err, &exit) {
+				t.Fatalf("the binary did not run: %v", err)
+			}
+			if code := exit.ExitCode(); code != 1 {
+				t.Errorf("exit status %d, want 1", code)
+			}
+			for _, want := range []string{"OPENAI_API_KEY", "translate.api-key"} {
+				if !strings.Contains(stderr.String(), want) {
+					t.Errorf("stderr does not mention %s:\n%s", want, stderr.String())
+				}
+			}
+			// The assertion that matters: ffprobe was never reached, so nothing was
+			// probed, extracted or transcribed before the key was checked.
+			if b, err := os.ReadFile(probeLog); err == nil && len(b) > 0 {
+				t.Errorf("ffprobe ran %d time(s) before the key was checked:\n%s%s",
+					len(strings.Fields(string(b))), stdout.String(), stderr.String())
+			}
+		})
+	}
+}
+
+// envWithout is os.Environ() with one variable removed, which is how a test
+// reproduces `env -u NAME`.
+func envWithout(env []string, name string) []string {
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		if !strings.HasPrefix(kv, name+"=") {
+			out = append(out, kv)
+		}
+	}
+	return out
 }

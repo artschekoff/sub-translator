@@ -1,12 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -31,27 +31,60 @@ func writeStub(t *testing.T, path, script string) {
 }
 
 // stubTranslator points every client the run builds at an httptest server that
-// prefixes each text with "ES:", so translation never reaches the network.
-// record, when non-nil, is called with each request's query before it is
-// answered.
-func stubTranslator(t *testing.T, record func(q url.Values)) {
+// answers like the chat endpoint, prefixing each line with "ES:", so translation
+// never reaches the network. record, when non-nil, is called with each request's
+// system prompt — which is where the languages are named — before it is answered.
+func stubTranslator(t *testing.T, record func(system string)) {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		q := r.URL.Query()
+		var req struct {
+			Messages []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("the translation request is not JSON: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var system, user string
+		for _, m := range req.Messages {
+			switch m.Role {
+			case "system":
+				system = m.Content
+			case "user":
+				user = m.Content
+			}
+		}
 		if record != nil {
-			record(q)
+			record(system)
 		}
-		parts := strings.Split(q.Get("q"), "|||||")
-		for i := range parts {
-			parts[i] = "ES:" + strings.TrimSpace(parts[i])
+		var payload struct {
+			Translate map[string]string `json:"translate"`
 		}
-		fmt.Fprintf(w, `[[[%q,"",null,null,3]],null,"en"]`, strings.Join(parts, " ||||| "))
+		if err := json.Unmarshal([]byte(user), &payload); err != nil {
+			t.Errorf("the user message is not the batch payload: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		out := make(map[string]string, len(payload.Translate))
+		for k, v := range payload.Translate {
+			out[k] = "ES:" + v
+		}
+		content, _ := json.Marshal(out)
+		fmt.Fprintf(w, `{"choices":[{"message":{"role":"assistant","content":%q}}]}`, content)
 	}))
 	t.Cleanup(srv.Close)
 
 	real := newTranslateClient
 	newTranslateClient = func(o translate.Options) (translate.Translator, error) {
 		o.BaseURL = srv.URL
+		if o.APIKey == "" {
+			// The key is mandatory now, and these tests are about the run rather
+			// than about where the key came from.
+			o.APIKey = "sk-test"
+		}
 		return translate.NewTranslator(o)
 	}
 	t.Cleanup(func() { newTranslateClient = real })
@@ -159,12 +192,11 @@ func TestRunProgressiveEndToEnd(t *testing.T) {
 	// observed from outside: chunk n's request happens after chunk n-1's write.
 	var mu sync.Mutex
 	var sizes []int64
-	var sls, tls []string
-	stubTranslator(t, func(q url.Values) {
+	var prompts []string
+	stubTranslator(t, func(system string) {
 		mu.Lock()
 		defer mu.Unlock()
-		sls = append(sls, q.Get("sl"))
-		tls = append(tls, q.Get("tl"))
+		prompts = append(prompts, system)
 		var size int64
 		if fi, err := os.Stat(outPath); err == nil {
 			size = fi.Size()
@@ -194,8 +226,15 @@ func TestRunProgressiveEndToEnd(t *testing.T) {
 	if got := strings.Fields(string(langs)); !slices.Equal(got, []string{"en", "en", "en"}) {
 		t.Errorf("whisper was given -l %v, want [en en en] — the source language, once per chunk", got)
 	}
-	if !slices.Equal(sls, []string{"en", "en", "en"}) || !slices.Equal(tls, []string{"es", "es", "es"}) {
-		t.Errorf("translated sl=%v tl=%v, want sl all en and tl all es", sls, tls)
+	if len(prompts) != 3 {
+		t.Fatalf("%d translation requests, want one per chunk", len(prompts))
+	}
+	for i, p := range prompts {
+		// A swapped from/to would read "from es into en" here, which is the whole
+		// point of asserting on the instruction rather than on the result.
+		if !strings.Contains(p, "from en into es") {
+			t.Errorf("chunk %d was asked to translate the wrong way round:\n%s", i+1, p)
+		}
 	}
 
 	// The file grew after every chunk. The first request sees no file at all,
@@ -403,10 +442,9 @@ func TestRunProgressiveNamesTheProvider(t *testing.T) {
 	streams[1].Tags.Language = "eng"
 	opts := whisper.Options{Bin: filepath.Join(binDir, "stub-whisper"), Model: filepath.Join(dir, "ggml-test.bin")}
 	topts := translate.Options{
-		Provider: translate.ProviderOpenAI,
-		APIKey:   "sk-test",
-		Model:    translate.DefaultModel,
-		Workers:  4,
+		APIKey:  "sk-test",
+		Model:   translate.DefaultModel,
+		Workers: 4,
 	}
 
 	out := captureStdout(t, func() {
