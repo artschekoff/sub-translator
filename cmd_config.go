@@ -33,7 +33,9 @@ func runConfig(args []string, out io.Writer) error {
 			return err
 		}
 		for _, key := range config.Keys() {
-			value, err := c.Get(key)
+			// Display, not Get: a listing is what gets pasted into an issue, and
+			// translate.api-key is masked there. `config get` still prints it whole.
+			value, err := c.Display(key)
 			if err != nil {
 				return err
 			}

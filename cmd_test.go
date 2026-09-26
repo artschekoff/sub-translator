@@ -66,12 +66,43 @@ func TestRunConfigListShowsEveryKey(t *testing.T) {
 	}
 }
 
+// `config list` is what gets pasted into an issue or a screenshot; `config get`
+// is what gets read back by a script. Only the first one may hide the key.
+func TestRunConfigMasksTheAPIKeyInListButNotInGet(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	const key = "sk-proj-abcdefghijklmnopqrstuvwxyz-a4f2"
+	if err := runConfig([]string{"set", "translate.api-key", key}, io.Discard); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+
+	var list strings.Builder
+	if err := runConfig([]string{"list"}, &list); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if strings.Contains(list.String(), key) {
+		t.Errorf("config list printed the key in full:\n%s", list.String())
+	}
+	if !strings.Contains(list.String(), "sk-…a4f2") {
+		t.Errorf("config list does not show the masked key:\n%s", list.String())
+	}
+
+	var get strings.Builder
+	if err := runConfig([]string{"get", "translate.api-key"}, &get); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if strings.TrimSpace(get.String()) != key {
+		t.Errorf("config get printed %q, want the key in full", get.String())
+	}
+}
+
 func TestRunConfigRejectsBadUsage(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	for _, args := range [][]string{
 		{},
 		{"frobnicate"},
 		{"set", "whisper.threads"},
+		{"set", "translate.provider", "deepl"},
+		{"set", "translate.workers", "0"},
 		{"set"},
 		{"get"},
 		{"get", "nope"},

@@ -52,6 +52,10 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 		"whisper.threads":       "8",
 		"whisper.language":      "auto",
 		"models.dir":            "/models",
+		"translate.provider":    "openai",
+		"translate.api-key":     "sk-abcdefghijklmnop-a4f2",
+		"translate.model":       "gpt-6-luna",
+		"translate.workers":     "6",
 	} {
 		if err := c.Set(key, value); err != nil {
 			t.Fatalf("Set(%q): %v", key, err)
@@ -210,14 +214,103 @@ func TestSetRejectsMalformedNumbers(t *testing.T) {
 	}
 }
 
+// A provider that does not exist, a worker count that cannot run and an empty
+// model are all mistakes worth catching at `config set`, where the message can
+// still name what is acceptable, rather than in the middle of a film.
+func TestSetValidatesTranslateSettings(t *testing.T) {
+	c := &Config{}
+	for _, tt := range []struct {
+		key, value, mustName string
+	}{
+		{"translate.provider", "deepl", "openai"},
+		{"translate.provider", "", "google"},
+		{"translate.workers", "0", "positive"},
+		{"translate.workers", "-2", "positive"},
+		{"translate.workers", "lots", "positive"},
+		{"translate.model", "", "gpt-6-luna"},
+		{"translate.model", "   ", "gpt-6-luna"},
+	} {
+		err := c.Set(tt.key, tt.value)
+		if err == nil {
+			t.Errorf("Set(%q, %q): want error", tt.key, tt.value)
+			continue
+		}
+		if !strings.Contains(err.Error(), tt.mustName) {
+			t.Errorf("Set(%q, %q) error %q does not say what is acceptable (%q)",
+				tt.key, tt.value, err, tt.mustName)
+		}
+	}
+	for _, provider := range []string{"google", "openai"} {
+		if err := c.Set("translate.provider", provider); err != nil {
+			t.Errorf("Set(translate.provider, %q): %v", provider, err)
+		}
+	}
+}
+
+// The API key is the one secret in the file. Display is what `config list`
+// prints, and a listing is what people paste into an issue.
+func TestDisplayMasksTheAPIKeyButGetDoesNot(t *testing.T) {
+	c := &Config{}
+	const key = "sk-proj-abcdefghijklmnopqrstuvwxyz-a4f2"
+	if err := c.Set("translate.api-key", key); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	full, err := c.Get("translate.api-key")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if full != key {
+		t.Errorf("Get returned %q, want the key in full — that is how it gets scripted with", full)
+	}
+
+	masked, err := c.Display("translate.api-key")
+	if err != nil {
+		t.Fatalf("Display: %v", err)
+	}
+	if want := "sk-…a4f2"; masked != want {
+		t.Errorf("Display = %q, want %q", masked, want)
+	}
+	if strings.Contains(masked, "abcdefghij") {
+		t.Errorf("Display leaked the middle of the key: %q", masked)
+	}
+
+	// Nothing else is masked, or a listing would stop being useful.
+	if err := c.Set("whisper.language", "en"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := c.Display("whisper.language"); got != "en" {
+		t.Errorf("Display(whisper.language) = %q, want en", got)
+	}
+	if _, err := c.Display("nope"); err == nil {
+		t.Error("Display: want an error for an unknown key")
+	}
+}
+
+func TestMask(t *testing.T) {
+	for _, tt := range []struct{ in, want string }{
+		{"", ""},
+		{"short", "…"},
+		{"sk-1234", "…"},         // seven characters: too short to show both ends
+		{"sk-12345", "sk-…2345"}, // eight is the shortest that masks anything
+		{"sk-proj-deadbeefa4f2", "sk-…a4f2"},
+		{"ключ-очень-длинный-1234", "клю…1234"}, // runes, not bytes
+	} {
+		if got := Mask(tt.in); got != tt.want {
+			t.Errorf("Mask(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
 func TestKeysAreSortedAndComplete(t *testing.T) {
 	keys := Keys()
 	if !slices.IsSorted(keys) {
 		t.Errorf("Keys() must be sorted for stable output, got %v", keys)
 	}
 	for _, want := range []string{
-		"models.dir", "whisper.bin", "whisper.chunk-minutes", "whisper.language",
-		"whisper.model", "whisper.threads", "whisper.vad-model",
+		"models.dir", "translate.api-key", "translate.model", "translate.provider",
+		"translate.workers", "whisper.bin", "whisper.chunk-minutes",
+		"whisper.language", "whisper.model", "whisper.threads", "whisper.vad-model",
 		"whisper.vad-threshold",
 	} {
 		if !slices.Contains(keys, want) {
