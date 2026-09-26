@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/artschekoff/sub-translator/internal/config"
 	"github.com/artschekoff/sub-translator/internal/media"
@@ -88,6 +89,8 @@ Flags:
   -atrack        audio stream index, -1 = auto (default: -1)
   -mode          output mode: srt, mux or both (default: srt)
   -out           output path (.srt in srt mode, container otherwise)
+  -fast          translate progressively so the opening is watchable within a minute
+  -chunk         chunk length in minutes for -fast (default 10, or whisper.chunk-minutes)
   -whisper-model path to a whisper ggml model
   -whisper-bin   path to the whisper-cli binary
   -vad-model     path to a Silero VAD model
@@ -98,6 +101,7 @@ Examples:
   sub-translator -to es -source audio movie.mkv
   sub-translator -to fr -mode mux movie.mp4
   sub-translator -to ru -track 3 movie.mkv
+  sub-translator -to es -source audio -fast movie.mkv
   sub-translator config set whisper.model ~/models/ggml-large-v3-turbo.bin
   sub-translator model pull large-v3-turbo
 `
@@ -120,6 +124,8 @@ func main() {
 	vadModel := flag.String("vad-model", "", "path to a Silero VAD model")
 	modeFlag := flag.String("mode", "srt", "output mode: srt, mux or both")
 	out := flag.String("out", "", "output path (.srt in srt mode, container otherwise)")
+	fast := flag.Bool("fast", false, "translate progressively so the opening is watchable within a minute")
+	chunkMin := flag.Int("chunk", -1, "chunk length in minutes for -fast (default 10, or whisper.chunk-minutes)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	flag.Parse()
@@ -136,6 +142,19 @@ func main() {
 
 	source, err := parseSource(*sourceFlag)
 	if err != nil {
+		fatalf("%v", err)
+	}
+
+	// The mode and chunk checks depend on nothing but the flags, so they belong
+	// here rather than behind a container probe, a whisper lookup and an
+	// interactive "this can take a while" prompt the user answers only to be
+	// told the combination was never going to work.
+	configChunkMinutes := 0
+	if cfg, err := config.Load(); err == nil {
+		configChunkMinutes = cfg.Whisper.ChunkMinutes
+	}
+	chunkMinutes := resolveChunkMinutes(*chunkMin, configChunkMinutes)
+	if err := validateFastFlags(*fast, mode, chunkMinutes); err != nil {
 		fatalf("%v", err)
 	}
 
@@ -167,6 +186,12 @@ func main() {
 
 	source, needsConfirm, err := resolveSource(source, len(subs) > 0, stdinIsTerminal())
 	if err != nil {
+		fatalf("%v", err)
+	}
+
+	// The one -fast check that genuinely needs resolveSource to have run: only
+	// now is it known whether "auto" found a subtitle track.
+	if err := validateFastSource(*fast, source); err != nil {
 		fatalf("%v", err)
 	}
 
@@ -223,6 +248,14 @@ func main() {
 	var blocks []srt.Block
 
 	if source == sourceAudio {
+		if *fast {
+			if err := runProgressive(input, runTmpDir, streams, *atrack, *from, *to,
+				time.Duration(chunkMinutes)*time.Minute, whisperOpts, *out); err != nil {
+				fatalf("%v", err)
+			}
+			return
+		}
+
 		var lang string
 		blocks, lang, err = transcribe(input, runTmpDir, streams, *atrack, *from, whisperOpts)
 		if err != nil {
@@ -243,7 +276,16 @@ func main() {
 		// hour of CPU over a sidecar file would be indefensible — so it warns
 		// and carries on to the translation the user actually asked for.
 		transcriptPath := media.DefaultSRTPath(input, *from)
-		if err := srt.Write(transcriptPath, blocks); err != nil {
+		if transcriptPath == srtOutputPath(input, *to, *out, mode) {
+			// Source and target are the same language — reachable by mis-guessing
+			// a film's language, or by -to en on an English film — so the sidecar
+			// and the translation want the same file. The sidecar is written
+			// first, so a fatal translate error below would leave untranslated
+			// source text under the translated filename: precisely the artifact
+			// this branch exists to make impossible.
+			fmt.Fprintf(os.Stderr, "warning: not saving the %s transcript to %s: "+
+				"that is where the translated subtitles go\n", *from, transcriptPath)
+		} else if err := srt.Write(transcriptPath, blocks); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: could not save transcript to %s: %v\n", transcriptPath, err)
 		} else {
 			fmt.Printf("Saved transcript: %s\n", transcriptPath)
@@ -289,15 +331,20 @@ func main() {
 
 	// Translate
 	fmt.Printf("Translating %s → %s...\n", *from, *to)
-	client := translate.New(*from, *to)
+	client := newTranslateClient(*from, *to)
 	texts := srt.Texts(blocks)
-	translated, err := client.TranslateAll(texts, func(done, total int) {
+	translated, failedBlocks, err := client.TranslateAll(texts, func(done, total int) {
 		pct := float64(done) / float64(total) * 100
 		fmt.Printf("\r  progress: %d/%d (%.0f%%)   ", done, total, pct)
 	})
 	fmt.Println()
 	if err != nil {
 		fatalf("translate: %v", err)
+	}
+	if len(failedBlocks) > 0 {
+		fmt.Fprintf(os.Stderr,
+			"warning: %d of %d blocks could not be translated and kept their original text (first: %v)\n",
+			len(failedBlocks), len(texts), firstFew(failedBlocks, 3))
 	}
 
 	// Rebuild blocks
@@ -318,10 +365,7 @@ func main() {
 	tmpTranslated := filepath.Join(runTmpDir, "translated.srt")
 
 	if mode.writesSRT() {
-		srtOut := media.DefaultSRTPath(input, *to)
-		if mode == modeSRT && *out != "" {
-			srtOut = *out
-		}
+		srtOut := srtOutputPath(input, *to, *out, mode)
 		if err := srt.Write(srtOut, outBlocks); err != nil {
 			fatalf("write SRT: %v", err)
 		}
@@ -429,72 +473,39 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-// transcribe extracts one audio stream, runs whisper over it, and returns the
-// parsed transcript together with the language whisper used. Its working files
-// go in tmpDir, the caller's run-scoped scratch directory, so that a single
-// owner removes them however the run ends: a feature film's 16 kHz WAV is over
-// a gigabyte and must not be left behind.
-func transcribe(input, tmpDir string, streams []media.Stream, atrack int, from string, opts whisper.Options) ([]srt.Block, string, error) {
-	audio := media.AudioStreams(streams)
-	if len(audio) == 0 {
-		return nil, "", fmt.Errorf("no audio tracks in %s — nothing to transcribe", filepath.Base(input))
+// srtOutputPath is where the translated .srt will land: an explicit -out wins
+// in srt mode, otherwise it is the default <video>.<lang>.srt next to the input.
+// The transcript sidecar is compared against this, so the two sites must not
+// drift.
+func srtOutputPath(input, to, out string, mode outputMode) string {
+	if mode == modeSRT && out != "" {
+		return out
 	}
+	return media.DefaultSRTPath(input, to)
+}
 
-	var src media.Stream
-	// detect records that a requested language had to be abandoned, so the
-	// choice to let whisper detect one survives down to the options below.
-	detect := false
-	switch {
-	case atrack >= 0:
-		found := false
-		for _, s := range audio {
-			if s.Index == atrack {
-				src, found = s, true
-				break
-			}
-		}
-		if !found {
-			return nil, "", fmt.Errorf("no audio stream at index %d", atrack)
-		}
-	case from != "":
-		if s, ok := media.FindAudioByLang(audio, from); ok {
-			src = s
-		} else {
-			// Falling back to the first track is right — untagged audio is
-			// common — but forcing -l <from> onto it is not: whisper given the
-			// wrong language emits fluent nonsense in that language, which then
-			// translates into a finished, confidently wrong subtitle file.
-			src = audio[0]
-			fmt.Fprintf(os.Stderr, "warning: no audio track tagged lang=%s; using #%d and letting whisper detect the language\n", from, src.Index)
-			from = ""
-			detect = true
-		}
-	default:
-		src = audio[0]
-	}
-	fmt.Printf("Audio:  #%d  lang=%s  %q\n", src.Index, src.Tags.Language, src.Tags.Title)
+// newTranslateClient builds the client the run translates through. It is a
+// variable so the end-to-end test can point a whole progressive run at an
+// httptest server instead of the real endpoint; production never replaces it.
+var newTranslateClient = func(from, to string) *translate.Client {
+	return translate.New(from, to)
+}
 
-	wav := filepath.Join(tmpDir, "audio.wav")
-	fmt.Printf("Extracting audio track #%d...\n", src.Index)
-	if err := media.ExtractAudio(input, src.Index, wav); err != nil {
-		return nil, "", fmt.Errorf("extract audio: %w", err)
-	}
+// errEmptyTranscript is what whisper producing nothing at all comes back as.
+// The whole-file path treats it as fatal outright; the chunked path has to tell
+// a silent stretch mid-film (ordinary — credits, a long establishing shot) from
+// a silent film, so it needs to recognise this rather than match on a string.
+var errEmptyTranscript = errors.New("transcript is empty — the audio track may be silent")
 
-	opts.Audio = wav
-	opts.OutBase = filepath.Join(tmpDir, "transcript")
-	switch {
-	case from != "":
-		opts.Language = from
-	case detect:
-		// The requested language was dropped above; a language left over from
-		// config would be just as wrong for this track, so whisper decides.
-		opts.Language = ""
-	}
+// transcribeInto runs whisper over one audio file and returns its blocks and the
+// language actually used. Both the whole-file path and the chunked path go
+// through here, so the rule about what whisper is told to hear lives in exactly
+// one place.
+func transcribeInto(opts whisper.Options, audio, outBase, lang string) ([]srt.Block, string, error) {
+	opts.Audio = audio
+	opts.OutBase = outBase
+	opts.Language = lang
 
-	fmt.Printf("Transcribing with %s...\n", filepath.Base(opts.Model))
-	if opts.VADModel != "" {
-		fmt.Printf("  VAD: %s\n", filepath.Base(opts.VADModel))
-	}
 	result, err := whisper.Run(opts, func(pct int) {
 		fmt.Printf("\r  progress: %d%%   ", pct)
 	})
@@ -508,7 +519,42 @@ func transcribe(input, tmpDir string, streams []media.Stream, atrack int, from s
 		return nil, "", fmt.Errorf("parse transcript: %w", err)
 	}
 	if len(blocks) == 0 {
-		return nil, "", fmt.Errorf("transcript is empty — the audio track may be silent")
+		return nil, result.Language, errEmptyTranscript
 	}
 	return blocks, result.Language, nil
+}
+
+// transcribe extracts one audio stream, runs whisper over it, and returns the
+// parsed transcript together with the language whisper used. Its working files
+// go in tmpDir, the caller's run-scoped scratch directory, so that a single
+// owner removes them however the run ends: a feature film's 16 kHz WAV is over
+// a gigabyte and must not be left behind.
+func transcribe(input, tmpDir string, streams []media.Stream, atrack int, from string, opts whisper.Options) ([]srt.Block, string, error) {
+	src, picked, err := pickAudioStream(input, streams, atrack, from)
+	if err != nil {
+		return nil, "", err
+	}
+	fmt.Printf("Audio:  #%d  lang=%s  %q\n", src.Index, src.Tags.Language, src.Tags.Title)
+
+	wav := filepath.Join(tmpDir, "audio.wav")
+	fmt.Printf("Extracting audio track #%d...\n", src.Index)
+	if err := media.ExtractAudio(input, src.Index, wav); err != nil {
+		return nil, "", fmt.Errorf("extract audio: %w", err)
+	}
+
+	fmt.Printf("Transcribing with %s...\n", filepath.Base(opts.Model))
+	if opts.VADModel != "" {
+		fmt.Printf("  VAD: %s\n", filepath.Base(opts.VADModel))
+	}
+	return transcribeInto(opts, wav, filepath.Join(tmpDir, "transcript"),
+		resolveChunkLanguage(from, picked, opts.Language))
+}
+
+// firstFew renders the first n values of a list for an error message, with a
+// trailing ellipsis when there are more.
+func firstFew(v []int, n int) string {
+	if len(v) <= n {
+		return fmt.Sprint(v)
+	}
+	return fmt.Sprint(v[:n]) + "…"
 }

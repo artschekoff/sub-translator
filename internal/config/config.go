@@ -22,6 +22,7 @@ type WhisperConfig struct {
 	VADThreshold float64 `json:"vadThreshold,omitempty"`
 	Threads      int     `json:"threads,omitempty"`
 	Language     string  `json:"language,omitempty"`
+	ChunkMinutes int     `json:"chunkMinutes,omitempty"`
 }
 
 type ModelsConfig struct {
@@ -88,6 +89,22 @@ var fields = map[string]field{
 	"whisper.language": {
 		get: func(c *Config) string { return c.Whisper.Language },
 		set: func(c *Config, v string) error { c.Whisper.Language = strings.TrimSpace(v); return nil },
+	},
+	"whisper.chunk-minutes": {
+		get: func(c *Config) string {
+			if c.Whisper.ChunkMinutes == 0 {
+				return ""
+			}
+			return strconv.Itoa(c.Whisper.ChunkMinutes)
+		},
+		set: func(c *Config, v string) error {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 1 {
+				return fmt.Errorf("whisper.chunk-minutes must be a positive integer, got %q", v)
+			}
+			c.Whisper.ChunkMinutes = n
+			return nil
+		},
 	},
 	"models.dir": {
 		get: func(c *Config) string { return c.Models.Dir },
