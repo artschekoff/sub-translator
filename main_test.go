@@ -1,8 +1,11 @@
 package main
 
 import (
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -322,4 +325,102 @@ func TestDescribeProviderNamesWhatIsBeingSpent(t *testing.T) {
 		strings.Contains(got, "0 workers") {
 		t.Errorf("describeProvider() = %q, want the defaults named rather than zeroes", got)
 	}
+}
+
+// buildCLI compiles the real binary, so a test can assert on the order main does
+// things in. Nothing else can: the ordering lives in main(), which ends in
+// os.Exit, and calling the pieces in the right order from a test only proves the
+// test knows the order.
+func buildCLI(t *testing.T) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("the ffprobe stub is a POSIX shell script")
+	}
+	bin := filepath.Join(t.TempDir(), "sub-translator")
+	out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput()
+	if err != nil {
+		t.Fatalf("go build: %v\n%s", err, out)
+	}
+	return bin
+}
+
+// A missing API key must be refused before the video is probed. With no fallback
+// provider there is nothing a keyless run can produce, and under -source audio
+// the alternative is transcribing a whole film and only then discovering there is
+// no key — which is the waste this ordering exists to prevent.
+//
+// The proof has to be a real subprocess with a real ffprobe on PATH: only an
+// ffprobe that was never called can show the probe did not happen.
+func TestCLIRefusesAMissingAPIKeyBeforeProbing(t *testing.T) {
+	bin := buildCLI(t)
+
+	for _, tt := range []struct {
+		name string
+		args []string
+	}{
+		{"ordinary run", []string{"-to", "es"}},
+		{"progressive run", []string{"-to", "es", "-source", "audio", "-fast"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			binDir := filepath.Join(dir, "bin")
+			cfgDir := filepath.Join(dir, "config") // empty: no translate.api-key
+			for _, d := range []string{binDir, cfgDir} {
+				if err := os.MkdirAll(d, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			probeLog := filepath.Join(dir, "ffprobe.log")
+			writeStub(t, filepath.Join(binDir, "ffprobe"), "#!/bin/sh\necho called >> "+probeLog+"\nexit 1\n")
+
+			input := filepath.Join(dir, "movie.mkv")
+			if err := os.WriteFile(input, []byte("not really a film"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			cmd := exec.Command(bin, append(tt.args, input)...)
+			cmd.Env = append(envWithout(os.Environ(), "OPENAI_API_KEY"),
+				"XDG_CONFIG_HOME="+cfgDir,
+				"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			var stderr strings.Builder
+			cmd.Stderr = &stderr
+			var stdout strings.Builder
+			cmd.Stdout = &stdout
+			err := cmd.Run()
+
+			if err == nil {
+				t.Fatalf("the run succeeded with no API key:\n%s", stdout.String())
+			}
+			var exit *exec.ExitError
+			if !errors.As(err, &exit) {
+				t.Fatalf("the binary did not run: %v", err)
+			}
+			if code := exit.ExitCode(); code != 1 {
+				t.Errorf("exit status %d, want 1", code)
+			}
+			for _, want := range []string{"OPENAI_API_KEY", "translate.api-key"} {
+				if !strings.Contains(stderr.String(), want) {
+					t.Errorf("stderr does not mention %s:\n%s", want, stderr.String())
+				}
+			}
+			// The assertion that matters: ffprobe was never reached, so nothing was
+			// probed, extracted or transcribed before the key was checked.
+			if b, err := os.ReadFile(probeLog); err == nil && len(b) > 0 {
+				t.Errorf("ffprobe ran %d time(s) before the key was checked:\n%s%s",
+					len(strings.Fields(string(b))), stdout.String(), stderr.String())
+			}
+		})
+	}
+}
+
+// envWithout is os.Environ() with one variable removed, which is how a test
+// reproduces `env -u NAME`.
+func envWithout(env []string, name string) []string {
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		if !strings.HasPrefix(kv, name+"=") {
+			out = append(out, kv)
+		}
+	}
+	return out
 }
