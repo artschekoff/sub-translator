@@ -11,6 +11,7 @@ import (
 
 	"github.com/artschekoff/sub-translator/internal/media"
 	"github.com/artschekoff/sub-translator/internal/srt"
+	"github.com/artschekoff/sub-translator/internal/translate"
 	"github.com/artschekoff/sub-translator/internal/whisper"
 )
 
@@ -153,7 +154,7 @@ func notifyDone(title, message string) {
 // output file after every chunk so the opening is watchable while the rest is
 // still being produced.
 func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, from, to string,
-	chunkLen time.Duration, opts whisper.Options, out string) error {
+	chunkLen time.Duration, opts whisper.Options, topts translate.Options, out string) error {
 
 	src, lang, err := pickAudioStream(input, streams, atrack, from)
 	if err != nil {
@@ -184,7 +185,10 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 	// the ordinary run writes.
 	outPath := srtOutputPath(input, to, out, modeSRT)
 
-	client := newTranslateClient(lang, to)
+	client, err := newTranslateClient(withLangs(topts, lang, to))
+	if err != nil {
+		return err
+	}
 	var srcBlocks, outBlocks []srt.Block
 	// Failed block numbers accumulate across the whole run in absolute,
 	// post-merge numbering, because that is the only numbering the finished file
@@ -244,8 +248,13 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 			fmt.Printf("Detected language: %s\n", lang)
 			// The client was built before anything was known about the audio,
 			// so its source language is only settled now — otherwise the first
-			// chunk translates with an empty sl for the whole call.
-			client.From = lang
+			// chunk translates with an empty source language for the whole call.
+			// The options have already been validated, so this cannot newly fail;
+			// if it somehow did, carrying on with the old client is better than
+			// losing the film.
+			if c, err := newTranslateClient(withLangs(topts, lang, to)); err == nil {
+				client = c
+			}
 		case !langMissingWarned:
 			// whisper.Run falls back to the *requested* language when its JSON
 			// sidecar is missing or unparseable, and the requested value is

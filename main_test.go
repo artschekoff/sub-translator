@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/artschekoff/sub-translator/internal/config"
+	"github.com/artschekoff/sub-translator/internal/translate"
 )
 
 // touch creates an empty file, making the parent directories as needed.
@@ -192,5 +193,142 @@ func TestResolveWhisperFlagsBeatConfigForBinaryAndVAD(t *testing.T) {
 	}
 	if opts.Threads != 4 || opts.Language != "ru" {
 		t.Errorf("config passthrough lost: threads=%d language=%q", opts.Threads, opts.Language)
+	}
+}
+
+// The translation settings follow the same precedence as -whisper-model and
+// friends: flag, then config, then default. The default provider in particular
+// must stay google — nobody should start spending money because they upgraded.
+func TestResolveTranslateOptions(t *testing.T) {
+	// A key exported in the caller's environment must not leak into the cases
+	// that are about config.
+	t.Setenv("OPENAI_API_KEY", "")
+
+	empty := &config.Config{}
+	configured := &config.Config{}
+	for key, value := range map[string]string{
+		"translate.provider": "openai",
+		"translate.api-key":  "sk-from-config",
+		"translate.model":    "gpt-6-sol",
+		"translate.workers":  "8",
+	} {
+		if err := configured.Set(key, value); err != nil {
+			t.Fatalf("Set(%q): %v", key, err)
+		}
+	}
+
+	tests := []struct {
+		name         string
+		cfg          *config.Config
+		providerFlag string
+		workersFlag  int
+		env          string
+		want         translate.Options
+	}{
+		{
+			name: "nothing configured", cfg: empty, workersFlag: -1,
+			want: translate.Options{
+				Provider: translate.ProviderGoogle,
+				Model:    translate.DefaultModel,
+				Workers:  translate.DefaultWorkers,
+			},
+		},
+		{
+			name: "config supplies everything", cfg: configured, workersFlag: -1,
+			want: translate.Options{
+				Provider: translate.ProviderOpenAI,
+				APIKey:   "sk-from-config",
+				Model:    "gpt-6-sol",
+				Workers:  8,
+			},
+		},
+		{
+			name: "flags beat config", cfg: configured,
+			providerFlag: "google", workersFlag: 2,
+			want: translate.Options{
+				Provider: translate.ProviderGoogle,
+				APIKey:   "sk-from-config",
+				Model:    "gpt-6-sol",
+				Workers:  2,
+			},
+		},
+		{
+			name: "the environment beats the config file", cfg: configured,
+			workersFlag: -1, env: "sk-from-env",
+			want: translate.Options{
+				Provider: translate.ProviderOpenAI,
+				APIKey:   "sk-from-env",
+				Model:    "gpt-6-sol",
+				Workers:  8,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("OPENAI_API_KEY", tt.env)
+			got := resolveTranslateOptions(tt.cfg, tt.providerFlag, tt.workersFlag)
+			if got != tt.want {
+				t.Errorf("resolveTranslateOptions() = %+v, want %+v", got, tt.want)
+			}
+			if err := got.Validate(); err != nil {
+				t.Errorf("the resolved options do not validate: %v", err)
+			}
+		})
+	}
+}
+
+// An openai run with no key anywhere must fail with a message that names both
+// ways of supplying one, and it must fail before anything expensive happens.
+func TestResolveTranslateOptionsWithoutAKeyIsRefused(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "")
+	c := &config.Config{}
+	if err := c.Set("translate.provider", "openai"); err != nil {
+		t.Fatal(err)
+	}
+
+	err := resolveTranslateOptions(c, "", -1).Validate()
+	if err == nil {
+		t.Fatal("want an error for the openai provider with no key")
+	}
+	for _, want := range []string{"OPENAI_API_KEY", "translate.api-key"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %s", err, want)
+		}
+	}
+}
+
+func TestResolveWorkers(t *testing.T) {
+	for _, tt := range []struct {
+		flagValue, configValue, want int
+	}{
+		{-1, 0, translate.DefaultWorkers}, // nothing given
+		{-1, 6, 6},                        // config
+		{2, 6, 2},                         // flag wins
+		{1, 6, 1},                         // and may ask for the sequential run
+		{0, 6, 0},                         // a typed 0 survives, for main to reject
+	} {
+		if got := resolveWorkers(tt.flagValue, tt.configValue); got != tt.want {
+			t.Errorf("resolveWorkers(%d, %d) = %d, want %d",
+				tt.flagValue, tt.configValue, got, tt.want)
+		}
+	}
+}
+
+// describeProvider is printed before a run spends anything, so it has to name
+// the model when there is one to pay for.
+func TestDescribeProviderNamesWhatIsBeingSpent(t *testing.T) {
+	got := describeProvider(translate.Options{
+		Provider: translate.ProviderOpenAI, Model: "gpt-6-luna", Workers: 4,
+	})
+	for _, want := range []string{"openai", "gpt-6-luna", "4"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("describeProvider() = %q, does not mention %s", got, want)
+		}
+	}
+	if got := describeProvider(translate.Options{
+		Provider: translate.ProviderGoogle, Model: translate.DefaultModel, Workers: 1,
+	}); strings.Contains(got, translate.DefaultModel) {
+		t.Errorf("describeProvider() = %q: the Google path has no model to name", got)
 	}
 }

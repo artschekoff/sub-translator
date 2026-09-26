@@ -91,6 +91,8 @@ Flags:
   -out           output path (.srt in srt mode, container otherwise)
   -fast          translate progressively so the opening is watchable within a minute
   -chunk         chunk length in minutes for -fast (default 10, or whisper.chunk-minutes)
+  -provider      translation provider: google or openai (default: google)
+  -workers       batches translated at once (default 4, or translate.workers)
   -whisper-model path to a whisper ggml model
   -whisper-bin   path to the whisper-cli binary
   -vad-model     path to a Silero VAD model
@@ -124,6 +126,8 @@ func main() {
 	vadModel := flag.String("vad-model", "", "path to a Silero VAD model")
 	modeFlag := flag.String("mode", "srt", "output mode: srt, mux or both")
 	out := flag.String("out", "", "output path (.srt in srt mode, container otherwise)")
+	provider := flag.String("provider", "", "translation provider: google or openai")
+	workers := flag.Int("workers", -1, "batches translated at once (default 4, or translate.workers)")
 	fast := flag.Bool("fast", false, "translate progressively so the opening is watchable within a minute")
 	chunkMin := flag.Int("chunk", -1, "chunk length in minutes for -fast (default 10, or whisper.chunk-minutes)")
 	showVersion := flag.Bool("version", false, "print version and exit")
@@ -145,15 +149,19 @@ func main() {
 		fatalf("%v", err)
 	}
 
+	// A config that cannot be read is not fatal here: every setting it holds has
+	// a flag or a default. The audio path below loads it again and does fail, so
+	// a broken file is still reported where it matters.
+	settings := &config.Config{}
+	if c, err := config.Load(); err == nil {
+		settings = c
+	}
+
 	// The mode and chunk checks depend on nothing but the flags, so they belong
 	// here rather than behind a container probe, a whisper lookup and an
 	// interactive "this can take a while" prompt the user answers only to be
 	// told the combination was never going to work.
-	configChunkMinutes := 0
-	if cfg, err := config.Load(); err == nil {
-		configChunkMinutes = cfg.Whisper.ChunkMinutes
-	}
-	chunkMinutes := resolveChunkMinutes(*chunkMin, configChunkMinutes)
+	chunkMinutes := resolveChunkMinutes(*chunkMin, settings.Whisper.ChunkMinutes)
 	if err := validateFastFlags(*fast, mode, chunkMinutes); err != nil {
 		fatalf("%v", err)
 	}
@@ -165,6 +173,17 @@ func main() {
 	input := flag.Arg(0)
 	if _, err := os.Stat(input); err != nil {
 		fatalf("input file not found: %s", input)
+	}
+
+	// The provider is settled for the same reason, and before any work happens:
+	// an openai run with no key has to be refused now, not discovered after an
+	// hour of transcription.
+	if *workers != -1 && *workers < 1 {
+		fatalf("-workers must be at least 1, got %d", *workers)
+	}
+	translateOpts := resolveTranslateOptions(settings, *provider, *workers)
+	if err := translateOpts.Validate(); err != nil {
+		fatalf("%v", err)
 	}
 
 	setupRunTmpDir()
@@ -250,7 +269,7 @@ func main() {
 	if source == sourceAudio {
 		if *fast {
 			if err := runProgressive(input, runTmpDir, streams, *atrack, *from, *to,
-				time.Duration(chunkMinutes)*time.Minute, whisperOpts, *out); err != nil {
+				time.Duration(chunkMinutes)*time.Minute, whisperOpts, translateOpts, *out); err != nil {
 				fatalf("%v", err)
 			}
 			return
@@ -330,8 +349,11 @@ func main() {
 	fmt.Printf("Parsed %d subtitle blocks\n", len(blocks))
 
 	// Translate
-	fmt.Printf("Translating %s → %s...\n", *from, *to)
-	client := newTranslateClient(*from, *to)
+	client, err := newTranslateClient(withLangs(translateOpts, *from, *to))
+	if err != nil {
+		fatalf("%v", err)
+	}
+	fmt.Printf("Translating %s → %s via %s...\n", *from, *to, describeProvider(translateOpts))
 	texts := srt.Texts(blocks)
 	translated, failedBlocks, err := client.TranslateAll(texts, func(done, total int) {
 		pct := float64(done) / float64(total) * 100
@@ -487,8 +509,55 @@ func srtOutputPath(input, to, out string, mode outputMode) string {
 // newTranslateClient builds the client the run translates through. It is a
 // variable so the end-to-end test can point a whole progressive run at an
 // httptest server instead of the real endpoint; production never replaces it.
-var newTranslateClient = func(from, to string) *translate.Client {
-	return translate.New(from, to)
+var newTranslateClient = func(o translate.Options) (translate.Translator, error) {
+	return translate.NewTranslator(o)
+}
+
+// resolveTranslateOptions assembles the translation settings from flags, config
+// and defaults, in that order of precedence — the same order -whisper-model and
+// friends follow. The key is read from the environment first: an exported
+// OPENAI_API_KEY is how a shared machine or a CI job supplies one without
+// writing it to disk.
+//
+// The default provider stays google. Moving someone onto a paid API because they
+// upgraded is not a decision this program gets to make.
+func resolveTranslateOptions(c *config.Config, providerFlag string, workersFlag int) translate.Options {
+	return translate.Options{
+		Provider: firstNonEmpty(providerFlag, c.Translate.Provider, translate.ProviderGoogle),
+		APIKey:   firstNonEmpty(os.Getenv("OPENAI_API_KEY"), c.Translate.APIKey),
+		Model:    firstNonEmpty(c.Translate.Model, translate.DefaultModel),
+		Workers:  resolveWorkers(workersFlag, c.Translate.Workers),
+	}
+}
+
+// resolveWorkers turns the -workers flag into a worker count. Only the sentinel
+// -1 means "not given", so a 0 the user typed survives to be rejected instead of
+// quietly becoming the default.
+func resolveWorkers(flagValue, configValue int) int {
+	if flagValue != -1 {
+		return flagValue
+	}
+	if configValue > 0 {
+		return configValue
+	}
+	return translate.DefaultWorkers
+}
+
+// withLangs is o with the languages this run settled on. In audio mode the source
+// language is not known until whisper has reported it, so the options travel
+// without it and the client is built once it is.
+func withLangs(o translate.Options, from, to string) translate.Options {
+	o.From, o.To = from, to
+	return o
+}
+
+// describeProvider names what is about to be spent: which endpoint, which model
+// when there is one, and how many batches go out at once.
+func describeProvider(o translate.Options) string {
+	if o.Provider == translate.ProviderOpenAI {
+		return fmt.Sprintf("openai %s, %d workers", o.Model, o.Workers)
+	}
+	return fmt.Sprintf("google, %d workers", o.Workers)
 }
 
 // errEmptyTranscript is what whisper producing nothing at all comes back as.

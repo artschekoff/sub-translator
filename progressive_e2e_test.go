@@ -49,8 +49,9 @@ func stubTranslator(t *testing.T, record func(q url.Values)) {
 	t.Cleanup(srv.Close)
 
 	real := newTranslateClient
-	newTranslateClient = func(from, to string) *translate.Client {
-		return translate.NewWithBaseURL(from, to, srv.URL)
+	newTranslateClient = func(o translate.Options) (translate.Translator, error) {
+		o.BaseURL = srv.URL
+		return translate.NewTranslator(o)
 	}
 	t.Cleanup(func() { newTranslateClient = real })
 }
@@ -179,7 +180,7 @@ func TestRunProgressiveEndToEnd(t *testing.T) {
 	}
 
 	if err := runProgressive(input, tmpDir, streams, -1, "en", "es",
-		10*time.Minute, opts, ""); err != nil {
+		10*time.Minute, opts, translate.Options{}, ""); err != nil {
 		t.Fatalf("runProgressive() = %v, want success", err)
 	}
 
@@ -291,7 +292,7 @@ esac`)
 	opts := whisper.Options{Bin: filepath.Join(binDir, "stub-whisper"), Model: filepath.Join(dir, "ggml-test.bin")}
 
 	if err := runProgressive(input, tmpDir, streams, -1, "en", "es",
-		10*time.Minute, opts, ""); err != nil {
+		10*time.Minute, opts, translate.Options{}, ""); err != nil {
 		t.Fatalf("runProgressive() = %v, want success — a silent first chunk is not a silent film", err)
 	}
 
@@ -341,7 +342,7 @@ func TestRunProgressiveFailsWhenEveryChunkIsSilent(t *testing.T) {
 	opts := whisper.Options{Bin: filepath.Join(binDir, "stub-whisper"), Model: filepath.Join(dir, "ggml-test.bin")}
 
 	err := runProgressive(input, tmpDir, streams, -1, "en", "es",
-		10*time.Minute, opts, "")
+		10*time.Minute, opts, translate.Options{}, "")
 	if err == nil {
 		t.Fatal("runProgressive() = nil, want an error — nothing was transcribed")
 	}
