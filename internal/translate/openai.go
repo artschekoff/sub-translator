@@ -48,7 +48,7 @@ func newOpenAI(o Options) *openAIClient {
 		c.baseURL = defaultOpenAIURL
 	}
 	if c.workers < 1 {
-		c.workers = DefaultWorkers
+		c.workers = defaultOpenAIWorkers
 	}
 	return c
 }

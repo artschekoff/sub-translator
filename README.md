@@ -40,7 +40,7 @@ The result is one command, a few seconds of waiting, and a file that plays with 
 - **Automatic track detection** — finds the right subtitle track by language code, no manual stream index needed
 - **Sidecar or embedded** — writes a `.srt` next to your video by default, or embeds the translated track into a new container with `-mode mux`
 - **Timing-safe translation** — timecode lines are never sent to the translator, so sync is preserved exactly
-- **Smart batching** — groups subtitle blocks for fewer requests, four batches at a time, with per-block fallback on failure
+- **Smart batching** — groups subtitle blocks for fewer requests, in parallel where the endpoint can take it, with per-block fallback on failure
 - **Two translation providers** — Google's free endpoint by default, or an OpenAI model with `-provider openai` when you want context-aware dialogue
 - **ISO 639-1/2 aware** — handles both `en` and `eng`, `es` and `spa` transparently
 - **Multi-format muxing** — embeds the translated track into MKV/MP4; saves external SRT for AVI
@@ -112,7 +112,7 @@ Flags:
   -fast          write subtitles progressively so the opening is watchable within a minute
   -chunk         chunk length in minutes for -fast (default: 10)
   -provider      translation provider: google or openai (default: google)
-  -workers       batches translated at once (default: 4)
+  -workers       batches translated at once (default: 1 for google, 4 for openai)
   -whisper-model path to a whisper ggml model
   -whisper-bin   path to the whisper-cli binary
   -vad-model     path to a Silero VAD model
@@ -273,7 +273,7 @@ Translation goes through one of two providers, chosen with `-provider` or rememb
 | Quality | Good on plain dialogue; each batch is translated with no knowledge of the scene. | Each request carries the previous three lines as context, so names, who is addressing whom and formality survive from line to line. |
 | Rate limits | A free public endpoint. Sustained use gets throttled, and a heavy run can be blocked for tens of minutes. | The quota on your account. |
 
-Both providers send 40 blocks per request and translate four batches at once. Timing lines are never sent, whichever provider you use.
+Both providers send 40 blocks per request. Timing lines are never sent, whichever provider you use.
 
 ### Using OpenAI
 
@@ -296,10 +296,18 @@ sub-translator config set translate.model gpt-6-sol
 
 **What it costs.** A feature film is roughly 1500 subtitle blocks, which is a few hundred thousand tokens once the prompts and context are counted — well under a dollar on Luna. A TV episode is a fraction of that. You are paying for the context, not for the words.
 
-**Parallelism.** `-workers` sets how many batches are in flight at once, for both providers. Four is the default; `-workers 1` translates one batch at a time, which is what to reach for when a provider is throttling you.
+**Parallelism.** `-workers` sets how many batches are in flight at once. The default depends on the provider, because the two deserve opposite treatment:
+
+| Provider | Default | Why |
+|---|---|---|
+| `google` | **1** | The endpoint is free, public and shared. Four batches in flight is four times the request rate against the thing that blocked this host for nineteen minutes during development. |
+| `openai` | **4** | A paid endpoint with a published rate limit and a quota you own. Parallelism here is what it is for, and it is the difference between minutes and tens of minutes on a feature film. |
+
+`-workers N` or `translate.workers` overrides either, in both directions — ask Google for four if you like your luck, or drop OpenAI to one while you are being throttled.
 
 ```bash
 sub-translator -provider openai -workers 8 -to es movie.mkv
+sub-translator -workers 4 -to es movie.mkv            # google, at your own risk
 ```
 
 ## Configuration
@@ -327,7 +335,7 @@ sub-translator config path
 | `translate.provider` | `google` or `openai`. `google` when unset. |
 | `translate.api-key` | OpenAI API key. `OPENAI_API_KEY` wins over it. Masked in `config list`. |
 | `translate.model` | OpenAI model id. `gpt-6-luna` when unset. |
-| `translate.workers` | Batches translated at once. 4 when unset. |
+| `translate.workers` | Batches translated at once. 1 for google, 4 for openai when unset. |
 
 The corresponding flags — `-whisper-model`, `-whisper-bin`, `-vad-model`, `-chunk`, `-provider`, `-workers` — override the config for a single run.
 
@@ -353,7 +361,7 @@ input.mkv
     ├─ ffprobe   →  detect subtitle tracks
     ├─ ffmpeg    →  extract .srt (stream copy, no decode)
     ├─ parse     →  split into blocks, preserve timing lines exactly
-    ├─ translate →  batch requests to Google Translate or OpenAI (40 blocks/req, 4 at a time)
+    ├─ translate →  batch requests to Google Translate or OpenAI (40 blocks/req)
     ├─ rebuild   →  merge translated text back, timing untouched
     └─ ffmpeg    →  mux new track into output container (stream copy)
 ```

@@ -399,6 +399,18 @@ func TestOpenAIPreservesOrderUnderConcurrency(t *testing.T) {
 	}
 }
 
+func TestDefaultWorkersForIsProviderSpecific(t *testing.T) {
+	if got := DefaultWorkersFor(ProviderGoogle); got != 1 {
+		t.Errorf("DefaultWorkersFor(google) = %d, want 1", got)
+	}
+	if got := DefaultWorkersFor(""); got != 1 {
+		t.Errorf("DefaultWorkersFor(\"\") = %d, want 1 — an unset provider is google", got)
+	}
+	if got := DefaultWorkersFor(ProviderOpenAI); got != 4 {
+		t.Errorf("DefaultWorkersFor(openai) = %d, want 4", got)
+	}
+}
+
 func TestNewTranslatorChoosesTheProvider(t *testing.T) {
 	g, err := NewTranslator(Options{From: "en", To: "es"})
 	if err != nil {
@@ -408,8 +420,23 @@ func TestNewTranslatorChoosesTheProvider(t *testing.T) {
 	if !ok {
 		t.Fatalf("default provider built %T, want the Google *Client", g)
 	}
-	if gc.Workers != DefaultWorkers {
-		t.Errorf("Workers = %d, want the default %d", gc.Workers, DefaultWorkers)
+	// One worker against the free public endpoint, whatever the openai default is.
+	if gc.Workers != defaultGoogleWorkers {
+		t.Errorf("Workers = %d, want the Google default %d", gc.Workers, defaultGoogleWorkers)
+	}
+	if defaultGoogleWorkers != 1 {
+		t.Errorf("defaultGoogleWorkers = %d: four batches in flight against a free "+
+			"endpoint is what got this host blocked for nineteen minutes",
+			defaultGoogleWorkers)
+	}
+
+	// And the openai default is the parallel one, applied when nothing asks.
+	o4, err := NewTranslator(Options{Provider: ProviderOpenAI, To: "es", APIKey: "sk-x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := o4.(*openAIClient).workers; got != defaultOpenAIWorkers {
+		t.Errorf("openai workers = %d, want the default %d", got, defaultOpenAIWorkers)
 	}
 
 	o, err := NewTranslator(Options{Provider: ProviderOpenAI, To: "es", APIKey: "sk-x", Workers: 2})

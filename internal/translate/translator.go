@@ -34,10 +34,16 @@ const (
 	// low-reasoning case, which is Luna.
 	DefaultModel = "gpt-6-luna"
 
-	// DefaultWorkers is how many batches are translated at once. Four is enough
-	// to hide the round-trip latency that used to dominate a run without turning
-	// a free endpoint's rate limit into a wall.
-	DefaultWorkers = 4
+	// defaultGoogleWorkers is one on purpose. Google's endpoint is free and
+	// public, it rate-limited this host for over nineteen minutes during
+	// development, and four batches in flight is four times the request rate
+	// against it. Parallelism is for an API with a quota you are paying for.
+	defaultGoogleWorkers = 1
+
+	// defaultOpenAIWorkers is four: enough to hide the round-trip latency that
+	// otherwise dominates a run, against a paid endpoint with real, documented
+	// rate limits.
+	defaultOpenAIWorkers = 4
 
 	// contextLines is how many already-seen source lines are handed to an LLM
 	// provider as context. Three is enough to carry who is addressing whom,
@@ -77,6 +83,16 @@ func (o Options) Validate() error {
 	}
 }
 
+// DefaultWorkersFor is how many batches a provider translates at once when
+// neither -workers nor translate.workers says otherwise. It differs by provider
+// deliberately: see the constants.
+func DefaultWorkersFor(provider string) int {
+	if provider == ProviderOpenAI {
+		return defaultOpenAIWorkers
+	}
+	return defaultGoogleWorkers
+}
+
 // NewTranslator builds the provider the options name. An empty provider, model
 // or worker count takes the default, so a partially configured machine still
 // runs.
@@ -85,7 +101,7 @@ func NewTranslator(o Options) (Translator, error) {
 		return nil, err
 	}
 	if o.Workers < 1 {
-		o.Workers = DefaultWorkers
+		o.Workers = DefaultWorkersFor(o.Provider)
 	}
 	switch o.Provider {
 	case "", ProviderGoogle:

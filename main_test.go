@@ -230,7 +230,7 @@ func TestResolveTranslateOptions(t *testing.T) {
 			want: translate.Options{
 				Provider: translate.ProviderGoogle,
 				Model:    translate.DefaultModel,
-				Workers:  translate.DefaultWorkers,
+				Workers:  translate.DefaultWorkersFor(translate.ProviderGoogle),
 			},
 		},
 		{
@@ -300,17 +300,23 @@ func TestResolveTranslateOptionsWithoutAKeyIsRefused(t *testing.T) {
 
 func TestResolveWorkers(t *testing.T) {
 	for _, tt := range []struct {
-		flagValue, configValue, want int
+		flagValue, configValue int
+		provider               string
+		want                   int
 	}{
-		{-1, 0, translate.DefaultWorkers}, // nothing given
-		{-1, 6, 6},                        // config
-		{2, 6, 2},                         // flag wins
-		{1, 6, 1},                         // and may ask for the sequential run
-		{0, 6, 0},                         // a typed 0 survives, for main to reject
+		// Nothing given: the default follows the provider, because one batch at a
+		// time is what a free public endpoint tolerates.
+		{-1, 0, translate.ProviderGoogle, 1},
+		{-1, 0, translate.ProviderOpenAI, 4},
+		{-1, 6, translate.ProviderGoogle, 6}, // config
+		{2, 6, translate.ProviderGoogle, 2},  // flag wins
+		{4, 0, translate.ProviderGoogle, 4},  // including asking Google for four
+		{1, 6, translate.ProviderOpenAI, 1},  // and asking openai for the sequential run
+		{0, 6, translate.ProviderGoogle, 0},  // a typed 0 survives, for main to reject
 	} {
-		if got := resolveWorkers(tt.flagValue, tt.configValue); got != tt.want {
-			t.Errorf("resolveWorkers(%d, %d) = %d, want %d",
-				tt.flagValue, tt.configValue, got, tt.want)
+		if got := resolveWorkers(tt.flagValue, tt.configValue, tt.provider); got != tt.want {
+			t.Errorf("resolveWorkers(%d, %d, %q) = %d, want %d",
+				tt.flagValue, tt.configValue, tt.provider, got, tt.want)
 		}
 	}
 }

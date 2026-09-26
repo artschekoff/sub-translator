@@ -92,7 +92,7 @@ Flags:
   -fast          translate progressively so the opening is watchable within a minute
   -chunk         chunk length in minutes for -fast (default 10, or whisper.chunk-minutes)
   -provider      translation provider: google or openai (default: google)
-  -workers       batches translated at once (default 4, or translate.workers)
+  -workers       batches translated at once (default 1 for google, 4 for openai)
   -whisper-model path to a whisper ggml model
   -whisper-bin   path to the whisper-cli binary
   -vad-model     path to a Silero VAD model
@@ -522,25 +522,27 @@ var newTranslateClient = func(o translate.Options) (translate.Translator, error)
 // The default provider stays google. Moving someone onto a paid API because they
 // upgraded is not a decision this program gets to make.
 func resolveTranslateOptions(c *config.Config, providerFlag string, workersFlag int) translate.Options {
+	provider := firstNonEmpty(providerFlag, c.Translate.Provider, translate.ProviderGoogle)
 	return translate.Options{
-		Provider: firstNonEmpty(providerFlag, c.Translate.Provider, translate.ProviderGoogle),
+		Provider: provider,
 		APIKey:   firstNonEmpty(os.Getenv("OPENAI_API_KEY"), c.Translate.APIKey),
 		Model:    firstNonEmpty(c.Translate.Model, translate.DefaultModel),
-		Workers:  resolveWorkers(workersFlag, c.Translate.Workers),
+		Workers:  resolveWorkers(workersFlag, c.Translate.Workers, provider),
 	}
 }
 
 // resolveWorkers turns the -workers flag into a worker count. Only the sentinel
 // -1 means "not given", so a 0 the user typed survives to be rejected instead of
-// quietly becoming the default.
-func resolveWorkers(flagValue, configValue int) int {
+// quietly becoming the default. The default itself depends on the provider: one
+// against Google's free endpoint, four against a paid API.
+func resolveWorkers(flagValue, configValue int, provider string) int {
 	if flagValue != -1 {
 		return flagValue
 	}
 	if configValue > 0 {
 		return configValue
 	}
-	return translate.DefaultWorkers
+	return translate.DefaultWorkersFor(provider)
 }
 
 // withLangs is o with the languages this run settled on. In audio mode the source
