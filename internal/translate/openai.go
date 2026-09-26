@@ -79,11 +79,21 @@ type batchPayload struct {
 	Translate             map[string]string `json:"translate"`
 }
 
+// malformedAttempts is how many times a batch is sent before the pool is allowed
+// to fall back to one request per block.
+//
+// One retry, not none: a model's reply is sampled, so the same prompt can come
+// back well-formed on a second look. And the arithmetic is the opposite way round
+// from the Google path — fanning out is 40 requests, each re-sending the system
+// prompt and the context lines, against one request to ask the batch again. The
+// cheap recovery here is the retry; the fan-out is the expensive last resort.
+const malformedAttempts = 2
+
 // batch translates one batch in a single request. The blocks go out as a JSON
-// object keyed by index and must come back as an object with exactly those keys:
-// anything else — a missing key, an extra key, a body that will not parse — fails
-// the batch, which then falls through to the per-block path exactly as a mangled
-// separator does on the Google side.
+// object keyed by index and must come back as an object with exactly those keys.
+// Anything else — a missing key, an extra key, a renumbered set, a body that will
+// not parse — is retried once and then fails the batch, which falls through to
+// the per-block path exactly as a mangled separator does on the Google side.
 func (c *openAIClient) batch(texts, before []string) ([]string, error) {
 	keys := make([]string, len(texts))
 	src := make(map[string]string, len(texts))
@@ -107,14 +117,29 @@ func (c *openAIClient) batch(texts, before []string) ([]string, error) {
 		return nil, fmt.Errorf("encode request: %w", err)
 	}
 
-	content, err := retry(func() (string, error) { return c.complete(body) })
-	if err != nil {
-		return nil, err
+	var lastErr error
+	for attempt := 1; attempt <= malformedAttempts; attempt++ {
+		content, err := retry(func() (string, error) { return c.complete(body) })
+		if err != nil {
+			// A status failure is the endpoint's, not the model's, and retry has
+			// already exhausted it. Asking again would only widen the hole the pool
+			// is careful not to dig.
+			return nil, err
+		}
+		out, err := mapReply(content, keys)
+		if err == nil {
+			return out, nil
+		}
+		lastErr = err
 	}
+	return nil, lastErr
+}
 
-	// A key set that does not match is not retried: the request was fine, the
-	// answer was not, and asking again with the same prompt is not the cheap way
-	// to recover. The per-block path is.
+// mapReply turns the model's message into one translation per requested key. The
+// key set must match exactly: a renumbered or shifted set is the same size as the
+// one asked for and would silently put every line one block out of place, which
+// is worse than an untranslated file because it still looks finished.
+func mapReply(content string, keys []string) ([]string, error) {
 	got, err := decodeObject(content)
 	if err != nil {
 		return nil, err
@@ -123,7 +148,7 @@ func (c *openAIClient) batch(texts, before []string) ([]string, error) {
 		return nil, fmt.Errorf("the model returned %d translations for %d blocks",
 			len(got), len(keys))
 	}
-	out := make([]string, len(texts))
+	out := make([]string, len(keys))
 	for i, k := range keys {
 		v, ok := got[k]
 		if !ok {
@@ -203,12 +228,15 @@ func decodeObject(content string) (map[string]string, error) {
 		return nil, errors.New("the model returned an empty message")
 	}
 	start := strings.Index(s, "{")
-	end := strings.LastIndex(s, "}")
-	if start < 0 || end < start {
+	if start < 0 {
 		return nil, fmt.Errorf("no JSON object in the model's reply: %s", excerpt(s))
 	}
+	// Decode rather than Unmarshal, and no search for a closing brace: the decoder
+	// stops at the end of the first complete value, so trailing prose — including
+	// prose with a {brace} in it — does not turn a usable reply into a 40-request
+	// fan-out.
 	var got map[string]string
-	if err := json.Unmarshal([]byte(s[start:end+1]), &got); err != nil {
+	if err := json.NewDecoder(strings.NewReader(s[start:])).Decode(&got); err != nil {
 		return nil, fmt.Errorf("parse the model's reply (%s): %w", excerpt(s), err)
 	}
 	return got, nil

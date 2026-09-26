@@ -253,6 +253,19 @@ func TestOpenAIMalformedResponseFallsThroughToPerBlock(t *testing.T) {
 		{"an unparseable body", func(p batchPayload) string {
 			return "Sure! Here are your translations, but not as JSON."
 		}},
+		// The likeliest LLM misbehaviour of the lot, and the most dangerous: the
+		// set is the right size, so only comparing the keys catches it. Accepting
+		// it would put every line one block out of place in a file that still
+		// looks finished.
+		{"renumbered keys", func(p batchPayload) string {
+			out := map[string]string{}
+			for k, v := range p.Translate {
+				n, _ := strconv.Atoi(k)
+				out[strconv.Itoa(n+1)] = "ES:" + v
+			}
+			b, _ := json.Marshal(out)
+			return string(b)
+		}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			c, requests := openAIFor(t, func(w http.ResponseWriter, got capturedRequest) {
@@ -279,11 +292,45 @@ func TestOpenAIMalformedResponseFallsThroughToPerBlock(t *testing.T) {
 					t.Errorf("results[%d] = %q, want %q", i, got[i], want)
 				}
 			}
-			// One rejected batch plus one request per block.
-			if n := len(requests()); n != 1+len(texts) {
-				t.Errorf("%d requests, want %d: the batch and then each block", n, 1+len(texts))
+			// The batch is asked again before the fan-out, because one more batch
+			// request is far cheaper than len(batch) requests that each re-send the
+			// system prompt and the context lines.
+			if n := len(requests()); n != malformedAttempts+len(texts) {
+				t.Errorf("%d requests, want %d: the batch twice, then each block",
+					n, malformedAttempts+len(texts))
 			}
 		})
+	}
+}
+
+// A reply is sampled, so the same prompt can come back well-formed on a second
+// look. Retrying the batch costs one request; fanning out costs one per block,
+// each re-sending the system prompt and the context lines.
+func TestOpenAIRetriesTheBatchBeforeFanningOut(t *testing.T) {
+	var calls atomic.Int32
+	c, requests := openAIFor(t, func(w http.ResponseWriter, got capturedRequest) {
+		var p batchPayload
+		json.Unmarshal([]byte(got.Message[1].Content), &p)
+		if calls.Add(1) == 1 {
+			reply(w, "Absolutely! Here you go, chief.")
+			return
+		}
+		echoTranslation(w, p)
+	})
+
+	texts := []string{"one", "two", "three"}
+	got, failed, err := c.TranslateAll(texts, nil)
+	if err != nil || len(failed) != 0 {
+		t.Fatalf("err=%v failed=%v", err, failed)
+	}
+	for i, want := range []string{"ES:one", "ES:two", "ES:three"} {
+		if got[i] != want {
+			t.Errorf("results[%d] = %q, want %q", i, got[i], want)
+		}
+	}
+	if n := len(requests()); n != 2 {
+		t.Errorf("%d requests, want 2: the malformed batch and the retry that "+
+			"worked — no block was translated on its own", n)
 	}
 }
 
@@ -507,6 +554,9 @@ func TestDecodeObjectToleratesWrapping(t *testing.T) {
 		{"plain", `{"0":"uno"}`, map[string]string{"0": "uno"}},
 		{"fenced", "```json\n{\"0\":\"uno\"}\n```", map[string]string{"0": "uno"}},
 		{"prefaced", "Here you go:\n{\"0\":\"uno\"}\n", map[string]string{"0": "uno"}},
+		// A brace in the trailing prose used to be swallowed by the search for the
+		// last one, turning a perfectly usable reply into a 40-request fan-out.
+		{"trailing prose with a brace", `{"0":"uno"} (tell me if {anything} looks off)`, map[string]string{"0": "uno"}},
 	} {
 		got, err := decodeObject(tt.content)
 		if err != nil {

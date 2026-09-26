@@ -252,7 +252,9 @@ func runBatch(p provider, results []string, start int, batch, before []string) (
 
 	// Any other failure — a mangled separator on the Google side, a key set that
 	// does not match on the OpenAI side — says nothing about the endpoint's
-	// health, so each block gets its own attempt.
+	// health, so each block gets its own attempt. This is the expensive path, not
+	// the cheap one: a provider that can retry its own batch more cheaply than
+	// len(batch) single requests does so before handing the failure back here.
 	lastErr := err
 	n := 0
 	// statusFailures bounds what the fan-out will tolerate before deciding the
