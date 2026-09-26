@@ -557,6 +557,9 @@ func withLangs(o translate.Options, from, to string) translate.Options {
 // when there is one, and how many batches go out at once.
 func describeProvider(o translate.Options) string {
 	name := o.Provider
+	if name == "" {
+		name = translate.ProviderGoogle
+	}
 	if o.Provider == translate.ProviderOpenAI {
 		name += " " + o.Model
 	}

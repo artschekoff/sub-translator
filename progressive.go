@@ -189,6 +189,10 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 	if err != nil {
 		return err
 	}
+	// Said once, here, for the same reason the ordinary path says it: -fast is
+	// what people reach for on long films, which are the expensive ones, and
+	// nothing else in this loop names what is being spent.
+	fmt.Printf("Translating via %s...\n", describeProvider(topts))
 	var srcBlocks, outBlocks []srt.Block
 	// Failed block numbers accumulate across the whole run in absolute,
 	// post-merge numbering, because that is the only numbering the finished file

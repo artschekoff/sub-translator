@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -355,5 +356,69 @@ func TestRunProgressiveFailsWhenEveryChunkIsSilent(t *testing.T) {
 	}
 	if _, err := os.Stat(outPath); err == nil {
 		t.Errorf("%s was written although there was nothing to put in it", outPath)
+	}
+}
+
+// captureStdout runs fn with os.Stdout redirected and returns what was written.
+// The reader drains in a goroutine because a progressive run prints far more than
+// a pipe buffer holds.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	real := os.Stdout
+	os.Stdout = w
+
+	done := make(chan string, 1)
+	go func() {
+		var b strings.Builder
+		io.Copy(&b, r)
+		done <- b.String()
+	}()
+
+	fn()
+
+	os.Stdout = real
+	w.Close()
+	out := <-done
+	r.Close()
+	return out
+}
+
+// -fast is what people reach for on long films, which are the expensive ones, so
+// it must say which provider and model it is about to spend on. Nothing else in
+// that loop names it.
+func TestRunProgressiveNamesTheProvider(t *testing.T) {
+	dir, binDir, tmpDir, _ := progressiveStubs(t, silentSRT)
+
+	input := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(input, []byte("not really a film"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stubTranslator(t, nil)
+
+	streams := []media.Stream{{Index: 0, CodecType: "video"}, {Index: 1, CodecType: "audio"}}
+	streams[1].Tags.Language = "eng"
+	opts := whisper.Options{Bin: filepath.Join(binDir, "stub-whisper"), Model: filepath.Join(dir, "ggml-test.bin")}
+	topts := translate.Options{
+		Provider: translate.ProviderOpenAI,
+		APIKey:   "sk-test",
+		Model:    translate.DefaultModel,
+		Workers:  4,
+	}
+
+	out := captureStdout(t, func() {
+		// A silent stub means this run ends in the empty-transcript error, which is
+		// beside the point: the line is printed before the first chunk either way.
+		_ = runProgressive(input, tmpDir, streams, -1, "en", "es",
+			10*time.Minute, opts, topts, "")
+	})
+
+	for _, want := range []string{"openai", translate.DefaultModel, "4 workers"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("a -fast run never named %q:\n%s", want, out)
+		}
 	}
 }

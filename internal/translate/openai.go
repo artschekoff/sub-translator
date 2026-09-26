@@ -13,7 +13,7 @@ import (
 
 // defaultOpenAIURL is the chat completions endpoint. The whole URL is
 // overridable rather than just a host, so a test server needs no route of a
-// particular shape — the same arrangement NewWithBaseURL uses for Google.
+// particular shape — the same arrangement Options.BaseURL makes for Google.
 const defaultOpenAIURL = "https://api.openai.com/v1/chat/completions"
 
 // openAIClient translates through an OpenAI chat model. The reason to pay for a
