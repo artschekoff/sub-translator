@@ -2,7 +2,6 @@ package translate
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -28,26 +27,22 @@ var (
 type Client struct {
 	From    string
 	To      string
+	Workers int
 	baseURL string
 	http    *http.Client
 }
 
 func New(from, to string) *Client {
 	return &Client{
-		From:    from,
-		To:      to,
+		From: from,
+		To:   to,
+		// One worker: New is the plain constructor, and a caller that has not
+		// asked for parallelism gets exactly the sequential run this package
+		// always did. NewTranslator is where the -workers default is applied.
+		Workers: 1,
 		baseURL: defaultAPIURL,
 		http:    &http.Client{Timeout: 30 * time.Second},
 	}
-}
-
-// NewWithBaseURL is New with the endpoint overridden. It exists so a caller's
-// end-to-end test can drive a whole run against an httptest server instead of
-// reaching the real translation service; production always uses New.
-func NewWithBaseURL(from, to, baseURL string) *Client {
-	c := New(from, to)
-	c.baseURL = baseURL
-	return c
 }
 
 // TranslateAll translates every text, returning the results, the indices of any
@@ -58,99 +53,22 @@ func NewWithBaseURL(from, to, baseURL string) *Client {
 // named .es.srt: every block silently kept its English text while the progress
 // counter reached 100%.
 func (c *Client) TranslateAll(texts []string, progress func(done, total int)) ([]string, []int, error) {
-	results := make([]string, len(texts))
-	var failed []int
-	var lastErr error
-
-	for i := 0; i < len(texts); i += batchSize {
-		end := min(i+batchSize, len(texts))
-		batch := texts[i:end]
-
-		translated, err := c.translateBatch(batch)
-		if err == nil {
-			copy(results[i:], translated)
-		} else {
-			lastErr = err
-			// Distinguish: if the batch failed with a status error (429, 5xx),
-			// the endpoint is down or throttling us. Per-block retries cannot
-			// succeed where the batch just failed four times. Mark the entire
-			// batch as failed and move on. Only attempt per-block retries if
-			// the batch failed for a different reason (e.g., separator mismatch).
-			var se statusError
-			if errors.As(err, &se) {
-				// Status-level failure already retried; don't retry per-block
-				for j := range batch {
-					results[i+j] = batch[j]
-					failed = append(failed, i+j)
-				}
-			} else {
-				// Other failure (e.g., separator mismatch); try per-block retries
-				for j, t := range batch {
-					r, err := c.translateWithRetry(t)
-					if err != nil {
-						results[i+j] = t
-						failed = append(failed, i+j)
-						lastErr = err
-					} else {
-						results[i+j] = r
-					}
-					time.Sleep(perBlockSleep)
-				}
-			}
-		}
-		if progress != nil {
-			// Blocks translated, not blocks attempted. Reporting the batch end
-			// made a wholly failed run print "progress: 1834/1834 (100%)" over an
-			// untranslated file, which is the exact bug this package was changed
-			// to stop telling.
-			progress(end-len(failed), len(texts))
-		}
-		time.Sleep(batchSleep)
-	}
-
-	if len(failed) == len(texts) && len(texts) > 0 {
-		return results, failed, fmt.Errorf("all %d blocks failed: %w", len(texts), lastErr)
-	}
-	return results, failed, nil
+	return translateAll(c, texts, c.Workers, progress)
 }
 
-// statusError carries the HTTP status so the retry logic can tell a transient
-// throttle from a request that will never succeed.
-type statusError struct{ code int }
-
-func (e statusError) Error() string {
-	if e.code == http.StatusTooManyRequests {
-		return fmt.Sprintf("rate limited by the translation service (HTTP %d)", e.code)
-	}
-	return fmt.Sprintf("translation service returned HTTP %d", e.code)
+// batch and one make the Google client a provider the shared worker pool can
+// drive. Google has no notion of context lines, so before is ignored.
+func (c *Client) batch(texts, _ []string) ([]string, error) {
+	return c.translateBatch(texts)
 }
 
-func (e statusError) retryable() bool {
-	return e.code == http.StatusTooManyRequests || e.code >= 500
+func (c *Client) one(text string, _ []string) (string, error) {
+	return c.translateWithRetry(text)
 }
 
 // translateWithRetry retries throttling and server faults with a widening pause.
-// A 429 is usually a short burst; a 4xx that is not 429 will never succeed on a
-// repeat, so it fails immediately.
 func (c *Client) translateWithRetry(text string) (string, error) {
-	var lastErr error
-	delay := retryBaseDelay
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		out, err := c.translateOne(text)
-		if err == nil {
-			return out, nil
-		}
-		lastErr = err
-		var se statusError
-		if !errors.As(err, &se) || !se.retryable() {
-			return "", err
-		}
-		if attempt < maxAttempts {
-			time.Sleep(delay)
-			delay *= 2
-		}
-	}
-	return "", lastErr
+	return retry(func() (string, error) { return c.translateOne(text) })
 }
 
 func (c *Client) translateBatch(texts []string) ([]string, error) {
@@ -184,7 +102,7 @@ func (c *Client) translateOne(text string) (string, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", statusError{code: resp.StatusCode}
+		return "", statusError{code: resp.StatusCode, retryAfter: parseRetryAfter(resp.Header)}
 	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {

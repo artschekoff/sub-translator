@@ -29,9 +29,17 @@ type ModelsConfig struct {
 	Dir string `json:"dir,omitempty"`
 }
 
+type TranslateConfig struct {
+	Provider string `json:"provider,omitempty"`
+	APIKey   string `json:"apiKey,omitempty"`
+	Model    string `json:"model,omitempty"`
+	Workers  int    `json:"workers,omitempty"`
+}
+
 type Config struct {
-	Whisper WhisperConfig `json:"whisper"`
-	Models  ModelsConfig  `json:"models"`
+	Whisper   WhisperConfig   `json:"whisper"`
+	Models    ModelsConfig    `json:"models"`
+	Translate TranslateConfig `json:"translate"`
 }
 
 // field couples a dotted key to its accessors, so Keys, Get and Set can never
@@ -39,6 +47,8 @@ type Config struct {
 type field struct {
 	get func(*Config) string
 	set func(*Config, string) error
+	// secret keys are masked by Display, which is what `config list` prints.
+	secret bool
 }
 
 var fields = map[string]field{
@@ -110,6 +120,54 @@ var fields = map[string]field{
 		get: func(c *Config) string { return c.Models.Dir },
 		set: func(c *Config, v string) error { c.Models.Dir = expandPath(v); return nil },
 	},
+	"translate.provider": {
+		get: func(c *Config) string { return c.Translate.Provider },
+		set: func(c *Config, v string) error {
+			switch v = strings.TrimSpace(v); v {
+			case "google", "openai":
+				c.Translate.Provider = v
+				return nil
+			default:
+				return fmt.Errorf("translate.provider must be google or openai, got %q", v)
+			}
+		},
+	},
+	// The key is the one setting here that is genuinely a secret. It is stored in
+	// the same 0600 file as everything else, and masked by Display so that the
+	// output of `config list` — which is what people paste into an issue — never
+	// carries it.
+	"translate.api-key": {
+		get:    func(c *Config) string { return c.Translate.APIKey },
+		set:    func(c *Config, v string) error { c.Translate.APIKey = strings.TrimSpace(v); return nil },
+		secret: true,
+	},
+	"translate.model": {
+		get: func(c *Config) string { return c.Translate.Model },
+		set: func(c *Config, v string) error {
+			v = strings.TrimSpace(v)
+			if v == "" {
+				return fmt.Errorf("translate.model must be a model id, e.g. gpt-6-luna")
+			}
+			c.Translate.Model = v
+			return nil
+		},
+	},
+	"translate.workers": {
+		get: func(c *Config) string {
+			if c.Translate.Workers == 0 {
+				return ""
+			}
+			return strconv.Itoa(c.Translate.Workers)
+		},
+		set: func(c *Config, v string) error {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 1 {
+				return fmt.Errorf("translate.workers must be a positive integer, got %q", v)
+			}
+			c.Translate.Workers = n
+			return nil
+		},
+	},
 }
 
 // Keys returns every valid config key, sorted, for `config list` and for the
@@ -133,6 +191,35 @@ func (c *Config) Get(key string) (string, error) {
 		return "", unknownKey(key)
 	}
 	return f.get(c), nil
+}
+
+// Display is Get with secrets masked. `config list` prints this; `config get`
+// prints the value in full, because reading one key back is how a key gets
+// scripted with, while listing every key is how a config gets shared.
+func (c *Config) Display(key string) (string, error) {
+	f, ok := fields[key]
+	if !ok {
+		return "", unknownKey(key)
+	}
+	v := f.get(c)
+	if f.secret {
+		return Mask(v), nil
+	}
+	return v, nil
+}
+
+// Mask elides the middle of a secret, keeping the first three and last four
+// characters so it is still recognisable as the key you meant: sk-…a4f2. A value
+// too short to mask that way is elided entirely rather than half-shown.
+func Mask(s string) string {
+	r := []rune(s)
+	if len(r) == 0 {
+		return ""
+	}
+	if len(r) < 8 {
+		return "…"
+	}
+	return string(r[:3]) + "…" + string(r[len(r)-4:])
 }
 
 func (c *Config) Set(key, value string) error {

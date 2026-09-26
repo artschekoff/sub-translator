@@ -33,7 +33,9 @@ func runConfig(args []string, out io.Writer) error {
 			return err
 		}
 		for _, key := range config.Keys() {
-			value, err := c.Get(key)
+			// Display, not Get: a listing is what gets pasted into an issue, and
+			// translate.api-key is masked there. `config get` still prints it whole.
+			value, err := c.Display(key)
 			if err != nil {
 				return err
 			}
@@ -73,7 +75,9 @@ func runConfig(args []string, out io.Writer) error {
 		if err := c.Save(); err != nil {
 			return err
 		}
-		value, _ := c.Get(args[1])
+		// Display, as in list: echoing a freshly set API key back in full puts it
+		// in one more scrollback than it needs to be in.
+		value, _ := c.Display(args[1])
 		fmt.Fprintf(out, "%s = %s\n", args[1], value)
 		return nil
 

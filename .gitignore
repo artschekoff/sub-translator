@@ -21,3 +21,4 @@ sub-translator-*
 .idea/
 .vscode/
 *.swp
+.superpowers/
