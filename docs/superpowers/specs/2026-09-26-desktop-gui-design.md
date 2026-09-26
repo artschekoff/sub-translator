@@ -139,6 +139,46 @@ Fast mode is disabled unless the source is an audio track and the output is a si
 
 The path to the CLI itself sits apart, above a divider, labelled as the one setting the window keeps for itself — for the bootstrap reason given above.
 
+### Visual design
+
+Minimal, flat, and translucent — the window borrows the desktop behind it rather than painting its own background.
+
+**The glass is real, not drawn.** Wails exposes the operating system's own compositor: `WindowIsTranslucent` with `WebviewIsTransparent` (the documentation calls this pair the way to make "frosty-looking applications"), `mac.TitleBar{TitlebarAppearsTransparent: true, FullSizeContent: true}` for a seamless top edge, and `BackdropType: windows.Mica` on Windows 11. The page itself has no background colour; the blur comes from AppKit and DWM. A CSS `backdrop-filter` over an opaque page is the imitation of this and looks like one.
+
+**Legibility is the real cost of glass**, and it has to be paid explicitly. A user's wallpaper can be a white beach or a black-and-yellow poster, and text floating directly on the blur will fail against one of them. So content sits on a **scrim**: a single translucent layer, `rgba(255,255,255,0.72)` in light appearance and `rgba(28,28,30,0.72)` in dark, which keeps body text above a 7:1 contrast ratio over any wallpaper while still letting colour through at the edges. The blur stays visible in the window's margins and behind the title bar, which is where it reads as glass; it does not sit behind paragraphs.
+
+**Flat means no decoration doing a job that layout can do.** No drop shadows except the one macOS gives the window itself, no gradients, no borders where whitespace separates just as well. Where a line is genuinely needed — between list rows, above the button bar — it is a one-pixel hairline at 8% of the foreground colour. Corner radius is 10px on cards and 6px on controls, matching the platform rather than inventing a house style.
+
+**Type carries the hierarchy.** The system stack — `-apple-system` on macOS, `Segoe UI Variable` on Windows — so the window looks native and nothing is downloaded. Three sizes only: 13px for body and controls, 11px for secondary labels and hints, 20px semibold for the film's title. Numbers that change during a run (percentages, timecodes) use `font-variant-numeric: tabular-nums` so the layout does not jitter as they tick.
+
+**One accent colour**, taken from the OS where it is available (`AccentColor` / `-apple-system-blue`) so it matches whatever the user chose in their system settings. It appears on exactly three things: the selected radio, the progress fill, and the primary button. Nothing else is coloured except errors, which are the system red, and the "you can start watching" line, which is the system green.
+
+**Dark and light follow the OS**, through `prefers-color-scheme` and `mac.Appearance` — no in-app theme switch. Everything is expressed as CSS custom properties on `:root` and redefined once under the dark media query, so the two themes cannot drift apart.
+
+```
+╭──────────────────────────────────────────────╮
+│                                              │   ← translucent titlebar,
+│   Бойцовский клуб.mkv                        │     blur shows through
+│   2:19:08 · MKV                              │
+│                                              │
+│  ╭────────────────────────────────────────╮  │   ← scrim card, 10px radius
+│  │  Дорожка                               │  │
+│  │  ◯  #1  rus   MVO Позитив-Мультимедиа  │  │
+│  │  ◯  #2  rus   MVO РТР / РЕН-ТВ         │  │
+│  │  ◉  #3  eng   Original                 │  │   ← accent on the selection
+│  │  ────────────────────────────────────  │  │   ← 8% hairline
+│  │  Субтитров в файле нет                 │  │
+│  ╰────────────────────────────────────────╯  │
+│                                              │
+│  Язык  [ Испанский  ▾ ]   Вывод [ .srt  ▾ ]  │
+│  ☑ Быстрый режим — смотреть через минуту     │
+│                                              │
+│                        [ Начать ]            │   ← accent, the only filled button
+╰──────────────────────────────────────────────╯
+```
+
+The run screen replaces the card with a stage line, a progress bar and the growing coverage; the settings screen replaces it with form rows on the same scrim. One card, three contents — the window never changes shape or size between screens, which is what keeps it feeling like one surface rather than a wizard.
+
 ### Errors lead somewhere
 
 An `error` event with `kind` of `missing_key`, `whisper_not_found`, `no_model` or `ambiguous_model` switches to Settings, focuses the field at fault, and shows the message above it. Every other kind stays on the Run screen with the message and a Retry button.
@@ -181,4 +221,7 @@ Manual acceptance, on a real film: drag it in, see the three audio tracks, pick 
 - Without `-events json` the CLI's output does not change by one character.
 - `-probe` does no work and needs no API key.
 - The GUI holds no copy of the configuration rules — every read and write goes through the CLI, except the bootstrap path to the CLI binary itself.
+- The glass comes from the OS compositor, never from a CSS filter over an opaque page.
+- Body text keeps a 7:1 contrast ratio over any wallpaper, which is what the scrim is for.
+- No web fonts, no icon fonts, no CSS framework — the system stack and hand-written CSS.
 - Go 1.26 floor. Conventional commits.
