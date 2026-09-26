@@ -363,8 +363,14 @@ func TestOpenAISustainedRateLimitDoesNotFanOut(t *testing.T) {
 		w.WriteHeader(http.StatusTooManyRequests)
 	})
 
-	if _, failed, err := c.TranslateAll(lines(5), nil); err == nil || len(failed) != 5 {
+	_, failed, err := c.TranslateAll(lines(5), nil)
+	if err == nil || len(failed) != 5 {
 		t.Fatalf("want a total failure: err=%v failed=%v", err, failed)
+	}
+	// The wording is what tells someone they are being throttled and should lower
+	// -workers, rather than that they have found a bug in this program.
+	if e := strings.ToLower(err.Error()); !strings.Contains(e, "429") && !strings.Contains(e, "rate") {
+		t.Errorf("error %q names neither the status nor rate limiting", err)
 	}
 	if n := len(requests()); n > maxAttempts {
 		t.Errorf("%d requests, want at most the %d batch attempts", n, maxAttempts)
