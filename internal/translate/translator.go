@@ -199,12 +199,31 @@ func translateAll(p provider, texts []string, workers int, progress func(done, t
 // slice element.
 func runBatch(p provider, results []string, start int, batch, before []string) (int, []int, error) {
 	translated, err := p.batch(batch, before)
+	if err == nil && len(translated) != len(batch) {
+		// The pool's whole safety argument is that a worker writes only inside
+		// its own range. A provider handing back more strings than it was given
+		// would write into the next worker's range — a real data race and a
+		// scrambled file, with progress still reading 100%. Both providers check
+		// their own counts, so this is a backstop, and a cheap one.
+		err = fmt.Errorf("provider returned %d translations for %d blocks",
+			len(translated), len(batch))
+	}
 	if err == nil {
-		copy(results[start:], translated)
+		copy(results[start:start+len(batch)], translated)
 		return len(batch), nil, nil
 	}
 
+	// giveUp marks every block from j onwards as failed with its source kept. It
+	// is how both throttling cases end: there is nothing left worth asking for.
 	var failed []int
+	giveUp := func(j int) []int {
+		for ; j < len(batch); j++ {
+			results[start+j] = batch[j]
+			failed = append(failed, start+j)
+		}
+		return failed
+	}
+
 	var se statusError
 	if errors.As(err, &se) {
 		// A status-level failure (429, 5xx) has already been retried to
@@ -212,11 +231,7 @@ func runBatch(p provider, results []string, start int, batch, before []string) (
 		// cannot succeed where the batch just failed four times. Fanning out
 		// here is what once turned a sustained rate limit into a multi-hour wait
 		// before the user saw any error at all.
-		for j := range batch {
-			results[start+j] = batch[j]
-			failed = append(failed, start+j)
-		}
-		return 0, failed, err
+		return 0, giveUp(0), err
 	}
 
 	// Any other failure — a mangled separator on the Google side, a key set that
@@ -224,12 +239,30 @@ func runBatch(p provider, results []string, start int, batch, before []string) (
 	// health, so each block gets its own attempt.
 	lastErr := err
 	n := 0
+	// statusFailures bounds what the fan-out will tolerate before deciding the
+	// endpoint, rather than a block, is the problem. Carrying on regardless costs
+	// maxAttempts requests for every remaining block, each attempt able to honour
+	// a Retry-After, four workers deep: measured at 161 requests and over two
+	// minutes for a single 40-block batch, with the user watching an unmoving
+	// progress line and no error at all.
+	statusFailures := 0
 	for j, t := range batch {
 		r, err := p.one(t, before)
 		if err != nil {
+			lastErr = err
+			if errors.As(err, &se) {
+				statusFailures++
+				// A 429 is a statement about us, not about this block: every
+				// further request makes the throttling worse, so the batch ends
+				// here. A 5xx may genuinely be about one block's content — one bad
+				// block must not cost the other 1833 — but a second status failure
+				// is the endpoint, not the block.
+				if se.code == http.StatusTooManyRequests || statusFailures > 1 {
+					return n, giveUp(j), lastErr
+				}
+			}
 			results[start+j] = t
 			failed = append(failed, start+j)
-			lastErr = err
 		} else {
 			results[start+j] = r
 			n++
@@ -263,9 +296,11 @@ func (e statusError) retryable() bool {
 // seconds" in the test suite would cost three seconds per case.
 var (
 	retryAfterUnit = time.Second
-	// maxRetryAfter caps what a server can make a run wait. A misconfigured
-	// proxy answering "Retry-After: 86400" must not hang a film for a day.
-	maxRetryAfter = 2 * time.Minute
+	// maxRetryAfter caps what a server can make a run wait. A server asking for
+	// longer than half a minute is telling us to come back later, not to hold a
+	// goroutine: past that the backoff and the failure report serve the user
+	// better than waiting does.
+	maxRetryAfter = 30 * time.Second
 )
 
 // parseRetryAfter reads the delta-seconds form of Retry-After. The HTTP-date
