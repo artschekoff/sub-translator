@@ -299,6 +299,44 @@ func TestTranslateAllStopsFanningOutWhenTheEndpointRefuses(t *testing.T) {
 	}
 }
 
+// firstFew(failed, 3) is shown to the user as "first: [...]", so the indices
+// have to be sorted however the batches finish. Here the low-index batch is the
+// slowest, so an unsorted list would open with block 40 and point the user at
+// the wrong part of the film.
+func TestTranslateAllSortsFailedIndicesWhateverTheCompletionOrder(t *testing.T) {
+	texts := lines(3 * batchSize)
+
+	c := clientFor(t, func(w http.ResponseWriter, r *http.Request) {
+		start, reply := batchOf(r.URL.Query().Get("q"))
+		switch start {
+		case 0:
+			// Fails last, though it was requested first.
+			time.Sleep(40 * time.Millisecond)
+			w.WriteHeader(http.StatusTooManyRequests)
+		case batchSize:
+			w.WriteHeader(http.StatusTooManyRequests)
+		default:
+			fmt.Fprint(w, reply)
+		}
+	})
+	c.Workers = 4
+
+	_, failed, err := c.TranslateAll(texts, nil)
+	if err != nil {
+		t.Fatalf("one surviving batch means this is not fatal: %v", err)
+	}
+	if !slices.IsSorted(failed) {
+		t.Errorf("failed = %v… is not sorted", firstThree(failed))
+	}
+	if len(failed) != 2*batchSize {
+		t.Fatalf("failed = %d blocks, want the two throttled batches' %d", len(failed), 2*batchSize)
+	}
+	if failed[0] != 0 {
+		t.Errorf("failed[0] = %d, want 0 — the message would point at the wrong "+
+			"part of the film", failed[0])
+	}
+}
+
 // firstThree mirrors what the caller shows the user.
 func firstThree(v []int) []int {
 	if len(v) <= 3 {
