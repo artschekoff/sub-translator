@@ -1,5 +1,7 @@
 # Progressive Translation Implementation Plan
 
+> **Historical.** The Google translation provider was removed in a later refactor, leaving OpenAI as the only translator. The listings below still show the Google client, its `" ||||| "` separator and `translate.googleapis.com`; they are kept as a record of the plan as it was written, not as a description of the current code.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add a `-fast` mode that writes a watchable `.srt` covering the opening of a film within a minute and keeps extending the same file while the viewer watches — and, first, stop `internal/translate` from reporting a total failure as a success.
