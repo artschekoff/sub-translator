@@ -601,6 +601,81 @@ JSON`
 	}
 }
 
+// The spec's sample stream is a full run, not -probe, and its "probe" line
+// carries duration — so the ordinary run's probe event must too, via the same
+// media.ContainerDuration call -probe's emitProbe already made. The run is
+// steered into failing fast right after probing (an explicit -track pointing
+// at a subtitle stream that ffmpeg — stubbed to write an empty file — turns
+// into zero blocks), so this never has to reach whisper or the network: only
+// the probe event, already on stderr by then, is asserted on.
+func TestOrdinaryRunProbeEventCarriesDuration(t *testing.T) {
+	bin := buildCLI(t)
+
+	probeEventFor := func(t *testing.T, formatDuration string) map[string]any {
+		t.Helper()
+		dir := t.TempDir()
+		binDir := filepath.Join(dir, "bin")
+		if err := os.MkdirAll(binDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// Same JSON body answers both the -show_streams and -show_format calls
+		// Probe and ContainerDuration each make; neither cares about the other's
+		// field.
+		writeStub(t, filepath.Join(binDir, "ffprobe"), "#!/bin/sh\n"+`cat <<JSON
+{"streams":[
+ {"index":0,"codec_type":"subtitle","codec_name":"srt","tags":{"language":"eng"}}
+],"format":{"duration":"`+formatDuration+`"}}
+JSON`)
+		// ExtractSubtitle's only job here is to produce an empty transcript, so
+		// the run fails on "nothing to translate" without ever reaching whisper
+		// or the translation endpoint.
+		writeStub(t, filepath.Join(binDir, "ffmpeg"), "#!/bin/sh\nout=\"\"\nfor a in \"$@\"; do out=\"$a\"; done\n: > \"$out\"\nexit 0\n")
+
+		film := filepath.Join(dir, "movie.mkv")
+		if err := os.WriteFile(film, []byte("not a film"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		cmd := exec.Command(bin, "-events", "json", "-to", "es", "-from", "en", "-track", "0", film)
+		cmd.Env = append(os.Environ(),
+			"OPENAI_API_KEY=sk-test",
+			"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+			"XDG_CONFIG_HOME="+filepath.Join(dir, "cfg"),
+		)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		if err := cmd.Run(); err == nil {
+			t.Fatalf("run succeeded, want the empty-subtitle-track failure:\n%s", stdout.String())
+		}
+
+		var probe map[string]any
+		for _, line := range strings.Split(stderr.String(), "\n") {
+			var m map[string]any
+			if json.Unmarshal([]byte(line), &m) == nil && m["type"] == "probe" {
+				probe = m
+			}
+		}
+		if probe == nil {
+			t.Fatalf("no probe event:\n%s%s", stdout.String(), stderr.String())
+		}
+		return probe
+	}
+
+	t.Run("a readable duration is carried", func(t *testing.T) {
+		probe := probeEventFor(t, "120.5")
+		if probe["duration"] != 120.5 {
+			t.Errorf("duration = %v, want 120.5", probe["duration"])
+		}
+	})
+
+	t.Run("an unreadable duration is omitted, never zero", func(t *testing.T) {
+		probe := probeEventFor(t, "N/A")
+		if d, ok := probe["duration"]; ok {
+			t.Errorf("duration = %v, want the field omitted entirely (omitempty), not sent as 0", d)
+		}
+	})
+}
+
 // The event stream is what a wrapper renders its progress from. This pins the
 // order and the presence of the events a run produces, so a refactor cannot
 // quietly stop emitting one.
@@ -646,7 +721,7 @@ func TestFastRunEmitsTheExpectedEventSequence(t *testing.T) {
 	// functions main() calls (events.New/Emit and probeEvent), rather than
 	// re-deriving their shape by hand.
 	ev.Emit(&events.Version{Events: events.ProtocolVersion, Tool: version})
-	ev.Emit(probeEvent(streams))
+	ev.Emit(probeEvent(input, streams))
 
 	if err := runProgressive(input, tmpDir, streams, -1, "en", "es",
 		10*time.Minute, opts, translate.Options{}, ""); err != nil {
@@ -655,6 +730,7 @@ func TestFastRunEmitsTheExpectedEventSequence(t *testing.T) {
 
 	var kinds []string
 	var savedCount int
+	var translateStages []map[string]any
 	for _, line := range strings.Split(buf.String(), "\n") {
 		var m map[string]any
 		if json.Unmarshal([]byte(line), &m) != nil {
@@ -666,6 +742,9 @@ func TestFastRunEmitsTheExpectedEventSequence(t *testing.T) {
 			if m["watchable"] != true {
 				t.Errorf("saved event is not marked watchable: %v", m)
 			}
+		}
+		if m["type"] == "stage" && m["name"] == "translate" {
+			translateStages = append(translateStages, m)
 		}
 	}
 
@@ -682,6 +761,33 @@ func TestFastRunEmitsTheExpectedEventSequence(t *testing.T) {
 	}
 	if kinds[len(kinds)-1] != "done" {
 		t.Errorf("last event = %q, want done", kinds[len(kinds)-1])
+	}
+
+	// One "translate" stage per chunk, each carrying its own chunk number and
+	// the total — not the single bare pre-loop emit this run used to produce.
+	// A single-chunk run could not tell the two shapes apart, which is why
+	// this run is three chunks: a bare {"name":"translate"} with no chunk/of
+	// (omitempty drops zero fields, so a stray one would come back with no
+	// "chunk" key at all) would collapse to one event regardless of chunk
+	// count, while the per-chunk emit produces exactly one per chunk.
+	if len(translateStages) != 3 {
+		t.Fatalf("%d \"translate\" stage events, want one per chunk (3): %v", len(translateStages), translateStages)
+	}
+	for i, s := range translateStages {
+		chunk, ok := s["chunk"].(float64)
+		if !ok {
+			t.Fatalf("translate stage %d has no chunk field — looks like the old pre-loop bare emit: %v", i+1, s)
+		}
+		of, ok := s["of"].(float64)
+		if !ok {
+			t.Fatalf("translate stage %d has no of field: %v", i+1, s)
+		}
+		if int(chunk) != i+1 {
+			t.Errorf("translate stage %d: chunk = %v, want %d", i+1, chunk, i+1)
+		}
+		if int(of) != 3 {
+			t.Errorf("translate stage %d: of = %v, want 3", i+1, of)
+		}
 	}
 }
 

@@ -195,7 +195,6 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 	// what people reach for on long films, which are the expensive ones, and
 	// nothing else in this loop names what is being spent.
 	fmt.Printf("Translating via %s...\n", describeProvider(topts))
-	ev.Emit(&events.Stage{Name: "translate"})
 	var srcBlocks, outBlocks []srt.Block
 	// Failed block numbers accumulate across the whole run in absolute,
 	// post-merge numbering, because that is the only numbering the finished file
@@ -310,6 +309,7 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 		// A -fast run is watched while it happens, so minutes of silence between
 		// the transcription bar and the next "extended to" line read as a hang —
 		// longer still when the endpoint is throttling and every batch retries.
+		ev.Emit(&events.Stage{Name: "translate", Chunk: c.Index + 1, Of: len(plan)})
 		translated, failed, err := client.TranslateAll(srt.Texts(shifted), func(done, total int) {
 			fmt.Printf("\r  translating: %d/%d   ", done, total)
 			ev.Emit(&events.Progress{Pct: done * 100 / total})

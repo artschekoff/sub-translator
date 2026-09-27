@@ -232,7 +232,7 @@ func main() {
 	if err != nil {
 		fatalKindf(errProbeFailed, "probe failed: %v", err)
 	}
-	ev.Emit(probeEvent(streams))
+	ev.Emit(probeEvent(input, streams))
 
 	subs := media.SubtitleStreams(streams)
 	if len(subs) > 0 {
@@ -753,10 +753,12 @@ func firstN(v []int, n int) []int {
 	return v[:n]
 }
 
-// probeEvent converts a probe's streams into the shape the event protocol
-// carries. Both the -probe path (emitProbe, below) and the ordinary run use
-// this one conversion rather than each keeping its own copy.
-func probeEvent(streams []media.Stream) *events.Probe {
+// probeEvent builds the complete Probe event for input's streams, duration
+// included. Both the -probe path (emitProbe, below) and the ordinary run call
+// this one function rather than each building the event its own way, which is
+// what let the ordinary run's event drift out of sync with -probe's in the
+// first place.
+func probeEvent(input string, streams []media.Stream) *events.Probe {
 	toEvent := func(list []media.Stream) []events.Stream {
 		out := make([]events.Stream, 0, len(list))
 		for _, s := range list {
@@ -769,10 +771,17 @@ func probeEvent(streams []media.Stream) *events.Probe {
 		}
 		return out
 	}
-	return &events.Probe{
+	p := &events.Probe{
 		Audio:     toEvent(media.AudioStreams(streams)),
 		Subtitles: toEvent(media.SubtitleStreams(streams)),
 	}
+	// A duration we cannot read — missing, or ffprobe's own "N/A" — is not
+	// worth failing over: the file is still translatable, and the field is
+	// omitted rather than reported as zero.
+	if d, err := media.ContainerDuration(input); err == nil {
+		p.Duration = d.Seconds()
+	}
+	return p
 }
 
 // emitProbe reports what the file contains and nothing else. It is what a
@@ -780,13 +789,7 @@ func probeEvent(streams []media.Stream) *events.Probe {
 // it must not need a key, a target language, or do any work.
 func emitProbe(input string, streams []media.Stream) {
 	subs := media.SubtitleStreams(streams)
-	p := probeEvent(streams)
-	// A duration we cannot read is not worth failing over: the file is still
-	// translatable, and the field is omitted rather than reported as zero.
-	if d, err := media.ContainerDuration(input); err == nil {
-		p.Duration = d.Seconds()
-	}
-	ev.Emit(p)
+	ev.Emit(probeEvent(input, streams))
 
 	if len(subs) > 0 {
 		fmt.Print(formatTracks(subs))
