@@ -327,7 +327,9 @@ The corresponding flags — `-whisper-model`, `-whisper-bin`, `-vad-model`, `-ch
 sub-translator -events json -to es -source audio -fast movie.mkv 2> events.jsonl
 ```
 
-Every event carries `type` and `t` (an RFC 3339 UTC timestamp). The first line of any run is always a `version` event, so a consumer can refuse a stream it does not understand rather than guess. The shape below — every event, field and omission — was verified by running a `-fast` transcription against this code (paths and track metadata simplified for readability, and trimmed to two of the run's chunks for length):
+**Skip the lines that are not JSON.** stderr carries this tool's own prose as well as the events, by design: the `warning:` lines, the one `error:` line, the usage text, and the interactive prompts. A consumer must therefore treat a line that does not parse as JSON as human output and ignore it, rather than treating it as a protocol error. Every line this tool writes is whole — the events and the prose share one lock, so neither can land inside the other — and the ffmpeg children's output no longer reaches stderr at all: it is captured and surfaced only in the error message of a step that failed. (The visible consequence for a person is that a run no longer prints ffmpeg's progress chatter.)
+
+Every event carries `type` and `t` (an RFC 3339 UTC timestamp). The first line of any run is always a `version` event, so a consumer can refuse a stream it does not understand rather than guess. The shape below — every event, field and omission — was verified by running a `-fast` transcription against this code:
 
 ```json
 {"type":"version","t":"2026-09-27T16:49:08Z","events":1,"tool":"1.4.0"}
@@ -335,6 +337,7 @@ Every event carries `type` and `t` (an RFC 3339 UTC timestamp). The first line o
 {"type":"stage","t":"2026-09-27T16:49:08Z","name":"extract"}
 {"type":"stage","t":"2026-09-27T16:49:08Z","name":"transcribe","chunk":1,"of":14,"from":"0:00:00","to":"0:10:00"}
 {"type":"progress","t":"2026-09-27T16:49:09Z","pct":100}
+{"type":"language","t":"2026-09-27T16:49:09Z","detected":"en"}
 {"type":"stage","t":"2026-09-27T16:49:09Z","name":"translate","chunk":1,"of":14}
 {"type":"progress","t":"2026-09-27T16:49:09Z","pct":100}
 {"type":"saved","t":"2026-09-27T16:49:09Z","path":"/…/movie.es.srt","covers":"0:10:00","watchable":true}
@@ -346,7 +349,25 @@ Every event carries `type` and `t` (an RFC 3339 UTC timestamp). The first line o
 {"type":"done","t":"2026-09-27T16:49:10Z","path":"/…/movie.es.srt","covers":"2:19:08"}
 ```
 
-The ordinary run (no `-fast`) emits a different, shorter sequence: `probe`, then — only when transcribing audio — a bare `stage` `extract` and a bare `stage` `transcribe` with no `chunk`/`of`/`from`/`to` at all, then `progress`, then a single bare `stage` `translate`, then `progress`, then `done` with no `covers`. Reading an existing subtitle track skips the `extract`/`transcribe` stages entirely and goes straight from `probe` to the one `translate` stage. Either run may also emit a `warning` (some blocks kept their original text) before `done`, or end in a single `error` instead of `done`.
+Simplified for readability, in four ways worth knowing about: the paths and the track metadata are shortened; the run's fourteen chunks are trimmed to two; each `progress` burst is shown as the single event that ends it, where a real run emits one per batch of blocks translated and one per percentage whisper reports, so a fourteen-chunk film produces hundreds of them; and the `language` line is shown where a run that was not told `-from` emits it (the verified run named its source language, so it had nothing to report).
+
+`language` is emitted once, when whisper reports a source language that differs from the one that was asked for (including when none was asked for). Everything downstream — the transcript sidecar's filename, the translation — uses the language in that event from then on.
+
+The `stage` names are the five phases a run can go through:
+
+| `stage.name` | The phase |
+|---|---|
+| `extract` | decoding the chosen audio track to a 16 kHz WAV (`-source audio`) |
+| `extract-subs` | extracting an existing subtitle track and parsing it (`-source sub`) |
+| `transcribe` | whisper.cpp turning audio into text; carries `chunk`/`of`/`from`/`to` under `-fast` |
+| `translate` | the OpenAI round trips; carries `chunk`/`of` under `-fast` |
+| `mux` | writing the new container (`-mode mux`/`both`) |
+
+`progress` carries no stage of its own: a consumer reads it against the most recent `stage` event, which is always the one immediately before the burst.
+
+`warning` reports blocks that could not be translated and kept their original text. Its `kind` is currently always `"blocks_untranslated"` — it is there so a second kind of warning can be added without breaking a consumer — `count` is how many blocks kept their source text, and `total` is how many blocks the run produced in all (for `-fast`, the whole film's merged blocks, not one chunk's). A warning always precedes `done`, never follows it.
+
+The ordinary run (no `-fast`) emits a different, shorter sequence: `probe`, then — only when transcribing audio — a bare `stage` `extract` and a bare `stage` `transcribe` with no `chunk`/`of`/`from`/`to` at all, then `progress`, then a single bare `stage` `translate`, then `progress`, then `done` with no `covers`. Reading an existing subtitle track emits `stage` `extract-subs` instead of the two transcription stages. `-mode mux` or `both` adds a `stage` `mux` after translation. Either run may also emit a `warning` before `done`, or end in a single `error` instead of `done`.
 
 A field that does not apply to the current run is left out of the JSON rather than sent as a zero or empty string — `omitempty` in the Go source means "unknown here", not "the default":
 
@@ -361,23 +382,39 @@ A field that does not apply to the current run is left out of the JSON rather th
 sub-translator -events json -probe movie.mkv
 ```
 
+**`-probe` and `-version` carry no terminal event.** Neither is a run: both emit `version` (and `-probe` its `probe`), exit 0, and emit no `done` and no `error`. A decoder shared between the probe call and the run call must not wait for a terminal event on those two.
+
+**The `config` and `model` subcommands do not emit events, and refuse the flag.** They print plain text on stdout and have no run to report; `-events json` alongside one of them fails with a message saying so and one `error` event of kind `other`, rather than being swallowed as an argument and breaking the subcommand's own parsing. Read and write the config through them as prose.
+
 Every fatal error carries a `kind` so a program can act on the reason instead of matching on wording. The message stays exactly as it is today:
 
 | `kind` | Raised when |
 |---|---|
 | `missing_key` | no OpenAI key in the environment or the config |
+| `invalid_key` | the translation endpoint rejected the key — HTTP 401 or 403 |
 | `whisper_not_found` | `whisper-cli` is neither configured nor on `PATH` |
 | `no_model` | no ggml model configured or discovered |
 | `ambiguous_model` | several models found, none chosen |
 | `no_audio_track` | `-source audio` (or `-fast`) on a file with no audio track, or `-atrack` pointing at one that doesn't exist |
 | `no_subtitle_track` | `-source sub` on a file with none, `-track` pointing at a stream that isn't a subtitle track, or `-from` matching no subtitle track's language |
 | `probe_failed` | the input file doesn't exist, or ffprobe could not read it |
-| `rate_limited` | the translation endpoint refused every block in the run |
+| `rate_limited` | the translation endpoint returned HTTP 429 for every block in the run |
 | `transcript_empty` | the audio produced no speech at all |
-| `cancelled` | SIGINT or SIGTERM — the only `error` event that isn't followed by exit code 1; the process exits 130 |
-| `other` | anything not yet classified |
+| `cancelled` | SIGINT or SIGTERM |
+| `other` | anything not yet classified — including a usage error, an unreachable endpoint, and a reply the model mangled |
+
+`invalid_key` and `rate_limited` are deliberately separate: a key with a typo in it is fixed in the settings, and retrying it can never succeed, while a rate limit is waited out. The first five kinds in the table are the ones a wrapper takes to a settings screen.
 
 Every fatal path emits exactly one `error` event — a classified `fatalKindf` call emits its own `kind`; anything else falls through `fatalf`, which emits `other` — so a consumer driving this as a subprocess never sees a non-zero exit with silence on the wire.
+
+Exit codes, and the event that pairs with each:
+
+| Exit | Meaning | Terminal event |
+|---|---|---|
+| 0 | the run finished | one `done` (none for `-probe` and `-version`) |
+| 1 | a fatal error | one `error`, with the `kind` from the table above |
+| 2 | a usage error: an unknown flag or a bad flag value | one `error`, kind `other`, after the `version` event |
+| 130 | cancelled by SIGINT or SIGTERM | one `error`, kind `cancelled` |
 
 This is the same idea as `git status --porcelain` or `ffmpeg -progress`: a stable contract for programs, separate from the output meant for people.
 

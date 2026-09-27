@@ -1,7 +1,10 @@
 package main
 
 import (
+	"os"
+	"regexp"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -64,5 +67,99 @@ func TestErrOtherIsNotInTheClassifiedSet(t *testing.T) {
 	}
 	if classified[len(classified)-1] != errOther {
 		t.Error("errOther should be listed last: it is the fallback, not a peer")
+	}
+}
+
+// readRepoFile reads a file from the repository root, which is the working
+// directory of a test in this package.
+func readRepoFile(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(b)
+}
+
+const (
+	readmePath = "README.md"
+	specPath   = "docs/superpowers/specs/2026-09-26-desktop-gui-design.md"
+)
+
+// The kinds are a contract a consumer switches on, and the two documents a
+// consumer is written from are the README's table and the spec's. A kind that
+// exists in the code and in neither of them is a kind nobody can route on.
+func TestEveryErrKindIsDocumented(t *testing.T) {
+	readme := readRepoFile(t, readmePath)
+	spec := readRepoFile(t, specPath)
+	for _, k := range allErrKinds() {
+		// A table row, not a mention in passing: a kind explained in prose but
+		// missing from the table a consumer reads its switch off is undocumented
+		// where it counts.
+		row := regexp.MustCompile("(?m)^\\| `" + regexp.QuoteMeta(string(k)) + "` \\|")
+		if !row.MatchString(readme) {
+			t.Errorf("kind %q has no row in the README's table", k)
+		}
+		if !row.MatchString(spec) {
+			t.Errorf("kind %q has no row in the spec's table", k)
+		}
+	}
+}
+
+// stageNameInSource finds the stage names the code actually emits. Two of the
+// five — extract-subs and mux — sit on paths no test can drive to completion
+// (the mux runs after a translation no compiled binary can be pointed at a test
+// endpoint for), so this is what stands between them and being deleted with the
+// suite green: the emitted set, the README's table and the spec's list have to
+// agree, and removing an emit breaks that agreement.
+var stageNameInSource = regexp.MustCompile(`(?s)events\.Stage\{[^}]*Name:\s*"([a-z-]+)"`)
+
+// stageRowInREADME matches a row of the README's stage table.
+var stageRowInREADME = regexp.MustCompile("(?m)^\\| `([a-z-]+)` \\|")
+
+func TestEveryStageNameIsEmittedAndDocumented(t *testing.T) {
+	emitted := map[string]bool{}
+	for _, file := range []string{"main.go", "progressive.go"} {
+		for _, m := range stageNameInSource.FindAllStringSubmatch(readRepoFile(t, file), -1) {
+			emitted[m[1]] = true
+		}
+	}
+	// A sanity floor: a regexp that matched nothing would make every assertion
+	// below vacuous.
+	if len(emitted) < 2 {
+		t.Fatalf("found %d stage names in the source (%v); the scan itself is broken", len(emitted), emitted)
+	}
+
+	readme := readRepoFile(t, readmePath)
+	header := strings.Index(readme, "| `stage.name` | The phase |")
+	if header < 0 {
+		t.Fatal("the README has no stage-name table")
+	}
+	// The five rows following the header are the stage table; the tables further
+	// down the README (the kinds, the exit codes) are not read here.
+	documented := map[string]bool{}
+	for _, m := range stageRowInREADME.FindAllStringSubmatch(readme[header:], 5) {
+		documented[m[1]] = true
+	}
+	if len(documented) != 5 {
+		t.Fatalf("the README's stage table has %d rows (%v), want the five phases", len(documented), documented)
+	}
+
+	for name := range emitted {
+		if !documented[name] {
+			t.Errorf("the code emits stage %q and the README's table does not list it", name)
+		}
+	}
+	for name := range documented {
+		if !emitted[name] {
+			t.Errorf("the README's table lists stage %q and nothing emits it", name)
+		}
+	}
+
+	spec := readRepoFile(t, specPath)
+	for name := range emitted {
+		if !strings.Contains(spec, "`"+name+"`") {
+			t.Errorf("the code emits stage %q and the spec does not name it", name)
+		}
 	}
 }
