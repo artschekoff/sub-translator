@@ -496,8 +496,7 @@ func main() {
 	ev.Emit(&events.Stage{Name: "translate"})
 	texts := srt.Texts(blocks)
 	translated, failedBlocks, err := client.TranslateAll(texts, func(done, total int) {
-		pct := float64(done) / float64(total) * 100
-		fmt.Printf("\r  progress: %d/%d (%.0f%%)   ", done, total, pct)
+		fmt.Print(progressLine(done, total))
 		ev.Emit(&events.Progress{Pct: pctOf(done, total)})
 	})
 	fmt.Println()
@@ -897,6 +896,18 @@ func transcribe(input, tmpDir string, streams []media.Stream, atrack int, from s
 		resolveChunkLanguage(from, picked, opts.Language))
 }
 
+// progressLine is the ordinary run's printed translation progress, exactly as
+// it goes to stdout. It is a function only so a test can read the number a
+// person sees and hold it against the number the event carries: the two are
+// computed from the same division but formatted in two places, and they diverged
+// once — %.0f rounds halves to even while int() truncates, so 3 of 8 printed 37
+// and emitted 38 — with the whole suite green. The format string is unchanged,
+// so stdout is byte-for-byte what it was.
+func progressLine(done, total int) string {
+	return fmt.Sprintf("\r  progress: %d/%d (%.0f%%)   ",
+		done, total, float64(done)/float64(total)*100)
+}
+
 // pctOf is what the printed progress line shows, as an integer. It goes
 // through fmt's own formatting rather than math.Round because the event and
 // the terminal have to agree on every value, and %.0f rounds halves to even
@@ -959,7 +970,14 @@ func probeEvent(input string, streams, subs []media.Stream) *events.Probe {
 // it must not need a key, a target language, or do any work.
 func emitProbe(input string, streams []media.Stream) {
 	subs := media.SubtitleStreams(streams)
-	ev.Emit(probeEvent(input, streams, subs))
+	// Guarded for the reason the ordinary run's call site states: Go evaluates
+	// Emit's argument before Emit's nil check runs, so an unguarded call here
+	// spawns probeEvent's second ffprobe — for a duration the human output never
+	// prints — on every -probe with the flag off. An off feature costs nothing,
+	// and this was the last hole in that rule.
+	if ev != nil {
+		ev.Emit(probeEvent(input, streams, subs))
+	}
 
 	if len(subs) > 0 {
 		fmt.Print(formatTracks(subs))

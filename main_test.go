@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
 	"strconv"
@@ -1611,5 +1612,365 @@ exit 0
 	}
 	if kind != string(errOther) {
 		t.Errorf("error kind = %q, want %q", kind, errOther)
+	}
+}
+
+// The printed percentage and the emitted one are computed from the same division
+// but formatted in two places, and they diverged once with every test green:
+// %.0f rounds halves to even, int() truncates, so 3 of 8 printed 37 while the
+// event said 38. pctOf was fixed; nothing pinned the other half of the equality,
+// so changing the printed line alone re-opened it. This reads the number out of
+// the line a person actually sees and holds it against the number the event
+// carries — never against a hand-written expectation.
+func TestThePrintedAndEmittedPercentagesCannotDiverge(t *testing.T) {
+	percentIn := regexp.MustCompile(`\((\d+)%\)`)
+	for _, tt := range []struct{ done, total int }{
+		{1, 8},  // 12.5% — exact half: to-even (12) against away-from-zero (13)
+		{3, 8},  // 37.5% — the pair the review reproduced: printed 37, emitted 38
+		{5, 8},  // 62.5%
+		{1, 40}, // 2.5%
+		{3, 40}, // 7.5%
+		{0, 1},
+		{1, 1},
+		{1, 3},
+		{2, 3},
+		{7, 8},
+		{99, 200},
+		{100, 200},
+		{101, 200},
+	} {
+		line := progressLine(tt.done, tt.total)
+		// The line is also what a person reads, so its shape is asserted: a
+		// formatter that dropped the fraction would satisfy the equality below
+		// while printing something else entirely.
+		if want := fmt.Sprintf("progress: %d/%d ", tt.done, tt.total); !strings.Contains(line, want) {
+			t.Errorf("progressLine(%d, %d) = %q, want it to carry %q", tt.done, tt.total, line, want)
+		}
+		m := percentIn.FindStringSubmatch(line)
+		if m == nil {
+			t.Fatalf("progressLine(%d, %d) = %q carries no (N%%) percentage", tt.done, tt.total, line)
+		}
+		printed, err := strconv.Atoi(m[1])
+		if err != nil {
+			t.Fatalf("progressLine(%d, %d) = %q: %q is not an integer", tt.done, tt.total, line, m[1])
+		}
+		if emitted := pctOf(tt.done, tt.total); printed != emitted {
+			t.Errorf("done=%d total=%d: the line prints %d%% and the event emits %d%%",
+				tt.done, tt.total, printed, emitted)
+		}
+	}
+}
+
+// An off feature must cost nothing, and -probe was the surviving hole in that
+// rule: probeEvent's duration lookup is a second ffprobe, Go evaluates Emit's
+// argument before Emit's nil check runs, and the human -probe output never prints
+// a duration — so every flagless -probe spawned a subprocess whose result was
+// thrown away. This counts the invocations.
+func TestProbeSpawnsFfprobeOnlyWhenEventsAreOn(t *testing.T) {
+	bin := buildCLI(t)
+
+	countFfprobeCalls := func(t *testing.T, extraArgs ...string) int {
+		t.Helper()
+		dir := t.TempDir()
+		binDir := filepath.Join(dir, "bin")
+		if err := os.MkdirAll(binDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		log := filepath.Join(dir, "ffprobe.log")
+		writeStub(t, filepath.Join(binDir, "ffprobe"), "#!/bin/sh\necho called >> \""+log+"\"\n"+`cat <<JSON
+{"streams":[
+ {"index":0,"codec_type":"audio","codec_name":"ac3","tags":{"language":"eng"}}
+],"format":{"duration":"120.5"}}
+JSON`)
+
+		film := filepath.Join(dir, "movie.mkv")
+		if err := os.WriteFile(film, []byte("not a film"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		cmd := exec.Command(bin, append(append([]string{"-probe"}, extraArgs...), film)...)
+		cmd.Env = append(os.Environ(),
+			"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+			"XDG_CONFIG_HOME="+filepath.Join(dir, "cfg"),
+		)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("-probe failed: %v\nstderr: %s", err, stderr.String())
+		}
+
+		b, err := os.ReadFile(log)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return 0
+			}
+			t.Fatal(err)
+		}
+		// One word per line: the stub echoes "called".
+		return len(strings.Fields(string(b)))
+	}
+
+	t.Run("without -events json: one ffprobe call", func(t *testing.T) {
+		if got := countFfprobeCalls(t); got != 1 {
+			t.Errorf("ffprobe invoked %d time(s), want 1 (just media.Probe)", got)
+		}
+	})
+
+	t.Run("with -events json: two ffprobe calls", func(t *testing.T) {
+		if got := countFfprobeCalls(t, "-events", "json"); got != 2 {
+			t.Errorf("ffprobe invoked %d time(s), want 2 (media.Probe, plus probeEvent's duration)", got)
+		}
+	})
+}
+
+// waitForEvent polls a stderr file until it carries a line with the given
+// substring, which is how a test knows a subprocess has reached a stage without
+// guessing at a sleep.
+func waitForEvent(t *testing.T, path, want string) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if b, err := os.ReadFile(path); err == nil && strings.Contains(string(b), want) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	b, _ := os.ReadFile(path)
+	t.Fatalf("timed out waiting for %q on the event stream:\n%s", want, b)
+}
+
+// waitForFile polls until path exists, which is how a stub subprocess says it
+// has got far enough for the signal to land where the test wants it.
+func waitForFile(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", path)
+}
+
+// Cancellation had no test at all: deleting the emit at the SIGINT handler left
+// the whole suite green, and nothing asserted exit 130 anywhere. It is also the
+// event the stream's unparseability destroyed — a JSON object glued to the tail
+// of an ffmpeg progress line is unreadable by any line-oriented consumer, so the
+// assertion here is deliberately made the way a consumer would make it: parse
+// every line, and the cancelled event must be one of them.
+//
+// stderr goes to a file rather than a pipe on purpose. SIGINT does not kill the
+// ffmpeg child (a separate, deferred finding), and a pipe would keep this test
+// waiting on the orphan the way it would keep a GUI waiting.
+func TestCancellationExits130WithExactlyOneCancelledEvent(t *testing.T) {
+	bin := buildCLI(t)
+
+	// A loop of carriage-return progress, so a signal arriving at any moment
+	// arrives while a line with no newline at its end is in flight: the exact
+	// window the cancelled event used to be lost in.
+	const sleepyFfmpeg = `#!/bin/sh
+out=""
+for a in "$@"; do out="$a"; done
+printf 'size=       0KiB time=00:00:00.00 bitrate=1024.0kbits/s speed=57x    \r' >&2
+# Only now: the signal must arrive with a line that has no newline at its end
+# already in flight, which is the window the cancelled event was lost in.
+: > "$FFMPEG_STARTED"
+i=0
+while [ $i -lt 40 ]; do
+  printf 'size=%8dKiB time=00:00:00.00 bitrate=1024.0kbits/s speed=57x    \r' "$i" >&2
+  sleep 0.1
+  i=$((i+1))
+done
+printf 'RIFFWAVE' > "$out"
+exit 0
+`
+	const quickFfmpeg = `#!/bin/sh
+out=""
+for a in "$@"; do out="$a"; done
+printf 'RIFFWAVE' > "$out"
+exit 0
+`
+	const sleepyWhisper = `#!/bin/sh
+outbase=""
+while [ $# -gt 0 ]; do
+  case "$1" in -of) outbase="$2" ;; esac
+  shift
+done
+echo "whisper_print_progress_callback: progress =  10%" >&2
+i=0
+while [ $i -lt 40 ]; do
+  sleep 0.1
+  i=$((i+1))
+done
+: > "$outbase.srt"
+exit 0
+`
+
+	for _, tt := range []struct {
+		name string
+		// ffmpeg and whisper are the two stubs; one of them blocks, and which
+		// one decides where the signal lands.
+		ffmpeg, whisper string
+		// waitFor is the line on the event stream that says the run has reached
+		// the blocking step.
+		waitFor string
+		// waitForFfmpeg additionally waits until the ffmpeg stub has written a
+		// carriage-return fragment, so the signal cannot win the race against
+		// the child starting up.
+		waitForFfmpeg bool
+	}{
+		{
+			name:          "during audio extraction, mid ffmpeg progress line",
+			ffmpeg:        sleepyFfmpeg,
+			whisper:       quickFfmpeg, // never reached
+			waitFor:       `"name":"extract"`,
+			waitForFfmpeg: true,
+		},
+		{
+			name:    "during transcription",
+			ffmpeg:  quickFfmpeg,
+			whisper: sleepyWhisper,
+			// whisper's own progress reaching the stream means whisper.Run is
+			// scanning its piped stderr and the run is inside transcription.
+			waitFor: `"type":"progress"`,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			binDir := filepath.Join(dir, "bin")
+			if err := os.MkdirAll(binDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			writeStub(t, filepath.Join(binDir, "ffprobe"), "#!/bin/sh\n"+`cat <<JSON
+{"streams":[
+ {"index":0,"codec_type":"audio","codec_name":"ac3","tags":{"language":"eng"}}
+],"format":{"duration":"1800.0"}}
+JSON`)
+			writeStub(t, filepath.Join(binDir, "ffmpeg"), tt.ffmpeg)
+			whisperBin := filepath.Join(binDir, "stub-whisper")
+			writeStub(t, whisperBin, tt.whisper)
+			model := touch(t, filepath.Join(dir, "ggml-test.bin"))
+			film := filepath.Join(dir, "movie.mkv")
+			if err := os.WriteFile(film, []byte("not a film"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			errPath := filepath.Join(dir, "stderr.log")
+			errFile, err := os.Create(errPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer errFile.Close()
+
+			cmd := exec.Command(bin, "-events", "json", "-to", "es", "-source", "audio",
+				"-whisper-bin", whisperBin, "-whisper-model", model, film)
+			started := filepath.Join(dir, "ffmpeg-started")
+			cmd.Env = append(os.Environ(),
+				"OPENAI_API_KEY=sk-test",
+				"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+				"XDG_CONFIG_HOME="+filepath.Join(dir, "cfg"),
+				"FFMPEG_STARTED="+started,
+			)
+			cmd.Stdout = io.Discard
+			cmd.Stderr = errFile
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+
+			waitForEvent(t, errPath, tt.waitFor)
+			if tt.waitForFfmpeg {
+				waitForFile(t, started)
+			}
+			if err := cmd.Process.Signal(os.Interrupt); err != nil {
+				t.Fatal(err)
+			}
+			runErr := cmd.Wait()
+
+			var exit *exec.ExitError
+			if !errors.As(runErr, &exit) {
+				t.Fatalf("want a signalled exit, got %v", runErr)
+			}
+			// 128 + SIGINT, the shell convention, and what a wrapper's Cancel
+			// button reads when the kind cannot be recovered.
+			if code := exit.ExitCode(); code != 130 {
+				t.Errorf("exit status %d, want 130", code)
+			}
+
+			stream, err := os.ReadFile(errPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			errs := eventsOfKind(string(stream), "error")
+			if len(errs) != 1 {
+				t.Fatalf("%d error events, want exactly one parseable cancelled event:\n%s",
+					len(errs), stream)
+			}
+			if kind, _ := errs[0]["kind"].(string); kind != string(errCancelled) {
+				t.Errorf("error kind = %q, want %q", kind, errCancelled)
+			}
+			if got := eventsOfKind(string(stream), "done"); len(got) != 0 {
+				t.Errorf("%d done events on a cancelled run, want none", len(got))
+			}
+		})
+	}
+}
+
+// The failure side of the exit-code/terminal-event pairing is well covered; the
+// success side was not covered at all — both done emits could be deleted with the
+// suite green. This asserts the pairing on the -fast path: the run succeeds,
+// which is what main turns into exit 0 by returning, and the stream ends in
+// exactly one done and no error.
+//
+// It is in-process for a reason worth stating rather than hiding: a compiled
+// binary cannot be pointed at a test translation endpoint, so no subprocess test
+// can reach either success path at all. That seam — honouring OPENAI_BASE_URL —
+// is deliberately out of scope for this round, which leaves the ordinary run's
+// own done emit unpinned. The gap is named in the report, not papered over here.
+func TestASuccessfulRunEndsInExactlyOneDoneEventAndNoError(t *testing.T) {
+	dir, binDir, tmpDir, _ := progressiveStubs(t, dialogueSRT)
+	stubTranslator(t, nil)
+
+	input := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(input, []byte("not really a film"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	streams := []media.Stream{{Index: 0, CodecType: "video"}, {Index: 1, CodecType: "audio"}}
+	streams[1].Tags.Language = "eng"
+	opts := whisper.Options{
+		Bin:   filepath.Join(binDir, "stub-whisper"),
+		Model: filepath.Join(dir, "ggml-test.bin"),
+	}
+
+	// Same contract as the other ev swaps in this file: safe only because
+	// nothing in package main calls t.Parallel().
+	saved := ev
+	t.Cleanup(func() { ev = saved })
+	var buf bytes.Buffer
+	ev = events.New(&buf)
+
+	// A nil error is the success main() acts on: it returns, and the process
+	// exits 0.
+	if err := runProgressive(input, tmpDir, streams, -1, "en", "es",
+		10*time.Minute, opts, translate.Options{}, ""); err != nil {
+		t.Fatalf("runProgressive() = %v, want success", err)
+	}
+
+	all := eventsOf(buf.String())
+	if len(all) == 0 {
+		t.Fatal("no events at all")
+	}
+	dones := eventsOfKind(buf.String(), "done")
+	if len(dones) != 1 {
+		t.Fatalf("%d done events, want exactly 1:\n%s", len(dones), buf.String())
+	}
+	if got := eventsOfKind(buf.String(), "error"); len(got) != 0 {
+		t.Errorf("%d error events on a successful run, want none:\n%s", len(got), buf.String())
+	}
+	if last := all[len(all)-1]; last["type"] != "done" {
+		t.Errorf("last event = %v, want done", last["type"])
+	}
+	if path, _ := dones[0]["path"].(string); path == "" {
+		t.Error("the done event carries no path")
 	}
 }
