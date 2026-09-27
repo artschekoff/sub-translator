@@ -23,6 +23,9 @@ type Stream struct {
 
 type ProbeResult struct {
 	Streams []Stream `json:"streams"`
+	Format  struct {
+		Duration string `json:"duration"`
+	} `json:"format"`
 }
 
 func Probe(path string) ([]Stream, error) {
@@ -40,6 +43,30 @@ func Probe(path string) ([]Stream, error) {
 		return nil, fmt.Errorf("parse ffprobe output: %w", err)
 	}
 	return result.Streams, nil
+}
+
+// ContainerDuration reports how long the file runs. ffprobe gives it as a
+// string of seconds in the format object, which is why Probe now asks for
+// -show_format as well as -show_streams.
+func ContainerDuration(path string) (time.Duration, error) {
+	out, err := exec.Command("ffprobe",
+		"-v", "quiet",
+		"-print_format", "json",
+		"-show_format",
+		path,
+	).Output()
+	if err != nil {
+		return 0, fmt.Errorf("ffprobe duration: %w", err)
+	}
+	var result ProbeResult
+	if err := json.Unmarshal(out, &result); err != nil {
+		return 0, fmt.Errorf("parse ffprobe output: %w", err)
+	}
+	secs, err := strconv.ParseFloat(strings.TrimSpace(result.Format.Duration), 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse duration %q: %w", result.Format.Duration, err)
+	}
+	return time.Duration(secs * float64(time.Second)), nil
 }
 
 func SubtitleStreams(streams []Stream) []Stream {

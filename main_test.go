@@ -524,3 +524,73 @@ func TestClassifiedErrorsCarryTheirKind(t *testing.T) {
 		})
 	}
 }
+
+// -probe is what a wrapper calls to build a track list before the user has
+// chosen anything, so it must need nothing: no API key, no target language, and
+// it must not write a file or start any work.
+func TestProbeNeedsNoKeyAndDoesNoWork(t *testing.T) {
+	bin := buildCLI(t)
+	dir := t.TempDir()
+
+	// A stub ffprobe: -probe must go no further than this.
+	binDir := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	log := filepath.Join(dir, "calls.log")
+	stub := "#!/bin/sh\necho \"$@\" >> " + log + "\n" + `cat <<'JSON'
+{"streams":[
+ {"index":0,"codec_type":"video","codec_name":"h264","tags":{"language":"rus"}},
+ {"index":1,"codec_type":"audio","codec_name":"ac3","tags":{"language":"eng","title":"Original"}}
+],"format":{"duration":"120.5"}}
+JSON`
+	if err := os.WriteFile(filepath.Join(binDir, "ffprobe"), []byte(stub), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	film := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(film, []byte("not a film"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(bin, "-events", "json", "-probe", film)
+	cmd.Env = append(os.Environ(),
+		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"XDG_CONFIG_HOME="+filepath.Join(dir, "cfg"),
+	)
+	cmd.Env = append(cmd.Env, "OPENAI_API_KEY=")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("probe failed: %v\nstderr: %s", err, stderr.String())
+	}
+
+	var probe map[string]any
+	for _, line := range strings.Split(stderr.String(), "\n") {
+		var m map[string]any
+		if json.Unmarshal([]byte(line), &m) == nil && m["type"] == "probe" {
+			probe = m
+		}
+	}
+	if probe == nil {
+		t.Fatalf("no probe event:\n%s", stderr.String())
+	}
+	audio, _ := probe["audio"].([]any)
+	if len(audio) != 1 {
+		t.Errorf("audio = %#v, want one track", probe["audio"])
+	}
+	if probe["duration"] != 120.5 {
+		t.Errorf("duration = %v, want 120.5", probe["duration"])
+	}
+
+	// Nothing beyond the probe may have run.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".srt") {
+			t.Errorf("-probe wrote %s", e.Name())
+		}
+	}
+}

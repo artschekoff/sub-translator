@@ -143,6 +143,7 @@ func main() {
 	fast := flag.Bool("fast", false, "translate progressively so the opening is watchable within a minute")
 	chunkMin := flag.Int("chunk", -1, "chunk length in minutes for -fast (default 10, or whisper.chunk-minutes)")
 	showVersion := flag.Bool("version", false, "print version and exit")
+	probeOnly := flag.Bool("probe", false, "list the file's tracks and exit")
 	eventsFlag := flag.String("events", "", "emit machine-readable events on stderr: json")
 	flag.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	flag.Parse()
@@ -196,6 +197,18 @@ func main() {
 	input := flag.Arg(0)
 	if _, err := os.Stat(input); err != nil {
 		fatalKindf(errProbeFailed, "input file not found: %s", input)
+	}
+
+	// -probe is what a wrapper calls to build a track list before the user has
+	// chosen anything, so it returns here — before a key is required, before any
+	// scratch directory is created, and before anything is written.
+	if *probeOnly {
+		streams, err := media.Probe(input)
+		if err != nil {
+			fatalKindf(errProbeFailed, "probe failed: %v", err)
+		}
+		emitProbe(input, streams)
+		return
 	}
 
 	// The translation settings are settled for the same reason, and before any
@@ -713,4 +726,40 @@ func firstFew(v []int, n int) string {
 		return fmt.Sprint(v)
 	}
 	return fmt.Sprint(v[:n]) + "…"
+}
+
+// emitProbe reports what the file contains and nothing else. It is what a
+// wrapper calls to build a track list before the user has chosen anything, so
+// it must not need a key, a target language, or do any work.
+func emitProbe(input string, streams []media.Stream) {
+	toEvent := func(list []media.Stream) []events.Stream {
+		out := make([]events.Stream, 0, len(list))
+		for _, s := range list {
+			out = append(out, events.Stream{
+				Index: s.Index,
+				Lang:  s.Tags.Language,
+				Title: s.Tags.Title,
+				Codec: s.CodecName,
+			})
+		}
+		return out
+	}
+
+	subs := media.SubtitleStreams(streams)
+	p := &events.Probe{
+		Audio:     toEvent(media.AudioStreams(streams)),
+		Subtitles: toEvent(subs),
+	}
+	// A duration we cannot read is not worth failing over: the file is still
+	// translatable, and the field is omitted rather than reported as zero.
+	if d, err := media.ContainerDuration(input); err == nil {
+		p.Duration = d.Seconds()
+	}
+	ev.Emit(p)
+
+	if len(subs) > 0 {
+		fmt.Print(formatTracks(subs))
+	} else {
+		fmt.Printf("No subtitle tracks in %s.\n", filepath.Base(input))
+	}
 }
