@@ -4,15 +4,21 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/artschekoff/sub-translator/internal/config"
+	"github.com/artschekoff/sub-translator/internal/events"
+	"github.com/artschekoff/sub-translator/internal/media"
 	"github.com/artschekoff/sub-translator/internal/translate"
+	"github.com/artschekoff/sub-translator/internal/whisper"
 )
 
 // touch creates an empty file, making the parent directories as needed.
@@ -592,5 +598,146 @@ JSON`
 		if strings.HasSuffix(e.Name(), ".srt") {
 			t.Errorf("-probe wrote %s", e.Name())
 		}
+	}
+}
+
+// The event stream is what a wrapper renders its progress from. This pins the
+// order and the presence of the events a run produces, so a refactor cannot
+// quietly stop emitting one.
+//
+// Deviation from the brief's illustrative code: that example drove a real
+// compiled binary with exec.Command and expected -events json to reach a
+// working translation endpoint over the network. translate.Options.BaseURL is
+// documented in internal/translate/translator.go as a test seam for exactly
+// this reason ("the end-to-end tests fill in BaseURL to keep a whole run off
+// the network"), but it is a package-level field filled in-process — a
+// separate compiled subprocess cannot be redirected to httptest this way, and
+// there is no flag, config key or environment variable that lets a real
+// sub-translator binary point its OpenAI client anywhere but the real
+// endpoint (by design: Task 6 "Produces: no new API"). So this test drives
+// the same production call sequence a full run makes — media.Probe's stream
+// conversion via probeEvent, then runProgressive — in-process, the same way
+// progressive_e2e_test.go's own end-to-end tests do, with the event emitter
+// pointed at a buffer instead of stderr.
+func TestFastRunEmitsTheExpectedEventSequence(t *testing.T) {
+	dir, binDir, tmpDir, _ := progressiveStubs(t, dialogueSRT) // three chunks: a 30-minute stub file, 10-minute chunks
+	stubTranslator(t, nil)
+
+	input := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(input, []byte("not really a film"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	streams := []media.Stream{{Index: 0, CodecType: "video"}, {Index: 1, CodecType: "audio"}}
+	streams[1].Tags.Language = "eng"
+	opts := whisper.Options{
+		Bin:   filepath.Join(binDir, "stub-whisper"),
+		Model: filepath.Join(dir, "ggml-test.bin"),
+	}
+
+	saved := ev
+	t.Cleanup(func() { ev = saved })
+	var buf bytes.Buffer
+	ev = events.New(&buf)
+
+	// The two events a real run emits before it ever reaches runProgressive:
+	// main() emits Version right after parsing -events json, and Probe right
+	// after media.Probe succeeds — both reproduced here via the exact
+	// functions main() calls (events.New/Emit and probeEvent), rather than
+	// re-deriving their shape by hand.
+	ev.Emit(&events.Version{Events: events.ProtocolVersion, Tool: version})
+	ev.Emit(probeEvent(streams))
+
+	if err := runProgressive(input, tmpDir, streams, -1, "en", "es",
+		10*time.Minute, opts, translate.Options{}, ""); err != nil {
+		t.Fatalf("runProgressive() = %v, want success", err)
+	}
+
+	var kinds []string
+	var savedCount int
+	for _, line := range strings.Split(buf.String(), "\n") {
+		var m map[string]any
+		if json.Unmarshal([]byte(line), &m) != nil {
+			continue
+		}
+		kinds = append(kinds, m["type"].(string))
+		if m["type"] == "saved" {
+			savedCount++
+			if m["watchable"] != true {
+				t.Errorf("saved event is not marked watchable: %v", m)
+			}
+		}
+	}
+
+	if len(kinds) == 0 || kinds[0] != "version" {
+		t.Fatalf("first event = %v, want version", kinds)
+	}
+	for _, want := range []string{"probe", "stage", "progress", "saved", "done"} {
+		if !slices.Contains(kinds, want) {
+			t.Errorf("no %q event in the stream: %v", want, kinds)
+		}
+	}
+	if savedCount != 3 {
+		t.Errorf("%d saved events, want one per chunk (3): %v", savedCount, kinds)
+	}
+	if kinds[len(kinds)-1] != "done" {
+		t.Errorf("last event = %q, want done", kinds[len(kinds)-1])
+	}
+}
+
+// The event stream is an addition, not a replacement, and TestEventsFlagLeavesStdoutUnchanged
+// only proves that for -version — a single stdout write. This is the same
+// constraint under load: a whole -fast translation, chunked and transcribed
+// and translated, run twice into separate scratch directories, once with the
+// event emitter enabled and once without. Every fmt.Printf this task added an
+// Emit beside must still be the only thing that reaches stdout.
+func TestAFullRunLeavesStdoutUnchangedUnderEvents(t *testing.T) {
+	dir, binDir, _, _ := progressiveStubs(t, dialogueSRT)
+	stubTranslator(t, nil)
+
+	// The same input path and output filename in both runs: outPath is
+	// derived from the input's basename and is itself printed ("Saved SRT:
+	// %s ..."), so two different input names would make the two stdout
+	// captures differ for a reason that has nothing to do with -events json.
+	input := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(input, []byte("not really a film"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	streams := []media.Stream{{Index: 0, CodecType: "video"}, {Index: 1, CodecType: "audio"}}
+	streams[1].Tags.Language = "eng"
+	opts := whisper.Options{
+		Bin:   filepath.Join(binDir, "stub-whisper"),
+		Model: filepath.Join(dir, "ggml-test.bin"),
+	}
+
+	saved := ev
+	t.Cleanup(func() { ev = saved })
+
+	run := func(scratch string, enableEvents bool) string {
+		t.Helper()
+		tmpDir := filepath.Join(dir, scratch)
+		if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if enableEvents {
+			ev = events.New(io.Discard)
+		} else {
+			ev = nil
+		}
+		return captureStdout(t, func() {
+			if err := runProgressive(input, tmpDir, streams, -1, "en", "es",
+				10*time.Minute, opts, translate.Options{}, ""); err != nil {
+				t.Fatalf("runProgressive() = %v, want success", err)
+			}
+		})
+	}
+
+	without := run("plain-scratch", false)
+	with := run("events-scratch", true)
+
+	if without != with {
+		t.Errorf("stdout differs with -events json enabled:\nwithout (%d bytes): %q\nwith (%d bytes):    %q",
+			len(without), without, len(with), with)
 	}
 }

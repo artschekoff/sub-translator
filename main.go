@@ -232,6 +232,7 @@ func main() {
 	if err != nil {
 		fatalKindf(errProbeFailed, "probe failed: %v", err)
 	}
+	ev.Emit(probeEvent(streams))
 
 	subs := media.SubtitleStreams(streams)
 	if len(subs) > 0 {
@@ -335,6 +336,7 @@ func main() {
 		// than useless.
 		if lang != "" && lang != *from {
 			fmt.Printf("Detected language: %s\n", lang)
+			ev.Emit(&events.Language{Detected: lang})
 			*from = lang
 		}
 
@@ -403,10 +405,12 @@ func main() {
 		fatalf("%v", err)
 	}
 	fmt.Printf("Translating %s → %s via %s...\n", *from, *to, describeProvider(translateOpts))
+	ev.Emit(&events.Stage{Name: "translate"})
 	texts := srt.Texts(blocks)
 	translated, failedBlocks, err := client.TranslateAll(texts, func(done, total int) {
 		pct := float64(done) / float64(total) * 100
 		fmt.Printf("\r  progress: %d/%d (%.0f%%)   ", done, total, pct)
+		ev.Emit(&events.Progress{Pct: done * 100 / total})
 	})
 	fmt.Println()
 	if err != nil {
@@ -418,6 +422,12 @@ func main() {
 		fmt.Fprintf(os.Stderr,
 			"warning: %d of %d blocks could not be translated and kept their original text (first: %v)\n",
 			len(failedBlocks), len(texts), firstFew(failedBlocks, 3))
+		ev.Emit(&events.Warning{
+			Kind:  "blocks_untranslated",
+			Count: len(failedBlocks),
+			Total: len(texts),
+			First: firstN(failedBlocks, 3),
+		})
 	}
 
 	// Rebuild blocks
@@ -447,6 +457,7 @@ func main() {
 
 	if !mode.writesContainer() {
 		fmt.Println("Done.")
+		ev.Emit(&events.Done{Path: srtOutputPath(input, *to, *out, mode)})
 		return
 	}
 
@@ -475,6 +486,7 @@ func main() {
 		fatalf("mux: %v", err)
 	}
 	fmt.Printf("Done: %s\n", outMKV)
+	ev.Emit(&events.Done{Path: outMKV})
 }
 
 func fatalf(format string, args ...any) {
@@ -677,6 +689,7 @@ func transcribeInto(opts whisper.Options, audio, outBase, lang string) ([]srt.Bl
 
 	result, err := whisper.Run(opts, func(pct int) {
 		fmt.Printf("\r  progress: %d%%   ", pct)
+		ev.Emit(&events.Progress{Pct: pct})
 	})
 	fmt.Println()
 	if err != nil {
@@ -707,11 +720,13 @@ func transcribe(input, tmpDir string, streams []media.Stream, atrack int, from s
 
 	wav := filepath.Join(tmpDir, "audio.wav")
 	fmt.Printf("Extracting audio track #%d...\n", src.Index)
+	ev.Emit(&events.Stage{Name: "extract"})
 	if err := media.ExtractAudio(input, src.Index, wav); err != nil {
 		return nil, "", fmt.Errorf("extract audio: %w", err)
 	}
 
 	fmt.Printf("Transcribing with %s...\n", filepath.Base(opts.Model))
+	ev.Emit(&events.Stage{Name: "transcribe"})
 	if opts.VADModel != "" {
 		fmt.Printf("  VAD: %s\n", filepath.Base(opts.VADModel))
 	}
@@ -728,10 +743,20 @@ func firstFew(v []int, n int) string {
 	return fmt.Sprint(v[:n]) + "…"
 }
 
-// emitProbe reports what the file contains and nothing else. It is what a
-// wrapper calls to build a track list before the user has chosen anything, so
-// it must not need a key, a target language, or do any work.
-func emitProbe(input string, streams []media.Stream) {
+// firstN is firstFew without the rendering: the actual first few values,
+// unformatted, for a Warning event's First field to carry the same ones
+// firstFew renders on the human-readable line beside it.
+func firstN(v []int, n int) []int {
+	if len(v) <= n {
+		return v
+	}
+	return v[:n]
+}
+
+// probeEvent converts a probe's streams into the shape the event protocol
+// carries. Both the -probe path (emitProbe, below) and the ordinary run use
+// this one conversion rather than each keeping its own copy.
+func probeEvent(streams []media.Stream) *events.Probe {
 	toEvent := func(list []media.Stream) []events.Stream {
 		out := make([]events.Stream, 0, len(list))
 		for _, s := range list {
@@ -744,12 +769,18 @@ func emitProbe(input string, streams []media.Stream) {
 		}
 		return out
 	}
-
-	subs := media.SubtitleStreams(streams)
-	p := &events.Probe{
+	return &events.Probe{
 		Audio:     toEvent(media.AudioStreams(streams)),
-		Subtitles: toEvent(subs),
+		Subtitles: toEvent(media.SubtitleStreams(streams)),
 	}
+}
+
+// emitProbe reports what the file contains and nothing else. It is what a
+// wrapper calls to build a track list before the user has chosen anything, so
+// it must not need a key, a target language, or do any work.
+func emitProbe(input string, streams []media.Stream) {
+	subs := media.SubtitleStreams(streams)
+	p := probeEvent(streams)
 	// A duration we cannot read is not worth failing over: the file is still
 	// translatable, and the field is omitted rather than reported as zero.
 	if d, err := media.ContainerDuration(input); err == nil {

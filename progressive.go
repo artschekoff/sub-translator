@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"time"
 
+	"github.com/artschekoff/sub-translator/internal/events"
 	"github.com/artschekoff/sub-translator/internal/media"
 	"github.com/artschekoff/sub-translator/internal/srt"
 	"github.com/artschekoff/sub-translator/internal/translate"
@@ -164,6 +165,7 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 
 	fullWAV := filepath.Join(tmpDir, "audio.wav")
 	fmt.Printf("Extracting audio track #%d...\n", src.Index)
+	ev.Emit(&events.Stage{Name: "extract"})
 	if err := media.ExtractAudio(input, src.Index, fullWAV); err != nil {
 		return fmt.Errorf("extract audio: %w", err)
 	}
@@ -193,6 +195,7 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 	// what people reach for on long films, which are the expensive ones, and
 	// nothing else in this loop names what is being spent.
 	fmt.Printf("Translating via %s...\n", describeProvider(topts))
+	ev.Emit(&events.Stage{Name: "translate"})
 	var srcBlocks, outBlocks []srt.Block
 	// Failed block numbers accumulate across the whole run in absolute,
 	// post-merge numbering, because that is the only numbering the finished file
@@ -225,6 +228,13 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 
 		fmt.Printf("Chunk %d/%d (%s–%s):\n", c.Index+1, len(plan),
 			formatClock(c.Start), formatClock(c.Start+c.Dur))
+		ev.Emit(&events.Stage{
+			Name:  "transcribe",
+			Chunk: c.Index + 1,
+			Of:    len(plan),
+			From:  formatClock(c.Start),
+			To:    formatClock(c.Start + c.Dur),
+		})
 		// The language is settled by the first chunk and then forced, so whisper
 		// cannot change its mind halfway and hand back a two-language file.
 		parsed, detected, err := transcribeInto(opts, chunkWAV,
@@ -250,6 +260,7 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 		case detected != "":
 			lang = detected
 			fmt.Printf("Detected language: %s\n", lang)
+			ev.Emit(&events.Language{Detected: lang})
 			// The client was built before anything was known about the audio,
 			// so its source language is only settled now — otherwise the first
 			// chunk translates with an empty source language for the whole call.
@@ -301,6 +312,7 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 		// longer still when the endpoint is throttling and every batch retries.
 		translated, failed, err := client.TranslateAll(srt.Texts(shifted), func(done, total int) {
 			fmt.Printf("\r  translating: %d/%d   ", done, total)
+			ev.Emit(&events.Progress{Pct: done * 100 / total})
 		})
 		fmt.Println()
 		if err != nil {
@@ -342,6 +354,7 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 		} else {
 			fmt.Printf("  extended to %s\n", covered)
 		}
+		ev.Emit(&events.Saved{Path: outPath, Covers: covered, Watchable: true})
 	}
 
 	if len(srcBlocks) == 0 {
@@ -356,6 +369,13 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 		fmt.Printf("Done: %s covers the full %s, but %d of %d blocks could not be "+
 			"translated and kept their original text (first: %v) — reload subtitles in your player\n",
 			outPath, formatClock(total), len(failedAll), len(outBlocks), firstFew(failedAll, 3))
+		ev.Emit(&events.Warning{
+			Kind:  "blocks_untranslated",
+			Count: len(failedAll),
+			Total: len(outBlocks),
+			First: firstN(failedAll, 3),
+		})
+		ev.Emit(&events.Done{Path: outPath, Covers: formatClock(total)})
 		notifyDone("Subtitles ready, with gaps",
 			fmt.Sprintf("%s — %d blocks untranslated", filepath.Base(outPath), len(failedAll)))
 		return nil
@@ -363,6 +383,7 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 
 	fmt.Printf("Done: %s covers the full %s — reload subtitles in your player\n",
 		outPath, formatClock(total))
+	ev.Emit(&events.Done{Path: outPath, Covers: formatClock(total)})
 	notifyDone("Subtitles ready", filepath.Base(outPath))
 	return nil
 }
