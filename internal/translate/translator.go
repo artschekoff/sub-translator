@@ -265,12 +265,43 @@ func runBatch(p provider, results []string, start int, batch, before []string) (
 	return n, failed, lastErr
 }
 
+// The two endpoint refusals a caller can do something about. They are sentinels
+// rather than status codes on purpose: this package is the only place that knows
+// an HTTP status at all, and a caller that had to match on "translation service
+// returned HTTP 401" — as the CLI did, by hard-coding a kind at one call site
+// and losing it entirely at the other — is matching on prose.
+//
+// Both survive %w-wrapping, so errors.Is finds them through translateAll's "all
+// N blocks failed" and through the progressive run's per-chunk wrapper.
+var (
+	// ErrUnauthorized is the endpoint rejecting our credentials: a mistyped or
+	// revoked key, or one without access to the model. Retrying cannot fix it,
+	// which is exactly what made reporting it as a rate limit harmful.
+	ErrUnauthorized = errors.New("the translation endpoint rejected the API key")
+
+	// ErrRateLimited is the endpoint throttling us — HTTP 429 and nothing else.
+	ErrRateLimited = errors.New("the translation endpoint is rate limiting this key")
+)
+
 // statusError carries the HTTP status so the retry logic can tell a transient
 // throttle from a request that will never succeed, and the Retry-After the
 // server asked for when it sent one.
 type statusError struct {
 	code       int
 	retryAfter time.Duration
+}
+
+// Is maps the status onto the exported sentinels, which is what lets a caller
+// several wraps away ask "was this an auth failure?" without knowing this type
+// or the status code exists.
+func (e statusError) Is(target error) bool {
+	switch target {
+	case ErrUnauthorized:
+		return e.code == http.StatusUnauthorized || e.code == http.StatusForbidden
+	case ErrRateLimited:
+		return e.code == http.StatusTooManyRequests
+	}
+	return false
 }
 
 func (e statusError) Error() string {

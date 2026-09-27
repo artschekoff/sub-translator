@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1430,5 +1432,184 @@ JSON`)
 	}
 	if !slices.Contains(names, "extract-subs") {
 		t.Errorf("stage events = %v, want one named extract-subs:\n%s", names, stderr.String())
+	}
+}
+
+// refusingTranslator points every client the run builds at an endpoint that
+// answers one status and nothing else, so a whole run can be driven into the
+// refusal a real endpoint gives a mistyped key.
+func refusingTranslator(t *testing.T, status int) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(status)
+	}))
+	t.Cleanup(srv.Close)
+
+	real := newTranslateClient
+	newTranslateClient = func(o translate.Options) (translate.Translator, error) {
+		o.BaseURL = srv.URL
+		if o.APIKey == "" {
+			o.APIKey = "sk-wrong"
+		}
+		return translate.NewTranslator(o)
+	}
+	t.Cleanup(func() { newTranslateClient = real })
+}
+
+// A mistyped API key was reported as rate_limited by both run paths — the
+// ordinary one because the kind was hard-coded at the call site, the -fast one
+// because it was thrown away in a fmt.Errorf and no prefix matcher could get it
+// back. A wrapper routes rate_limited to a Retry button, so the single most
+// likely first-run error sent the user to the one place it cannot be fixed.
+//
+// The 401 cases go through the real client and a real refusing endpoint. The 429
+// case is asserted on the sentinel instead: internal/translate's own suite drives
+// 429 end to end with its retry delays turned down to milliseconds, and this
+// package cannot reach them — four attempts at a second each, per batch, is not
+// worth seven seconds of suite time to prove the same mapping twice.
+func TestBothRunPathsClassifyARefusedTranslation(t *testing.T) {
+	t.Run("the ordinary path: a rejected key", func(t *testing.T) {
+		refusingTranslator(t, http.StatusUnauthorized)
+		client, err := newTranslateClient(translate.Options{From: "en", To: "es"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _, err = client.TranslateAll([]string{"one", "two"}, nil)
+		if err == nil {
+			t.Fatal("TranslateAll() = nil, want the endpoint's 401")
+		}
+		if got := classifyTranslateErr(err); got != errInvalidKey {
+			t.Errorf("classifyTranslateErr(%v) = %q, want %q", err, got, errInvalidKey)
+		}
+	})
+
+	t.Run("the -fast path: a rejected key, through the chunk loop", func(t *testing.T) {
+		dir, binDir, tmpDir, _ := progressiveStubs(t, dialogueSRT)
+		refusingTranslator(t, http.StatusUnauthorized)
+
+		input := filepath.Join(dir, "movie.mkv")
+		if err := os.WriteFile(input, []byte("not really a film"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		streams := []media.Stream{{Index: 0, CodecType: "video"}, {Index: 1, CodecType: "audio"}}
+		streams[1].Tags.Language = "eng"
+		opts := whisper.Options{
+			Bin:   filepath.Join(binDir, "stub-whisper"),
+			Model: filepath.Join(dir, "ggml-test.bin"),
+		}
+
+		err := runProgressive(input, tmpDir, streams, -1, "en", "es",
+			10*time.Minute, opts, translate.Options{}, "")
+		if err == nil {
+			t.Fatal("runProgressive() = nil, want the endpoint's 401")
+		}
+		kind, ok := classifyTranscribeErr(err)
+		if !ok {
+			t.Fatalf("classifyTranscribeErr(%v) = (%q, false), want a classified kind", err, kind)
+		}
+		if kind != errInvalidKey {
+			t.Errorf("classifyTranscribeErr(%v) = %q, want %q", err, kind, errInvalidKey)
+		}
+	})
+
+	t.Run("a rate limit stays rate_limited on both paths", func(t *testing.T) {
+		// Wrapped the way both paths wrap it: translateAll's "all N blocks
+		// failed", and the progressive run's per-chunk context over that.
+		err := fmt.Errorf("chunk 3: translate: %w",
+			fmt.Errorf("all 40 blocks failed: %w", translate.ErrRateLimited))
+		if got := classifyTranslateErr(err); got != errRateLimited {
+			t.Errorf("classifyTranslateErr = %q, want %q", got, errRateLimited)
+		}
+		kind, ok := classifyTranscribeErr(err)
+		if !ok || kind != errRateLimited {
+			t.Errorf("classifyTranscribeErr = (%q, %v), want (%q, true)", kind, ok, errRateLimited)
+		}
+	})
+
+	t.Run("anything else the endpoint does is not routable", func(t *testing.T) {
+		err := fmt.Errorf("all 40 blocks failed: %w",
+			errors.New("the model returned 3 translations for 40 blocks"))
+		if got := classifyTranslateErr(err); got != errOther {
+			t.Errorf("classifyTranslateErr = %q, want %q — rate_limited now means HTTP 429 only", got, errOther)
+		}
+	})
+}
+
+// The ordinary run's translate failure is the one classification a real binary
+// can be driven into without a way to point it at a test endpoint: an
+// unreachable proxy makes every request fail at the connection, so translateAll
+// returns "all N blocks failed" with an error that is not a status refusal at
+// all. That is the assertion this wants — the call site hard-coded
+// errRateLimited, so a connection failure, a malformed reply and a mistyped key
+// all arrived as "the endpoint is throttling you". Now the error is asked what
+// it was, and something that is neither refusal reports "other".
+func TestTheOrdinaryRunAsksTheErrorWhichRefusalItWas(t *testing.T) {
+	bin := buildCLI(t)
+	dir := t.TempDir()
+	binDir := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeStub(t, filepath.Join(binDir, "ffprobe"), "#!/bin/sh\n"+`cat <<JSON
+{"streams":[
+ {"index":0,"codec_type":"subtitle","codec_name":"srt","tags":{"language":"eng"}}
+],"format":{"duration":"120.5"}}
+JSON`)
+	// A real subtitle track this time: the run has to reach translation.
+	writeStub(t, filepath.Join(binDir, "ffmpeg"), `#!/bin/sh
+out=""
+for a in "$@"; do out="$a"; done
+printf '1\n00:00:01,000 --> 00:00:03,000\nHello\n\n2\n00:00:05,000 --> 00:00:07,000\nGoodbye\n\n' > "$out"
+exit 0
+`)
+
+	film := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(film, []byte("not a film"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(bin, "-events", "json", "-to", "es", "-from", "en", "-track", "0", film)
+	cmd.Env = append(os.Environ(),
+		"OPENAI_API_KEY=sk-test",
+		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"XDG_CONFIG_HOME="+filepath.Join(dir, "cfg"),
+		// Port 1 has nothing listening, and Go's http transport reads these, so
+		// the request never leaves the machine: no network, and deterministic.
+		"HTTPS_PROXY=http://127.0.0.1:1",
+		"HTTP_PROXY=http://127.0.0.1:1",
+	)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+
+	var exit *exec.ExitError
+	if err := cmd.Run(); !errors.As(err, &exit) {
+		t.Fatalf("want a non-zero exit, got %v\nstdout: %s\nstderr: %s", err, stdout.String(), stderr.String())
+	}
+	if code := exit.ExitCode(); code != 1 {
+		t.Errorf("exit status %d, want 1", code)
+	}
+
+	// The run got as far as translation, or this proves nothing.
+	var stageNames []string
+	for _, m := range eventsOfKind(stderr.String(), "stage") {
+		name, _ := m["name"].(string)
+		stageNames = append(stageNames, name)
+	}
+	if !slices.Contains(stageNames, "translate") {
+		t.Fatalf("the run never reached the translate stage (stages: %v)\nstdout: %s\nstderr: %s",
+			stageNames, stdout.String(), stderr.String())
+	}
+
+	errs := eventsOfKind(stderr.String(), "error")
+	if len(errs) != 1 {
+		t.Fatalf("%d error events, want exactly 1:\n%s", len(errs), stderr.String())
+	}
+	kind, _ := errs[0]["kind"].(string)
+	if kind == string(errRateLimited) {
+		t.Errorf("a connection failure is reported as %q — the kind is still hard-coded at the call site:\n%s",
+			kind, stderr.String())
+	}
+	if kind != string(errOther) {
+		t.Errorf("error kind = %q, want %q", kind, errOther)
 	}
 }

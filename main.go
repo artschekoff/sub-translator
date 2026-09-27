@@ -503,8 +503,10 @@ func main() {
 	fmt.Println()
 	if err != nil {
 		// translateAll returns an error only when every block failed: the
-		// endpoint refused the whole run rather than a few blocks.
-		fatalKindf(errRateLimited, "translate: %v", err)
+		// endpoint refused the whole run rather than a few blocks. Which refusal
+		// it was is the error's to say, not this call site's — hard-coding
+		// errRateLimited here is what reported a mistyped key as a rate limit.
+		fatalKindf(classifyTranslateErr(err), "translate: %v", err)
 	}
 	if len(failedBlocks) > 0 {
 		first := firstN(failedBlocks, 3)
@@ -774,8 +776,16 @@ var errEmptyTranscript = errors.New("transcript is empty — the audio track may
 // classifyTranscribeErr says which kind a failure out of transcribe or
 // runProgressive is, covering the two ways picking an audio track fails
 // (pickAudioStream, in progressive.go, is unexported and returns plain
-// errors, so this matches its message prefix rather than errors.Is) and the
-// one way transcription itself comes up empty, which does have a sentinel.
+// errors, so this matches its message prefix rather than errors.Is), the
+// one way transcription itself comes up empty, which does have a sentinel,
+// and the two endpoint refusals internal/translate names for itself.
+//
+// A -fast run translates inside its chunk loop, so a translation failure
+// reaches main through here rather than through classifyTranslateErr. It used
+// to arrive as "other": the kind was known at the point of failure and thrown
+// away in a fmt.Errorf, where no prefix matcher could recover it — which is
+// why the wrapped sentinels are the thing being matched now.
+//
 // Everything else that can reach these paths — an extract, parse or whisper
 // failure — is not one of the kinds a caller can act on, hence the false
 // return: those stay a plain, unclassified fatalf.
@@ -783,11 +793,33 @@ func classifyTranscribeErr(err error) (errKind, bool) {
 	switch {
 	case errors.Is(err, errEmptyTranscript):
 		return errTranscriptEmpty, true
+	case errors.Is(err, translate.ErrUnauthorized):
+		return errInvalidKey, true
+	case errors.Is(err, translate.ErrRateLimited):
+		return errRateLimited, true
 	case strings.HasPrefix(err.Error(), "no audio tracks in"),
 		strings.HasPrefix(err.Error(), "no audio stream at index"):
 		return errNoAudioTrack, true
 	default:
 		return errOther, false
+	}
+}
+
+// classifyTranslateErr names a translation failure the endpoint refused
+// outright. The two refusals a caller can act on are different problems with
+// different fixes — a wrong key is corrected in the settings, a rate limit is
+// waited out — and both used to arrive as rate_limited, which sent a user who
+// mistyped one character to a Retry button that could never succeed. Anything
+// else the endpoint or the model does is not something a caller can route on,
+// hence errOther.
+func classifyTranslateErr(err error) errKind {
+	switch {
+	case errors.Is(err, translate.ErrUnauthorized):
+		return errInvalidKey
+	case errors.Is(err, translate.ErrRateLimited):
+		return errRateLimited
+	default:
+		return errOther
 	}
 }
 

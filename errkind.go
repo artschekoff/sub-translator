@@ -13,7 +13,13 @@ import (
 type errKind string
 
 const (
-	errMissingKey      errKind = "missing_key"
+	errMissingKey errKind = "missing_key"
+	// errInvalidKey sits next to errMissingKey rather than next to
+	// errRateLimited, which is the other endpoint refusal, because the ordering
+	// here is what the spec's "the first N kinds are the ones a caller routes to
+	// its settings screen" reads off: a key that is wrong is fixed in the same
+	// place as a key that is absent.
+	errInvalidKey      errKind = "invalid_key"
 	errWhisperNotFound errKind = "whisper_not_found"
 	errNoModel         errKind = "no_model"
 	errAmbiguousModel  errKind = "ambiguous_model"
@@ -36,6 +42,7 @@ const (
 func allErrKinds() []errKind {
 	return []errKind{
 		errMissingKey,
+		errInvalidKey,
 		errWhisperNotFound,
 		errNoModel,
 		errAmbiguousModel,

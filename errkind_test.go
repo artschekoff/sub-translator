@@ -11,6 +11,7 @@ import (
 func TestErrKindsAreTheDocumentedStrings(t *testing.T) {
 	want := map[errKind]string{
 		errMissingKey:      "missing_key",
+		errInvalidKey:      "invalid_key",
 		errWhisperNotFound: "whisper_not_found",
 		errNoModel:         "no_model",
 		errAmbiguousModel:  "ambiguous_model",

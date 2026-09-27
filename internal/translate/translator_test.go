@@ -2,8 +2,10 @@ package translate
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strconv"
 	"strings"
@@ -450,5 +452,77 @@ func TestTranslateAllRejectsAWrongLengthBatch(t *testing.T) {
 			t.Fatalf("results[%d] = %q, want %q — the overlong reply was written anyway",
 				i, r, want)
 		}
+	}
+}
+
+// The two refusals a caller can act on have to be recognisable through whatever
+// wrapping the call chain adds. A caller matching on "translation service
+// returned HTTP 401" is matching on prose; a caller told 401 is a rate limit —
+// which is what the CLI did — sends a user who mistyped one character of their
+// key to a Retry button that can never succeed.
+func TestStatusErrorsAreRecognisableThroughTheSentinels(t *testing.T) {
+	for _, tt := range []struct {
+		code         int
+		unauthorized bool
+		rateLimited  bool
+	}{
+		{code: http.StatusUnauthorized, unauthorized: true},
+		{code: http.StatusForbidden, unauthorized: true},
+		{code: http.StatusTooManyRequests, rateLimited: true},
+		{code: http.StatusBadRequest},
+		{code: http.StatusInternalServerError},
+	} {
+		// Wrapped the way the real chain wraps it: translateAll's "all N blocks
+		// failed", then the progressive run's per-chunk context on top.
+		err := fmt.Errorf("chunk 3: translate: %w",
+			fmt.Errorf("all 40 blocks failed: %w", statusError{code: tt.code}))
+
+		if got := errors.Is(err, ErrUnauthorized); got != tt.unauthorized {
+			t.Errorf("HTTP %d: errors.Is(err, ErrUnauthorized) = %v, want %v", tt.code, got, tt.unauthorized)
+		}
+		if got := errors.Is(err, ErrRateLimited); got != tt.rateLimited {
+			t.Errorf("HTTP %d: errors.Is(err, ErrRateLimited) = %v, want %v", tt.code, got, tt.rateLimited)
+		}
+	}
+}
+
+// End to end through the real client: a refusing endpoint, every block failing,
+// and the error the caller is handed still says which refusal it was.
+func TestARefusingEndpointNamesItsRefusal(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		status int
+		want   error
+	}{
+		{name: "a rejected key", status: http.StatusUnauthorized, want: ErrUnauthorized},
+		{name: "a rate limit", status: http.StatusTooManyRequests, want: ErrRateLimited},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tt.status)
+			}))
+			defer srv.Close()
+
+			c := newOpenAI(Options{APIKey: "sk-test", BaseURL: srv.URL, Workers: 1, To: "es"})
+			_, failed, err := c.TranslateAll([]string{"one", "two"}, nil)
+			if err == nil {
+				t.Fatalf("TranslateAll() = nil, want the endpoint's HTTP %d", tt.status)
+			}
+			if len(failed) != 2 {
+				t.Errorf("%d blocks failed, want both", len(failed))
+			}
+			if !errors.Is(err, tt.want) {
+				t.Errorf("errors.Is(%v, %v) = false, want true", err, tt.want)
+			}
+			// And not the other one: narrowing rate_limited to 429 is half the
+			// point of the pair.
+			other := ErrRateLimited
+			if tt.want == ErrRateLimited {
+				other = ErrUnauthorized
+			}
+			if errors.Is(err, other) {
+				t.Errorf("errors.Is(%v, %v) = true, want false", err, other)
+			}
+		})
 	}
 }
