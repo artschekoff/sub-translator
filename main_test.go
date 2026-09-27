@@ -515,19 +515,88 @@ func TestClassifiedErrorsCarryTheirKind(t *testing.T) {
 			}
 
 			var found string
+			var errorEventCount int
 			for _, line := range strings.Split(stderr.String(), "\n") {
 				var m map[string]any
 				if json.Unmarshal([]byte(line), &m) != nil {
 					continue
 				}
 				if m["type"] == "error" {
+					errorEventCount++
 					found, _ = m["kind"].(string)
 				}
 			}
 			if found != tt.kind {
 				t.Errorf("error kind = %q, want %q\nstderr: %s", found, tt.kind, stderr.String())
 			}
+			// fatalKindf must emit its own kind exactly once, never falling
+			// through to fatalf's "other" as well — that would double-emit
+			// (one classified, one unclassified) for every classified fatal.
+			if errorEventCount != 1 {
+				t.Errorf("%d error events, want exactly 1\nstderr: %s", errorEventCount, stderr.String())
+			}
 		})
+	}
+}
+
+// Only fatalKindf used to emit an error event; plain fatalf emitted nothing,
+// so an unclassified fatal left a -events json consumer with a non-zero exit
+// and total silence on the wire. fatalf now emits kind "other" itself. This
+// drives a fatalf call site that carries no kind of its own — an empty
+// subtitle track, reached the same way TestOrdinaryRunProbeEventCarriesDuration
+// reaches the probe event, without touching whisper or the network.
+func TestFatalfEmitsAnUnclassifiedErrorEvent(t *testing.T) {
+	bin := buildCLI(t)
+	dir := t.TempDir()
+	binDir := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeStub(t, filepath.Join(binDir, "ffprobe"), "#!/bin/sh\n"+`cat <<JSON
+{"streams":[
+ {"index":0,"codec_type":"subtitle","codec_name":"srt","tags":{"language":"eng"}}
+],"format":{"duration":"120.5"}}
+JSON`)
+	writeStub(t, filepath.Join(binDir, "ffmpeg"), "#!/bin/sh\nout=\"\"\nfor a in \"$@\"; do out=\"$a\"; done\n: > \"$out\"\nexit 0\n")
+
+	film := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(film, []byte("not a film"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(bin, "-events", "json", "-to", "es", "-from", "en", "-track", "0", film)
+	cmd.Env = append(os.Environ(),
+		"OPENAI_API_KEY=sk-test",
+		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"XDG_CONFIG_HOME="+filepath.Join(dir, "cfg"),
+	)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	runErr := cmd.Run()
+	var exit *exec.ExitError
+	if !errors.As(runErr, &exit) {
+		t.Fatalf("the binary did not run: %v", runErr)
+	}
+	if code := exit.ExitCode(); code != 1 {
+		t.Errorf("exit status %d, want 1", code)
+	}
+
+	var errorEvents []map[string]any
+	for _, line := range strings.Split(stderr.String(), "\n") {
+		var m map[string]any
+		if json.Unmarshal([]byte(line), &m) == nil && m["type"] == "error" {
+			errorEvents = append(errorEvents, m)
+		}
+	}
+	if len(errorEvents) != 1 {
+		t.Fatalf("%d error events, want exactly 1: %v\nstdout: %s\nstderr: %s",
+			len(errorEvents), errorEvents, stdout.String(), stderr.String())
+	}
+	if kind, _ := errorEvents[0]["kind"].(string); kind != "other" {
+		t.Errorf("error event kind = %q, want %q", kind, "other")
+	}
+	if !strings.Contains(stderr.String(), "error: subtitle track #0 is empty") {
+		t.Errorf("stderr's human-readable \"error: ...\" line is missing or changed:\n%s", stderr.String())
 	}
 }
 
@@ -599,6 +668,78 @@ JSON`
 			t.Errorf("-probe wrote %s", e.Name())
 		}
 	}
+}
+
+// An off feature must cost nothing. probeEvent's own work — a second ffprobe
+// call for the duration — was, for one commit, unconditional: Go evaluates
+// Emit's argument before Emit's own nil check runs, so every ordinary run paid
+// for that subprocess whether or not -events json was passed. This counts
+// actual ffprobe invocations through a logging stub, once per flag
+// combination, using the same empty-subtitle-track failure
+// TestOrdinaryRunProbeEventCarriesDuration uses to reach the probe event
+// without whisper or the network.
+func TestOrdinaryRunSpawnsFfprobeOnlyWhenEventsAreOn(t *testing.T) {
+	bin := buildCLI(t)
+
+	countFfprobeCalls := func(t *testing.T, extraArgs ...string) int {
+		t.Helper()
+		dir := t.TempDir()
+		binDir := filepath.Join(dir, "bin")
+		if err := os.MkdirAll(binDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		log := filepath.Join(dir, "ffprobe.log")
+		writeStub(t, filepath.Join(binDir, "ffprobe"), "#!/bin/sh\necho called >> \""+log+"\"\n"+`cat <<JSON
+{"streams":[
+ {"index":0,"codec_type":"subtitle","codec_name":"srt","tags":{"language":"eng"}}
+],"format":{"duration":"120.5"}}
+JSON`)
+		writeStub(t, filepath.Join(binDir, "ffmpeg"), "#!/bin/sh\nout=\"\"\nfor a in \"$@\"; do out=\"$a\"; done\n: > \"$out\"\nexit 0\n")
+
+		film := filepath.Join(dir, "movie.mkv")
+		if err := os.WriteFile(film, []byte("not a film"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		args := append([]string{"-to", "es", "-from", "en", "-track", "0"}, extraArgs...)
+		args = append(args, film)
+		cmd := exec.Command(bin, args...)
+		cmd.Env = append(os.Environ(),
+			"OPENAI_API_KEY=sk-test",
+			"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+			"XDG_CONFIG_HOME="+filepath.Join(dir, "cfg"),
+		)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		if err := cmd.Run(); err == nil {
+			t.Fatalf("run succeeded, want the empty-subtitle-track failure:\n%s", stdout.String())
+		}
+
+		b, err := os.ReadFile(log)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return 0
+			}
+			t.Fatal(err)
+		}
+		lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+		if len(lines) == 1 && lines[0] == "" {
+			return 0
+		}
+		return len(lines)
+	}
+
+	t.Run("without -events json: one ffprobe call", func(t *testing.T) {
+		if got := countFfprobeCalls(t); got != 1 {
+			t.Errorf("ffprobe invoked %d time(s), want 1 (just media.Probe)", got)
+		}
+	})
+
+	t.Run("with -events json: two ffprobe calls", func(t *testing.T) {
+		if got := countFfprobeCalls(t, "-events", "json"); got != 2 {
+			t.Errorf("ffprobe invoked %d time(s), want 2 (media.Probe, plus probeEvent's duration)", got)
+		}
+	})
 }
 
 // The spec's sample stream is a full run, not -probe, and its "probe" line
@@ -710,6 +851,10 @@ func TestFastRunEmitsTheExpectedEventSequence(t *testing.T) {
 		Model: filepath.Join(dir, "ggml-test.bin"),
 	}
 
+	// Swapping the package var ev like this is safe only because nothing in
+	// package main calls t.Parallel(): two tests racing on ev, or this test
+	// racing against itself, would need its own synchronization, which
+	// neither this test nor t.Cleanup provides.
 	saved := ev
 	t.Cleanup(func() { ev = saved })
 	var buf bytes.Buffer
@@ -721,7 +866,7 @@ func TestFastRunEmitsTheExpectedEventSequence(t *testing.T) {
 	// functions main() calls (events.New/Emit and probeEvent), rather than
 	// re-deriving their shape by hand.
 	ev.Emit(&events.Version{Events: events.ProtocolVersion, Tool: version})
-	ev.Emit(probeEvent(input, streams))
+	ev.Emit(probeEvent(input, streams, media.SubtitleStreams(streams)))
 
 	if err := runProgressive(input, tmpDir, streams, -1, "en", "es",
 		10*time.Minute, opts, translate.Options{}, ""); err != nil {
@@ -731,6 +876,7 @@ func TestFastRunEmitsTheExpectedEventSequence(t *testing.T) {
 	var kinds []string
 	var savedCount int
 	var translateStages []map[string]any
+	var doneEvent map[string]any
 	for _, line := range strings.Split(buf.String(), "\n") {
 		var m map[string]any
 		if json.Unmarshal([]byte(line), &m) != nil {
@@ -746,12 +892,19 @@ func TestFastRunEmitsTheExpectedEventSequence(t *testing.T) {
 		if m["type"] == "stage" && m["name"] == "translate" {
 			translateStages = append(translateStages, m)
 		}
+		if m["type"] == "done" {
+			doneEvent = m
+		}
 	}
 
-	if len(kinds) == 0 || kinds[0] != "version" {
-		t.Fatalf("first event = %v, want version", kinds)
-	}
-	for _, want := range []string{"probe", "stage", "progress", "saved", "done"} {
+	// "version" and "probe" are not asserted here: this test hand-emits both
+	// two lines up, so checking for them would only prove the test's own
+	// Emit calls succeeded. version-first and stderr-only are pinned by
+	// TestEventsFlagLeavesStdoutUnchanged (real binary); the probe event's
+	// shape, including duration, by TestOrdinaryRunProbeEventCarriesDuration
+	// (also real binary). What's load-bearing here is what runProgressive
+	// itself produces.
+	for _, want := range []string{"stage", "progress", "saved", "done"} {
 		if !slices.Contains(kinds, want) {
 			t.Errorf("no %q event in the stream: %v", want, kinds)
 		}
@@ -761,6 +914,15 @@ func TestFastRunEmitsTheExpectedEventSequence(t *testing.T) {
 	}
 	if kinds[len(kinds)-1] != "done" {
 		t.Errorf("last event = %q, want done", kinds[len(kinds)-1])
+	}
+	// Unlike the ordinary run, -fast knows exactly what span the file covers
+	// at every point, chunk by chunk, so its done event must carry it —
+	// Major 3 (fix round 2) only made Covers omittable, never absent here.
+	if doneEvent == nil {
+		t.Fatal("no done event captured")
+	}
+	if covers, _ := doneEvent["covers"].(string); covers != "0:30:00" {
+		t.Errorf("done event covers = %q, want \"0:30:00\"", doneEvent["covers"])
 	}
 
 	// One "translate" stage per chunk, each carrying its own chunk number and
@@ -817,6 +979,9 @@ func TestAFullRunLeavesStdoutUnchangedUnderEvents(t *testing.T) {
 		Model: filepath.Join(dir, "ggml-test.bin"),
 	}
 
+	// Same contract as the swap above: safe only because nothing in package
+	// main calls t.Parallel(). This one additionally swaps os.Stdout via
+	// captureStdout, which carries the same restriction.
 	saved := ev
 	t.Cleanup(func() { ev = saved })
 
@@ -845,5 +1010,88 @@ func TestAFullRunLeavesStdoutUnchangedUnderEvents(t *testing.T) {
 	if without != with {
 		t.Errorf("stdout differs with -events json enabled:\nwithout (%d bytes): %q\nwith (%d bytes):    %q",
 			len(without), without, len(with), with)
+	}
+}
+
+// Major 4 (task-6 fix round 2, partial): six of the eleven emits this task
+// added live on the default, non -fast path, and none had a test. Fully
+// closing that gap needs main()'s pipeline pulled into a runOrdinary function
+// — out of scope for this round, carried to the final whole-branch review.
+// What is reachable without that: transcribe() already stands on its own, so
+// it is called directly here with the same stubs the -fast tests use, and its
+// two Stage emits are asserted for real. Its language emit — main()'s own
+// reaction to what transcribe found — was factored into reportDetectedLanguage
+// specifically so this test could call the real function main() calls rather
+// than re-deriving its two lines by hand the way the -fast sequence test
+// reproduces Version and probeEvent (see its comment); that reproduction cost
+// two tautological assertions (m11 in the review) this test does not want to
+// repeat.
+func TestTranscribeEmitsExtractTranscribeAndLanguageStages(t *testing.T) {
+	dir, binDir, tmpDir, _ := progressiveStubs(t, dialogueSRT)
+
+	input := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(input, []byte("not really a film"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	streams := []media.Stream{{Index: 0, CodecType: "video"}, {Index: 1, CodecType: "audio"}}
+	streams[1].Tags.Language = "eng"
+	opts := whisper.Options{
+		Bin:   filepath.Join(binDir, "stub-whisper"),
+		Model: filepath.Join(dir, "ggml-test.bin"),
+	}
+
+	// Same contract as the other ev swaps in this file: safe only because
+	// nothing in package main calls t.Parallel().
+	saved := ev
+	t.Cleanup(func() { ev = saved })
+	var buf bytes.Buffer
+	ev = events.New(&buf)
+
+	// from is empty, so whatever whisper's stub sidecar reports ("en", fixed
+	// by progressiveStubs) is new information — reportDetectedLanguage has
+	// something to say about it, the same way a real run with no -from does.
+	const from = ""
+	blocks, lang, err := transcribe(input, tmpDir, streams, -1, from, opts)
+	if err != nil {
+		t.Fatalf("transcribe() = %v, want success", err)
+	}
+	if len(blocks) == 0 {
+		t.Fatal("transcribe() returned no blocks")
+	}
+	if lang != "en" {
+		t.Fatalf("test setup problem: transcribe() detected %q, want the stub's \"en\"", lang)
+	}
+	reportDetectedLanguage(from, lang)
+
+	var kinds []string
+	var stageNames []string
+	var languageDetected string
+	for _, line := range strings.Split(buf.String(), "\n") {
+		var m map[string]any
+		if json.Unmarshal([]byte(line), &m) != nil {
+			continue
+		}
+		kinds = append(kinds, m["type"].(string))
+		if m["type"] == "stage" {
+			if name, ok := m["name"].(string); ok {
+				stageNames = append(stageNames, name)
+			}
+		}
+		if m["type"] == "language" {
+			languageDetected, _ = m["detected"].(string)
+		}
+	}
+
+	if !slices.Contains(stageNames, "extract") {
+		t.Errorf("no stage:extract event: %v", kinds)
+	}
+	if !slices.Contains(stageNames, "transcribe") {
+		t.Errorf("no stage:transcribe event: %v", kinds)
+	}
+	if !slices.Contains(kinds, "language") {
+		t.Fatalf("no language event: %v", kinds)
+	}
+	if languageDetected != "en" {
+		t.Errorf("language event detected = %q, want %q", languageDetected, "en")
 	}
 }

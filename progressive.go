@@ -306,13 +306,13 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 			fmt.Fprintf(os.Stderr, "warning: could not save transcript to %s: %v\n", transcriptPath, err)
 		}
 
+		ev.Emit(&events.Stage{Name: "translate", Chunk: c.Index + 1, Of: len(plan)})
 		// A -fast run is watched while it happens, so minutes of silence between
 		// the transcription bar and the next "extended to" line read as a hang —
 		// longer still when the endpoint is throttling and every batch retries.
-		ev.Emit(&events.Stage{Name: "translate", Chunk: c.Index + 1, Of: len(plan)})
 		translated, failed, err := client.TranslateAll(srt.Texts(shifted), func(done, total int) {
 			fmt.Printf("\r  translating: %d/%d   ", done, total)
-			ev.Emit(&events.Progress{Pct: done * 100 / total})
+			ev.Emit(&events.Progress{Pct: pctOf(done, total)})
 		})
 		fmt.Println()
 		if err != nil {
@@ -366,14 +366,19 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 	}
 
 	if len(failedAll) > 0 {
+		first := firstN(failedAll, 3)
+		firstStr := fmt.Sprint(first)
+		if len(failedAll) > len(first) {
+			firstStr += "…"
+		}
 		fmt.Printf("Done: %s covers the full %s, but %d of %d blocks could not be "+
-			"translated and kept their original text (first: %v) — reload subtitles in your player\n",
-			outPath, formatClock(total), len(failedAll), len(outBlocks), firstFew(failedAll, 3))
+			"translated and kept their original text (first: %s) — reload subtitles in your player\n",
+			outPath, formatClock(total), len(failedAll), len(outBlocks), firstStr)
 		ev.Emit(&events.Warning{
 			Kind:  "blocks_untranslated",
 			Count: len(failedAll),
 			Total: len(outBlocks),
-			First: firstN(failedAll, 3),
+			First: first,
 		})
 		ev.Emit(&events.Done{Path: outPath, Covers: formatClock(total)})
 		notifyDone("Subtitles ready, with gaps",

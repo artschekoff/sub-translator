@@ -4,6 +4,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -232,9 +233,15 @@ func main() {
 	if err != nil {
 		fatalKindf(errProbeFailed, "probe failed: %v", err)
 	}
-	ev.Emit(probeEvent(input, streams))
-
 	subs := media.SubtitleStreams(streams)
+	// probeEvent's own work — a second ffprobe call for the duration — must
+	// not happen at all when nothing is listening: Go evaluates the argument
+	// before Emit's nil check runs, so calling this unconditionally would
+	// spawn that subprocess on every ordinary run, -events json or not.
+	if ev != nil {
+		ev.Emit(probeEvent(input, streams, subs))
+	}
+
 	if len(subs) > 0 {
 		// Many releases ship untagged tracks, and the listing is what tells you
 		// which -track to pass.
@@ -334,11 +341,7 @@ func main() {
 		// asked for: transcribe drops -from when no track carries that tag, and
 		// translating from a language the transcript is not in would be worse
 		// than useless.
-		if lang != "" && lang != *from {
-			fmt.Printf("Detected language: %s\n", lang)
-			ev.Emit(&events.Language{Detected: lang})
-			*from = lang
-		}
+		*from = reportDetectedLanguage(*from, lang)
 
 		// Transcription is by far the most expensive step here; keeping its
 		// output costs one small file. A media library on a NAS share or a
@@ -410,7 +413,7 @@ func main() {
 	translated, failedBlocks, err := client.TranslateAll(texts, func(done, total int) {
 		pct := float64(done) / float64(total) * 100
 		fmt.Printf("\r  progress: %d/%d (%.0f%%)   ", done, total, pct)
-		ev.Emit(&events.Progress{Pct: done * 100 / total})
+		ev.Emit(&events.Progress{Pct: pctOf(done, total)})
 	})
 	fmt.Println()
 	if err != nil {
@@ -419,14 +422,19 @@ func main() {
 		fatalKindf(errRateLimited, "translate: %v", err)
 	}
 	if len(failedBlocks) > 0 {
+		first := firstN(failedBlocks, 3)
+		firstStr := fmt.Sprint(first)
+		if len(failedBlocks) > len(first) {
+			firstStr += "…"
+		}
 		fmt.Fprintf(os.Stderr,
-			"warning: %d of %d blocks could not be translated and kept their original text (first: %v)\n",
-			len(failedBlocks), len(texts), firstFew(failedBlocks, 3))
+			"warning: %d of %d blocks could not be translated and kept their original text (first: %s)\n",
+			len(failedBlocks), len(texts), firstStr)
 		ev.Emit(&events.Warning{
 			Kind:  "blocks_untranslated",
 			Count: len(failedBlocks),
 			Total: len(texts),
-			First: firstN(failedBlocks, 3),
+			First: first,
 		})
 	}
 
@@ -447,8 +455,9 @@ func main() {
 	// up the other run's subtitles.
 	tmpTranslated := filepath.Join(runTmpDir, "translated.srt")
 
+	var srtOut string
 	if mode.writesSRT() {
-		srtOut := srtOutputPath(input, *to, *out, mode)
+		srtOut = srtOutputPath(input, *to, *out, mode)
 		if err := srt.Write(srtOut, outBlocks); err != nil {
 			fatalf("write SRT: %v", err)
 		}
@@ -457,7 +466,9 @@ func main() {
 
 	if !mode.writesContainer() {
 		fmt.Println("Done.")
-		ev.Emit(&events.Done{Path: srtOutputPath(input, *to, *out, mode)})
+		// !writesContainer() implies writesSRT() (mode.go), so srtOut was set
+		// just above — the file the "Done." line refers to.
+		ev.Emit(&events.Done{Path: srtOut})
 		return
 	}
 
@@ -489,7 +500,21 @@ func main() {
 	ev.Emit(&events.Done{Path: outMKV})
 }
 
+// fatalf reports a fatal error with no kind a caller can act on. It still
+// emits exactly one error event — kind "other" — so a consumer never gets
+// silence and a bare exit code; fatalKindf is the one other path to the same
+// tail, and it emits its own kind instead, never this one, so a fatal run
+// always emits exactly one error event, never two.
 func fatalf(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	ev.Emit(&events.Error{Kind: string(errOther), Message: msg})
+	fatalTail("%s", msg)
+}
+
+// fatalTail is the ending every fatal path shares: the human-readable prose
+// line, cleanup, exit. It never touches the event stream itself — the two
+// callers above have already emitted, each exactly once, before reaching it.
+func fatalTail(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "error: "+format+"\n", args...)
 	// os.Exit skips deferred calls, so the scratch directory has to be removed
 	// here or every error path leaks it.
@@ -706,6 +731,24 @@ func transcribeInto(opts whisper.Options, audio, outBase, lang string) ([]srt.Bl
 	return blocks, result.Language, nil
 }
 
+// reportDetectedLanguage is main()'s reaction to what transcribe (or the first
+// chunk of a -fast run) found: whisper's own language, when it differs from
+// what was asked for, is worth telling both a person (the printed line) and a
+// machine (the language event) about, and it is what everything downstream —
+// the transcript sidecar's filename, the translation client — treats as the
+// source language from here on. Factored out of main() as its own small
+// function, not as part of the larger extraction of main()'s pipeline that is
+// out of scope for this round, so a test can call it directly rather than
+// re-deriving its two lines by hand.
+func reportDetectedLanguage(from, lang string) string {
+	if lang == "" || lang == from {
+		return from
+	}
+	fmt.Printf("Detected language: %s\n", lang)
+	ev.Emit(&events.Language{Detected: lang})
+	return lang
+}
+
 // transcribe extracts one audio stream, runs whisper over it, and returns the
 // parsed transcript together with the language whisper used. Its working files
 // go in tmpDir, the caller's run-scoped scratch directory, so that a single
@@ -734,18 +777,20 @@ func transcribe(input, tmpDir string, streams []media.Stream, atrack int, from s
 		resolveChunkLanguage(from, picked, opts.Language))
 }
 
-// firstFew renders the first n values of a list for an error message, with a
-// trailing ellipsis when there are more.
-func firstFew(v []int, n int) string {
-	if len(v) <= n {
-		return fmt.Sprint(v)
-	}
-	return fmt.Sprint(v[:n]) + "…"
+// pctOf rounds done/total to the nearest whole percent — the same rounding
+// %.0f already gives the human progress line — rather than truncating, so a
+// Progress event's Pct never disagrees with the percentage printed beside it.
+// Both translate-progress callbacks (the whole-file path and every chunk of a
+// -fast run) share this rather than each computing its own.
+func pctOf(done, total int) int {
+	return int(math.Round(float64(done) / float64(total) * 100))
 }
 
-// firstN is firstFew without the rendering: the actual first few values,
-// unformatted, for a Warning event's First field to carry the same ones
-// firstFew renders on the human-readable line beside it.
+// firstN is the first n values of v, unformatted: the actual indices, for a
+// Warning event's First field. It is the one place this slicing happens, so
+// the prose line a caller renders alongside a Warning event (with its own
+// ellipsis, since only the caller knows whether it truncated) and the event's
+// First field cannot drift apart the way two near-identical helpers could.
 func firstN(v []int, n int) []int {
 	if len(v) <= n {
 		return v
@@ -757,8 +802,10 @@ func firstN(v []int, n int) []int {
 // included. Both the -probe path (emitProbe, below) and the ordinary run call
 // this one function rather than each building the event its own way, which is
 // what let the ordinary run's event drift out of sync with -probe's in the
-// first place.
-func probeEvent(input string, streams []media.Stream) *events.Probe {
+// first place. subs is the caller's own media.SubtitleStreams(streams), taken
+// as a parameter rather than recomputed here, since both callers already need
+// that filtered list for their own purposes right next to this call.
+func probeEvent(input string, streams, subs []media.Stream) *events.Probe {
 	toEvent := func(list []media.Stream) []events.Stream {
 		out := make([]events.Stream, 0, len(list))
 		for _, s := range list {
@@ -773,7 +820,7 @@ func probeEvent(input string, streams []media.Stream) *events.Probe {
 	}
 	p := &events.Probe{
 		Audio:     toEvent(media.AudioStreams(streams)),
-		Subtitles: toEvent(media.SubtitleStreams(streams)),
+		Subtitles: toEvent(subs),
 	}
 	// A duration we cannot read — missing, or ffprobe's own "N/A" — is not
 	// worth failing over: the file is still translatable, and the field is
@@ -789,7 +836,7 @@ func probeEvent(input string, streams []media.Stream) *events.Probe {
 // it must not need a key, a target language, or do any work.
 func emitProbe(input string, streams []media.Stream) {
 	subs := media.SubtitleStreams(streams)
-	ev.Emit(probeEvent(input, streams))
+	ev.Emit(probeEvent(input, streams, subs))
 
 	if len(subs) > 0 {
 		fmt.Print(formatTracks(subs))

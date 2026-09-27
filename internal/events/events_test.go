@@ -176,3 +176,29 @@ func TestStageOmitsChunkFieldsWhenThereAreNone(t *testing.T) {
 		}
 	}
 }
+
+// The ordinary run translates whatever it parsed in one pass, not a span of
+// the container's own runtime, so it has no honest value for Covers — an
+// absent key means "unknown", which is the only truthful thing to say. The
+// -fast path does know a span, chunk by chunk, and must still send it.
+func TestDoneOmitsCoversWhenUnknownButCarriesItWhenSet(t *testing.T) {
+	var buf bytes.Buffer
+	e := fixed(New(&buf))
+	e.Emit(&Done{Path: "/tmp/movie.es.srt"})
+	e.Emit(&Done{Path: "/tmp/movie.es.srt", Covers: "2:19:08"})
+
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("got %d lines, want 2:\n%s", len(lines), buf.String())
+	}
+
+	unknown := decode(t, lines[0])
+	if _, present := unknown["covers"]; present {
+		t.Errorf(`"covers" = %v, want the key absent when Covers is unset`, unknown["covers"])
+	}
+
+	known := decode(t, lines[1])
+	if known["covers"] != "2:19:08" {
+		t.Errorf(`"covers" = %v, want "2:19:08" when Covers is set`, known["covers"])
+	}
+}

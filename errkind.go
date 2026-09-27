@@ -24,8 +24,10 @@ const (
 	errTranscriptEmpty errKind = "transcript_empty"
 	errCancelled       errKind = "cancelled"
 
-	// errOther is what an unclassified failure reports. It exists so a consumer
-	// always receives a kind, never an absent field.
+	// errOther is what an unclassified failure reports. fatalf emits it
+	// automatically, so a consumer always receives exactly one error event on
+	// any fatal path, classified or not, never an absent field and never
+	// silence.
 	errOther errKind = "other"
 )
 
@@ -49,8 +51,14 @@ func allErrKinds() []errKind {
 
 // fatalKindf reports a fatal error with a kind attached, for the failures a
 // caller can do something about. Everything else keeps using fatalf, which
-// reports no kind because there is nothing useful to say about it.
+// reports no kind because there is nothing useful to say about it — but still
+// emits, with kind "other".
+//
+// This goes straight to fatalTail rather than through fatalf: fatalf emits its
+// own error event (kind "other"), and calling it here would double-emit —
+// once with this kind, once with "other" — for every classified failure.
 func fatalKindf(kind errKind, format string, args ...any) {
-	ev.Emit(&events.Error{Kind: string(kind), Message: fmt.Sprintf(format, args...)})
-	fatalf("%s", fmt.Sprintf(format, args...))
+	msg := fmt.Sprintf(format, args...)
+	ev.Emit(&events.Error{Kind: string(kind), Message: msg})
+	fatalTail("%s", msg)
 }

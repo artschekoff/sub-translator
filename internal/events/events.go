@@ -122,8 +122,13 @@ func (*Warning) kind() Kind { return KindWarning }
 
 type Done struct {
 	base
-	Path   string `json:"path"`
-	Covers string `json:"covers"`
+	Path string `json:"path"`
+	// Covers is the clock value the -fast path knows and the ordinary run does
+	// not: the ordinary run translates whatever it parsed in one pass, not a
+	// span of the container's own runtime, so there is no honest value to put
+	// here. omitempty makes that absence explicit — "unknown", never "covers
+	// nothing" — instead of shipping a coverage claim of "".
+	Covers string `json:"covers,omitempty"`
 }
 
 func (*Done) kind() Kind { return KindDone }
