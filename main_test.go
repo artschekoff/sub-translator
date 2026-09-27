@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -332,6 +334,42 @@ func TestDescribeProviderNamesWhatIsBeingSpent(t *testing.T) {
 	if got := describeProvider(translate.Options{}); !strings.Contains(got, translate.DefaultModel) ||
 		strings.Contains(got, "0 workers") {
 		t.Errorf("describeProvider() = %q, want the defaults named rather than zeroes", got)
+	}
+}
+
+// pctOf must never disagree with the percentage the progress line prints
+// beside it. Fix round 2 used math.Round, which rounds halves away from
+// zero, while the printed line's %.0f rounds halves to even — 12.5% (1/8)
+// printed as 12 while pctOf emitted 13, and the review found 126 such pairs
+// for totals up to 200. This asserts the actual invariant — pctOf's result
+// equals int(%.0f of the same division) — rather than pinning today's
+// numbers by hand, so any future rounding-rule mismatch fails here again
+// regardless of which values happen to expose it.
+func TestPctOfAgreesWithThePrintedPercentage(t *testing.T) {
+	for _, tt := range []struct{ done, total int }{
+		{1, 8},  // 12.5% — exact half: even (12) vs away-from-zero (13)
+		{3, 8},  // 37.5% — exact half
+		{5, 8},  // 62.5% — exact half
+		{1, 40}, // 2.5%  — exact half
+		{3, 40}, // 7.5%  — exact half
+		{0, 1},
+		{1, 1},
+		{1, 3},
+		{2, 3},
+		{7, 8},
+		{99, 200},
+		{100, 200},
+		{101, 200},
+	} {
+		want := fmt.Sprintf("%.0f", float64(tt.done)/float64(tt.total)*100)
+		wantInt, err := strconv.Atoi(want)
+		if err != nil {
+			t.Fatalf("test setup: %q (from done=%d total=%d) is not an integer string", want, tt.done, tt.total)
+		}
+		if got := pctOf(tt.done, tt.total); got != wantInt {
+			t.Errorf("pctOf(%d, %d) = %d, want %d (the printed line's %%.0f gives %q)",
+				tt.done, tt.total, got, wantInt, want)
+		}
 	}
 }
 

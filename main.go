@@ -4,10 +4,10 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"math"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -777,13 +777,16 @@ func transcribe(input, tmpDir string, streams []media.Stream, atrack int, from s
 		resolveChunkLanguage(from, picked, opts.Language))
 }
 
-// pctOf rounds done/total to the nearest whole percent — the same rounding
-// %.0f already gives the human progress line — rather than truncating, so a
-// Progress event's Pct never disagrees with the percentage printed beside it.
-// Both translate-progress callbacks (the whole-file path and every chunk of a
-// -fast run) share this rather than each computing its own.
+// pctOf is what the printed progress line shows, as an integer. It goes
+// through fmt's own formatting rather than math.Round because the event and
+// the terminal have to agree on every value, and %.0f rounds halves to even
+// where math.Round rounds them away from zero: 12.5% prints as 12 and would
+// otherwise be emitted as 13. Both translate-progress callbacks (the
+// whole-file path and every chunk of a -fast run) share this rather than each
+// computing its own.
 func pctOf(done, total int) int {
-	return int(math.Round(float64(done) / float64(total) * 100))
+	p, _ := strconv.Atoi(fmt.Sprintf("%.0f", float64(done)/float64(total)*100))
+	return p
 }
 
 // firstN is the first n values of v, unformatted: the actual indices, for a
