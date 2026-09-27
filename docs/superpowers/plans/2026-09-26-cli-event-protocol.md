@@ -647,7 +647,7 @@ Declare the flag beside the existing ones in `main.go`:
 	eventsFlag := flag.String("events", "", "emit machine-readable events on stderr: json")
 ```
 
-Immediately after `flag.Parse()` and the `-version` check, before anything else happens:
+Immediately after `flag.Parse()` and **before** the `-version` check — a wrapper should be able to ask for the protocol version without opening a file, and Task 3's own test drives exactly that:
 
 ```go
 	switch *eventsFlag {
@@ -867,10 +867,12 @@ git commit -m "feat: attach error kinds to the failures a caller can act on"
 
 **Files:**
 - Modify: `main.go`
+- Modify: `internal/media/media.go` — adds `ContainerDuration`
 - Test: `main_test.go`
 
 **Interfaces:**
 - Consumes: `events.Probe`, `events.Stream` (Task 1); the existing `media.Probe`, `media.AudioStreams`, `media.SubtitleStreams`, `formatTracks`.
+- Produces, in package `media`: `func ContainerDuration(path string) (time.Duration, error)`
 - Produces: no new API.
 
 - [ ] **Step 1: Write the failing test**
