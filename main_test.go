@@ -1328,17 +1328,20 @@ func TestAnUnknownFlagStillCarriesVersionAndAnErrorEvent(t *testing.T) {
 	}
 }
 
-// The subcommands run before flag.Parse, so -events json used to be swallowed as
-// a positional argument and break them: `config get translate.model -events
-// json` failed with "config get: want exactly one key" and no event. They are
-// not runs — there is no stage, no progress and no terminal event to give them —
-// so the combination is refused, with a kind and a message, and the subcommands
-// themselves keep working untouched without the flag.
-func TestSubcommandsRefuseTheEventStreamAndKeepWorkingWithoutIt(t *testing.T) {
+// -events json has to compose with the subcommands, not be refused by them: the
+// flag worked on `config path` and `config list` before this branch existed (it
+// was ignored), and a wrapper that appends it to every invocation must not get an
+// inexplicable failure on a settings read. It also must not reach the
+// subcommand's own argument count, which is what made `config get k -events json`
+// fail with "config get: want exactly one key".
+//
+// The shape is the one -probe and -version already have: a version event, no
+// terminal event. So every verb is run twice, with the flag and without, and the
+// two runs must agree on stdout and on the exit code.
+func TestSubcommandsComposeWithTheEventStream(t *testing.T) {
 	bin := buildCLI(t)
-	cfg := t.TempDir()
 
-	run := func(t *testing.T, args ...string) (string, string, int) {
+	run := func(t *testing.T, cfg string, args ...string) (string, string, int) {
 		t.Helper()
 		cmd := exec.Command(bin, args...)
 		cmd.Env = append(os.Environ(), "XDG_CONFIG_HOME="+cfg)
@@ -1355,37 +1358,60 @@ func TestSubcommandsRefuseTheEventStreamAndKeepWorkingWithoutIt(t *testing.T) {
 		return stdout.String(), stderr.String(), code
 	}
 
-	t.Run("refused with a terminal event", func(t *testing.T) {
-		stdout, stderr, code := run(t, "config", "get", "translate.model", "-events", "json")
+	for _, verb := range [][]string{
+		{"config", "path"},
+		{"config", "list"},
+		{"config", "get", "translate.model"},
+		{"config", "set", "translate.model", "gpt-6-luna"},
+		{"model", "list"},
+	} {
+		t.Run(strings.Join(verb, " "), func(t *testing.T) {
+			// One config directory for both runs: the read-only verbs do not
+			// touch it and `set` writes the same value twice, so the only
+			// difference between the two runs can be the flag.
+			cfg := t.TempDir()
+
+			plainOut, plainErr, plainCode := run(t, cfg, verb...)
+			withOut, withErr, withCode := run(t, cfg, append(append([]string{}, verb...), "-events", "json")...)
+
+			if plainCode != 0 {
+				t.Fatalf("the plain run failed with %d:\n%s", plainCode, plainErr)
+			}
+			if withCode != plainCode {
+				t.Errorf("exit status %d with the flag, %d without:\n%s", withCode, plainCode, withErr)
+			}
+			if withOut != plainOut {
+				t.Errorf("stdout differs with -events json:\nwithout: %q\nwith:    %q", plainOut, withOut)
+			}
+			if got := eventsOf(plainErr); len(got) != 0 {
+				t.Errorf("a plain subcommand emitted %d events, want none: %v", len(got), got)
+			}
+
+			// Exactly one version event, and nothing else: a subcommand is not a
+			// run, so it has no terminal event to wait for.
+			all := eventsOf(withErr)
+			if len(all) != 1 {
+				t.Fatalf("%d events, want exactly one version event:\n%s", len(all), withErr)
+			}
+			if all[0]["type"] != "version" {
+				t.Errorf("the one event is %v, want version", all[0]["type"])
+			}
+			if all[0]["events"] != float64(events.ProtocolVersion) {
+				t.Errorf("version event events = %v, want %d", all[0]["events"], events.ProtocolVersion)
+			}
+		})
+	}
+
+	// An unsupported value is refused the same way the run path refuses it: the
+	// one thing that cannot be answered in a format is that the format is not
+	// understood.
+	t.Run("an unsupported -events value is refused", func(t *testing.T) {
+		_, stderr, code := run(t, t.TempDir(), "config", "path", "-events", "yaml")
 		if code != 1 {
 			t.Errorf("exit status %d, want 1", code)
 		}
-		errs := eventsOfKind(stderr, "error")
-		if len(errs) != 1 {
-			t.Fatalf("%d error events, want exactly 1:\n%s", len(errs), stderr)
-		}
-		if msg, _ := errs[0]["message"].(string); !strings.Contains(msg, "config") ||
-			!strings.Contains(msg, "-events json") {
-			t.Errorf("error message = %q, want it to name the flag and the subcommand", msg)
-		}
-		if strings.Contains(stderr, "want exactly one key") {
-			t.Errorf("the flag still reaches the subcommand's own argument check:\n%s", stderr)
-		}
-		if stdout != "" {
-			t.Errorf("stdout = %q, want nothing", stdout)
-		}
-	})
-
-	t.Run("without the flag the subcommand is untouched", func(t *testing.T) {
-		stdout, stderr, code := run(t, "config", "path")
-		if code != 0 {
-			t.Errorf("exit status %d, want 0\nstderr: %s", code, stderr)
-		}
-		if !strings.Contains(stdout, "config.json") {
-			t.Errorf("stdout = %q, want the config path", stdout)
-		}
-		if got := eventsOf(stderr); len(got) != 0 {
-			t.Errorf("a subcommand emitted %d events, want none: %v", len(got), got)
+		if !strings.Contains(stderr, "json") {
+			t.Errorf("error %q does not name the supported value", stderr)
 		}
 	})
 }
@@ -1972,5 +1998,134 @@ func TestASuccessfulRunEndsInExactlyOneDoneEventAndNoError(t *testing.T) {
 	}
 	if path, _ := dones[0]["path"].(string); path == "" {
 		t.Error("the done event carries no path")
+	}
+}
+
+// The argv pre-scan that lets a parse failure be reported on the stream must read
+// os.Args the way flag.Parse is about to read it, or the two disagree about the
+// same command line — and a user is then told that one flag works after the input
+// path while every other flag does not. These four cases are where a scan that
+// was merely "look for -events anywhere" and a scan that merely "stops at the
+// first word without a dash" each get it wrong.
+func TestTheEventsFlagIsHonouredWhereFlagParseWouldHonourIt(t *testing.T) {
+	bin := buildCLI(t)
+
+	run := func(t *testing.T, args ...string) (string, int) {
+		t.Helper()
+		cmd := exec.Command(bin, args...)
+		cmd.Env = append(os.Environ(), "XDG_CONFIG_HOME="+t.TempDir())
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		err := cmd.Run()
+		var exit *exec.ExitError
+		if !errors.As(err, &exit) {
+			t.Fatalf("want a non-zero exit, got %v\nstderr: %s", err, stderr.String())
+		}
+		return stderr.String(), exit.ExitCode()
+	}
+
+	missing := filepath.Join(t.TempDir(), "nonexistent.mkv")
+
+	t.Run("before the input path: honoured", func(t *testing.T) {
+		stderr, code := run(t, "-events", "json", "-to", "es", missing)
+		if code != 1 {
+			t.Errorf("exit status %d, want 1", code)
+		}
+		all := eventsOf(stderr)
+		if len(all) == 0 || all[0]["type"] != "version" {
+			t.Fatalf("want a version event first:\n%s", stderr)
+		}
+		if got := eventsOfKind(stderr, "error"); len(got) != 1 {
+			t.Errorf("%d error events, want exactly 1:\n%s", len(got), stderr)
+		}
+	})
+
+	// The case a scan that stopped at the first dashless word would break: "es"
+	// is -to's value, not the input path, so flag.Parse reads straight past it
+	// and so must the scan. The parse then fails on a flag it does define with a
+	// value it cannot use, which is what makes the scan's answer observable —
+	// after a successful parse the flag itself would switch the stream on.
+	t.Run("after another flag's value: honoured", func(t *testing.T) {
+		stderr, code := run(t, "-to", "es", "-workers=notanumber", "-events", "json", missing)
+		if code != 2 {
+			t.Errorf("exit status %d, want 2 (a bad flag value is a usage error)", code)
+		}
+		all := eventsOf(stderr)
+		if len(all) == 0 || all[0]["type"] != "version" {
+			t.Fatalf("want a version event first — the scan stopped at -to's value:\n%s", stderr)
+		}
+		errs := eventsOfKind(stderr, "error")
+		if len(errs) != 1 {
+			t.Fatalf("%d error events, want exactly 1:\n%s", len(errs), stderr)
+		}
+		if msg, _ := errs[0]["message"].(string); !strings.Contains(msg, "workers") {
+			t.Errorf("error message = %q, want it to name the flag at fault", msg)
+		}
+	})
+
+	// After the input path, flag.Parse honours nothing — every flag there is a
+	// positional argument — so this must not switch the stream on either. It used
+	// to, which was the one place the two disagreed.
+	t.Run("after the input path: ignored, like every other flag", func(t *testing.T) {
+		stderr, code := run(t, "-to", "es", missing, "-events", "json")
+		if code != 1 {
+			t.Errorf("exit status %d, want 1", code)
+		}
+		if got := eventsOf(stderr); len(got) != 0 {
+			t.Errorf("%d events, want none — flag.Parse ignores this flag here and so must the scan: %v\n%s",
+				len(got), got, stderr)
+		}
+		// The failure is still reported to a person.
+		if !strings.Contains(stderr, "error: input file not found") {
+			t.Errorf("the prose error line is missing:\n%s", stderr)
+		}
+	})
+
+	// The deliberate asymmetry: at a flag this CLI does not define, flag.Parse is
+	// about to fail rather than produce a run, so the scan keeps looking. A
+	// wrapper newer than the CLI it found on PATH is exactly the case the early
+	// scan exists for, and silence is the worst possible answer to it.
+	t.Run("at an unknown flag the scan keeps looking", func(t *testing.T) {
+		stderr, code := run(t, "-bogus", "-events", "json", missing)
+		if code != 2 {
+			t.Errorf("exit status %d, want 2", code)
+		}
+		all := eventsOf(stderr)
+		if len(all) == 0 || all[0]["type"] != "version" {
+			t.Fatalf("want a version event first:\n%s", stderr)
+		}
+		if got := eventsOfKind(stderr, "error"); len(got) != 1 {
+			t.Errorf("%d error events, want exactly 1:\n%s", len(got), stderr)
+		}
+	})
+}
+
+// Asking for help is not a usage error. flag's own ExitOnError exits 0 on -h,
+// and switching to ContinueOnError to catch the unknown-flag case silently
+// changed that to 2 — a regression in this branch, caught by comparing against
+// the binary built before it. Like -version, -h ends with no terminal event.
+func TestHelpExitsZeroAndCarriesNoTerminalEvent(t *testing.T) {
+	bin := buildCLI(t)
+
+	for _, flagName := range []string{"-h", "-help", "--help"} {
+		t.Run(flagName, func(t *testing.T) {
+			cmd := exec.Command(bin, "-events", "json", flagName)
+			cmd.Env = append(os.Environ(), "XDG_CONFIG_HOME="+t.TempDir())
+			var stdout, stderr bytes.Buffer
+			cmd.Stdout, cmd.Stderr = &stdout, &stderr
+			if err := cmd.Run(); err != nil {
+				t.Fatalf("%s exited non-zero: %v\nstderr: %s", flagName, err, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), "Usage:\n  sub-translator [flags] <input>") {
+				t.Errorf("%s printed no usage text:\n%s", flagName, stderr.String())
+			}
+			all := eventsOf(stderr.String())
+			if len(all) != 1 || all[0]["type"] != "version" {
+				t.Errorf("%d events, want exactly one version event: %v", len(all), all)
+			}
+			if stdout.String() != "" {
+				t.Errorf("stdout = %q, want nothing", stdout.String())
+			}
+		})
 	}
 }

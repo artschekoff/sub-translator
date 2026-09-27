@@ -84,7 +84,7 @@ Exit codes, and the terminal event each pairs with:
 
 | Exit | Meaning | Terminal event |
 |---|---|---|
-| 0 | the run finished | one `done` |
+| 0 | the run finished | one `done` — none for `-probe`, `-version`, `-h` or a subcommand |
 | 1 | a fatal error | one `error` with a `kind` |
 | 2 | a usage error: an unknown flag or a bad flag value | one `error`, kind `other`, after `version` |
 | 130 | cancelled by SIGINT or SIGTERM | one `error`, kind `cancelled` |
@@ -97,7 +97,9 @@ Prints the `version` and `probe` events and exits without doing any work. The GU
 
 With `-events json` it emits JSON; without it, the human-readable track listing the tool already prints. It requires only the input path — no `-to`, no key.
 
-**`-probe` and `-version` carry no terminal event.** Neither is a run: both exit 0 having emitted no `done` and no `error`. A decoder shared between the probe call and the run call must not wait for one. The `config` and `model` subcommands are prose-only for the same reason and refuse `-events json` outright, with a message and one `error` event, rather than letting the flag break their own argument parsing — the Settings screen reads and writes through them as text.
+**`-probe`, `-version`, `-h` and the subcommands carry no terminal event.** None of them is a run: each emits `version` (and `-probe` its `probe`), exits 0, and emits no `done` and no `error`. A decoder shared between the probe call, a settings read and the run call must not wait for one.
+
+`-events json` composes with the `config` and `model` subcommands rather than being refused by them, so a wrapper can append the flag to every invocation uniformly: the flag is taken out of the arguments the subcommand itself counts, the subcommand's own plain-text output on stdout is unchanged, and the stream carries the `version` event alone. The Settings screen still reads and writes through them as text.
 
 ### Typed errors
 
@@ -118,7 +120,7 @@ Every fatal error gains a `kind` so a caller can act on it rather than match on 
 | `cancelled` | SIGINT or SIGTERM |
 | `other` | anything not yet classified — a usage error, an unreachable endpoint, a mangled reply |
 
-The first five are what the GUI routes to its settings screen — Part 2's routing list below predates `invalid_key` and has to include it. `invalid_key` is separate from `rate_limited` because the two lead to different places: a key with a typo in it is corrected in Settings and retrying it can never succeed, while a rate limit is waited out on the Run screen. Folding them together sent the most likely first-run error to a Retry button that re-ran the whole transcription.
+The first five are what the GUI routes to its settings screen. `invalid_key` is separate from `rate_limited` because the two lead to different places: a key with a typo in it is corrected in Settings and retrying it can never succeed, while a rate limit is waited out on the Run screen. Folding them together sent the most likely first-run error to a Retry button that re-ran the whole transcription.
 
 ### Revised after implementation
 
@@ -129,6 +131,8 @@ Part 1 above is the design as built. What the build changed, and why:
 - **Five stage names, two of them new.** `extract-subs` and `mux` were invisible phases: the `-source sub` flow went `probe` → `stage translate` with nothing in between, and a container rewrite left the window reading "translate, 100%" for minutes.
 - **The exit-code table, including 2.** A usage error exits 2, which appeared nowhere in this document, and used to exit from inside the flag package before the emitter existed — so the one case version negotiation is for produced no `version` event. It now emits `version`, then `error`, then exits 2.
 - **The sample stream.** The original chained `warning → done → error`, which no run can produce. Replaced with one producible run plus the `error` alternative, because a decoder test written from the old sample would have encoded an impossible sequence as a fixture.
+- **The subcommands compose with the flag.** Refusing `-events json` on `config`/`model` was tried and reversed: the flag was ignored (so effectively worked) on `config path` and `config list` before the event stream existed, and refusing it shipped a regression on an invocation a script may already hold. They join `-probe` and `-version` as invocations that emit `version` and no terminal event.
+- **`-events json` is honoured exactly where `flag.Parse` honours it.** The early argv scan that lets a parse failure be reported on the stream reads argv by the same rules the flag package is about to — it stops at the first positional argument — so `movie.mkv -events json` is ignored by both rather than by only one of them. It keeps looking past a flag the CLI does not define, because that is the case it exists for.
 - **Still open, deliberately.** SIGINT does not kill the ffmpeg child, which is reparented to PID 1 and keeps the stream's fd open — a GUI that drains stderr to EOF waits for the orphan. That needs process groups and its own platform testing. Also open: no kind for an unwritable output path (S4), and Part 2's copy of `validateFast`'s rules (S6).
 
 ## Part 2: The window
@@ -216,7 +220,7 @@ The run screen replaces the card with a stage line, a progress bar and the growi
 
 ### Errors lead somewhere
 
-An `error` event with `kind` of `missing_key`, `whisper_not_found`, `no_model` or `ambiguous_model` switches to Settings, focuses the field at fault, and shows the message above it. Every other kind stays on the Run screen with the message and a Retry button.
+An `error` event with `kind` of `missing_key`, `invalid_key`, `whisper_not_found`, `no_model` or `ambiguous_model` switches to Settings, focuses the field at fault, and shows the message above it. Every other kind stays on the Run screen with the message and a Retry button.
 
 This is the owner's stated requirement: a missing key is not a failure to report, it is a setup step to complete.
 

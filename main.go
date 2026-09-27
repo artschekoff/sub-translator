@@ -133,51 +133,118 @@ Examples:
   sub-translator model pull large-v3-turbo
 `
 
-// eventsRequested reports whether argv asks for the JSON event stream. It is a
-// deliberately dumb scan over the raw arguments, and it exists for one reason:
-// flag.Parse used to be the first thing that could end the process — an unknown
-// flag printed a usage error and exited 2 before the emitter was built, so the
-// promise that "the first line of any run is always a version event" was broken
-// in precisely the case version negotiation exists for, a GUI newer than the CLI
-// it found on PATH. Knowing this one boolean early is enough to answer on the
-// stream instead. flag.Parse remains the only real parser; this decides nothing
-// else.
-func eventsRequested(args []string) bool {
-	for i, a := range args {
-		switch a {
-		case "-events", "--events":
+// eventsRequested reports whether argv asks for the JSON event stream, reading
+// os.Args the way flag.Parse is about to read it.
+//
+// It exists because flag.Parse can end the process before the emitter is built —
+// an unknown flag prints a usage error and exits 2 — and "the first line of any
+// run is always a version event" has to hold in precisely that case, which is
+// the one version negotiation exists for: a wrapper newer than the CLI it found
+// on PATH.
+//
+// It is not a second parser. It reads no values, validates nothing and keeps no
+// state; it asks fs a single question — does this flag take a value, so is the
+// next word its value or the first positional argument — because that is the one
+// piece of flag.Parse's knowledge it cannot do without. Asking the real flag set
+// rather than keeping a list here is what stops the two ever disagreeing about a
+// command line that runs: this stops where flag.Parse stops, at the first
+// positional argument or "--", so `movie.mkv -events json` is ignored by both,
+// exactly like every other flag written after the input path.
+//
+// One asymmetry is deliberate. At a flag this CLI does not define, flag.Parse is
+// about to fail rather than produce a run, so this keeps looking instead of
+// stopping — which is what lets `-bogus -events json` be answered on the stream
+// instead of in silence, the whole reason for scanning early. It cannot make the
+// two disagree about any argv that actually runs.
+func eventsRequested(args []string, fs *flag.FlagSet) bool {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "-" || a == "--" || !strings.HasPrefix(a, "-") {
+			// Where flag.Parse stops: everything from here is positional.
+			return false
+		}
+		name, value, hasValue := strings.Cut(strings.TrimLeft(a, "-"), "=")
+		if name == "events" {
+			if hasValue {
+				return value == "json"
+			}
 			return i+1 < len(args) && args[i+1] == "json"
-		case "-events=json", "--events=json":
-			return true
+		}
+		if hasValue {
+			continue
+		}
+		if f := fs.Lookup(name); f != nil && !isBoolFlag(f) {
+			// The next word is this flag's value, not the input path.
+			i++
 		}
 	}
 	return false
 }
 
-func main() {
-	// Before anything that can exit: the subcommand dispatch and flag.Parse both
-	// used to end the process while ev was still nil.
-	wantEvents := eventsRequested(os.Args[1:])
-	if wantEvents {
-		ev = events.New(proseErr)
-		ev.Emit(&events.Version{Events: events.ProtocolVersion, Tool: version})
-	}
+// isBoolFlag reports whether f is a boolean flag, the same way the flag package
+// itself decides whether the following argument belongs to it.
+func isBoolFlag(f *flag.Flag) bool {
+	b, ok := f.Value.(interface{ IsBoolFlag() bool })
+	return ok && b.IsBoolFlag()
+}
 
-	if verb := subcommandVerb(os.Args[1:]); verb != "" {
-		// The subcommands print plain text and emit nothing: they are not runs,
-		// there is no stage, progress or terminal event to give them, and they
-		// run before flag.Parse — so -events json used to be swallowed as a
-		// positional argument and break them ("config get: want exactly one
-		// key"). Refusing says so, with a kind and a message, instead.
-		if wantEvents {
-			fatalf("-events json is not supported by the %s subcommand: it writes plain text "+
-				"on stdout and emits no events — drop the flag (the event stream is for a "+
-				"translation run)", verb)
+// splitEventsFlag takes a -events flag out of a subcommand's arguments and
+// returns the rest of them, the value it carried, and whether it was there.
+//
+// A subcommand needs its own scan, and a different one: `config get <key>` is
+// three positional words, so eventsRequested's rule — stop at the first word
+// that is not a flag — would stop immediately and never see the flag. And the
+// flag has to be removed rather than merely noticed, because the subcommands
+// count their arguments: passing it through is what made `config get k -events
+// json` fail with "config get: want exactly one key". Nothing else in argv is
+// touched, so every verb sees exactly what it saw before the flag existed.
+func splitEventsFlag(args []string) (rest []string, value string, found bool) {
+	without := func(from, to int) []string {
+		out := append([]string{}, args[:from]...)
+		return append(out, args[min(to, len(args)):]...)
+	}
+	for i, a := range args {
+		switch {
+		case a == "-events", a == "--events":
+			if i+1 < len(args) {
+				return without(i, i+2), args[i+1], true
+			}
+			return without(i, i+1), "", true
+		case strings.HasPrefix(a, "-events="), strings.HasPrefix(a, "--events="):
+			_, v, _ := strings.Cut(a, "=")
+			return without(i, i+1), v, true
 		}
-		if handled, err := dispatchSubcommand(os.Args[1:], os.Stdout); handled {
+	}
+	return args, "", false
+}
+
+func main() {
+	if verb := subcommandVerb(os.Args[1:]); verb != "" {
+		// A subcommand is not a run: it prints plain text on stdout and has no
+		// stage, no progress and nothing that could honestly be a done or an
+		// error. But -events json still has to compose with it — the flag worked
+		// on `config path` and `config list` before this branch existed, and a
+		// wrapper that appends it to every invocation must not get an
+		// inexplicable failure on a settings read. So the flag is accepted,
+		// taken out of what the subcommand sees, and answered with a version
+		// event and nothing else: the shape -probe and -version already have.
+		args, value, found := splitEventsFlag(os.Args[1:])
+		if found {
+			switch value {
+			case "json":
+				ev = events.New(proseErr)
+				ev.Emit(&events.Version{Events: events.ProtocolVersion, Tool: version})
+			default:
+				// The same refusal the run path gives, and for the same reason:
+				// an unsupported format cannot be answered in that format.
+				fatalf("invalid -events %q: the only supported value is json", value)
+			}
+		}
+		if handled, err := dispatchSubcommand(args, os.Stdout); handled {
 			if err != nil {
 				fatalf("%v", err)
 			}
+			// No terminal event, as for -probe and -version.
 			return
 		}
 	}
@@ -199,6 +266,14 @@ func main() {
 	probeOnly := flag.Bool("probe", false, "list the file's tracks and exit")
 	eventsFlag := flag.String("events", "", "emit machine-readable events on stderr: json")
 	flag.Usage = func() { fmt.Fprint(proseErr, usage) }
+
+	// After the definitions, so the scan can ask which flags take a value;
+	// before Parse, which is the thing that can exit without the emitter.
+	if eventsRequested(os.Args[1:], flag.CommandLine) {
+		ev = events.New(proseErr)
+		ev.Emit(&events.Version{Events: events.ProtocolVersion, Tool: version})
+	}
+
 	// ContinueOnError, so a usage error comes back here rather than exiting
 	// inside the flag package: flag has already printed its message and the
 	// usage text by then, which is the prose this keeps unchanged, and the exit
@@ -208,21 +283,27 @@ func main() {
 	// ours, so it goes through the same serialised writer.
 	flag.CommandLine.SetOutput(proseErr)
 	if err := flag.CommandLine.Parse(os.Args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			// -h and -help: flag has already printed the usage text, and asking
+			// for help is not a failure. ExitOnError exits 0 here, so this must
+			// too — and like -version it ends with no terminal event.
+			os.Exit(0)
+		}
 		ev.Emit(&events.Error{Kind: string(errOther), Message: err.Error()})
 		os.Exit(2)
 	}
 
 	switch *eventsFlag {
 	case "":
-		// Disabled: Emit is a no-op, so nothing below needs a guard. The
-		// pre-scan above can still have switched the stream on — flag parsing
-		// stops at the first positional argument, so `movie.mkv -events json`
-		// reaches only the scan — and a version event already written is not
-		// worth taking back.
+		// Disabled: Emit is a no-op, so nothing below needs a guard.
 	case "json":
 		if ev == nil {
-			// A spelling the pre-scan does not know. Nothing has been emitted
-			// yet, so version is still the first line.
+			// Unreachable as long as the scan above reads argv the way Parse
+			// does, which is the property its comment is about. Kept as the one
+			// place that would notice if that ever stopped being true: an
+			// honoured -events json without a stream would be worse than a
+			// duplicate version line, and nothing has been emitted yet, so
+			// version is still the first line.
 			ev = events.New(proseErr)
 			ev.Emit(&events.Version{Events: events.ProtocolVersion, Tool: version})
 		}

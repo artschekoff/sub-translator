@@ -382,9 +382,17 @@ A field that does not apply to the current run is left out of the JSON rather th
 sub-translator -events json -probe movie.mkv
 ```
 
-**`-probe` and `-version` carry no terminal event.** Neither is a run: both emit `version` (and `-probe` its `probe`), exit 0, and emit no `done` and no `error`. A decoder shared between the probe call and the run call must not wait for a terminal event on those two.
+**`-probe`, `-version`, `-h` and the subcommands carry no terminal event.** None of them is a run: each emits `version` (and `-probe` its `probe`), exits 0, and emits no `done` and no `error`. A decoder shared between a probe call, a settings read and a run must not wait for a terminal event on those.
 
-**The `config` and `model` subcommands do not emit events, and refuse the flag.** They print plain text on stdout and have no run to report; `-events json` alongside one of them fails with a message saying so and one `error` event of kind `other`, rather than being swallowed as an argument and breaking the subcommand's own parsing. Read and write the config through them as prose.
+**`-events json` composes with the `config` and `model` subcommands.** They print plain text on stdout and have no run to report, so the flag is taken out of the arguments the subcommand counts — `config get translate.model -events json` is still a one-key `get` — the stdout is identical to the same command without the flag, and the stream carries the `version` event alone:
+
+```bash
+sub-translator config get translate.model -events json
+```
+
+so a wrapper can append `-events json` to every invocation it makes, including the ones that read and write settings.
+
+**Write `-events json` before the input path.** Like every flag this tool takes, it is only read while the arguments still look like flags: `sub-translator movie.mkv -events json` treats the flag as a positional argument and emits nothing, exactly as `-to es` after the path would be ignored.
 
 Every fatal error carries a `kind` so a program can act on the reason instead of matching on wording. The message stays exactly as it is today:
 
@@ -411,7 +419,7 @@ Exit codes, and the event that pairs with each:
 
 | Exit | Meaning | Terminal event |
 |---|---|---|
-| 0 | the run finished | one `done` (none for `-probe` and `-version`) |
+| 0 | the run finished | one `done` — none for `-probe`, `-version`, `-h` or a subcommand |
 | 1 | a fatal error | one `error`, with the `kind` from the table above |
 | 2 | a usage error: an unknown flag or a bad flag value | one `error`, kind `other`, after the `version` event |
 | 130 | cancelled by SIGINT or SIGTERM | one `error`, kind `cancelled` |
