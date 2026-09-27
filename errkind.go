@@ -1,5 +1,11 @@
 package main
 
+import (
+	"fmt"
+
+	"github.com/artschekoff/sub-translator/internal/events"
+)
+
 // errKind classifies a fatal error so a program driving this tool can act on the
 // reason instead of matching on the wording. The strings are a contract: a
 // wrapper switches on them, so they are pinned by a test and must not be
@@ -39,4 +45,12 @@ func allErrKinds() []errKind {
 		errCancelled,
 		errOther,
 	}
+}
+
+// fatalKindf reports a fatal error with a kind attached, for the failures a
+// caller can do something about. Everything else keeps using fatalf, which
+// reports no kind because there is nothing useful to say about it.
+func fatalKindf(kind errKind, format string, args ...any) {
+	ev.Emit(&events.Error{Kind: string(kind), Message: fmt.Sprintf(format, args...)})
+	fatalf("%s", fmt.Sprintf(format, args...))
 }

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/artschekoff/sub-translator/internal/config"
+	"github.com/artschekoff/sub-translator/internal/events"
 	"github.com/artschekoff/sub-translator/internal/media"
 	"github.com/artschekoff/sub-translator/internal/models"
 	"github.com/artschekoff/sub-translator/internal/srt"
@@ -28,6 +29,11 @@ var version = "dev"
 // fatalf's os.Exit and a SIGINT — both have to be able to remove it, and a
 // feature film's 16 kHz WAV is well over a gigabyte to leave behind.
 var runTmpDir string
+
+// ev carries the machine-readable event stream. It is disabled unless
+// -events json is passed, and Emit is a no-op when disabled, so the call sites
+// below need no guards.
+var ev *events.Emitter
 
 // setupRunTmpDir creates the run-scoped scratch directory and arms the signal
 // handler that removes it. Go's default SIGINT disposition terminates the
@@ -133,8 +139,19 @@ func main() {
 	fast := flag.Bool("fast", false, "translate progressively so the opening is watchable within a minute")
 	chunkMin := flag.Int("chunk", -1, "chunk length in minutes for -fast (default 10, or whisper.chunk-minutes)")
 	showVersion := flag.Bool("version", false, "print version and exit")
+	eventsFlag := flag.String("events", "", "emit machine-readable events on stderr: json")
 	flag.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	flag.Parse()
+
+	switch *eventsFlag {
+	case "":
+		// Disabled: Emit is a no-op, so nothing below needs a guard.
+	case "json":
+		ev = events.New(os.Stderr)
+		ev.Emit(&events.Version{Events: events.ProtocolVersion, Tool: version})
+	default:
+		fatalf("invalid -events %q: the only supported value is json", *eventsFlag)
+	}
 
 	if *showVersion {
 		fmt.Printf("sub-translator %s\n", version)

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"os/exec"
@@ -423,4 +424,47 @@ func envWithout(env []string, name string) []string {
 		}
 	}
 	return out
+}
+
+// The event stream is an addition, not a replacement: a person running the tool
+// in a terminal must see exactly what they saw before. Anything else makes
+// -events json a breaking change for every existing user and script.
+func TestEventsFlagLeavesStdoutUnchanged(t *testing.T) {
+	bin := buildCLI(t)
+
+	run := func(extra ...string) (string, string) {
+		t.Helper()
+		args := append([]string{"-version"}, extra...)
+		cmd := exec.Command(bin, args...)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		_ = cmd.Run()
+		return stdout.String(), stderr.String()
+	}
+
+	plainOut, plainErr := run()
+	jsonOut, jsonErr := run("-events", "json")
+
+	if plainOut != jsonOut {
+		t.Errorf("stdout differs with -events json:\nwithout: %q\nwith:    %q", plainOut, jsonOut)
+	}
+	if plainErr != "" {
+		t.Errorf("a plain run wrote to stderr: %q", plainErr)
+	}
+	if !strings.Contains(jsonErr, `"type":"version"`) {
+		t.Errorf("stderr carries no version event: %q", jsonErr)
+	}
+}
+
+func TestEventsFlagRejectsAnythingButJSON(t *testing.T) {
+	bin := buildCLI(t)
+	cmd := exec.Command(bin, "-events", "yaml", "-to", "es", "movie.mkv")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err == nil {
+		t.Fatal("want a non-zero exit for an unsupported -events value")
+	}
+	if !strings.Contains(stderr.String(), "json") {
+		t.Errorf("error %q does not name the supported value", stderr.String())
+	}
 }
