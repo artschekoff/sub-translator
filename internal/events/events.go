@@ -141,22 +141,57 @@ type Error struct {
 
 func (*Error) kind() Kind { return KindError }
 
+// SyncWriter serialises writes to one underlying writer. The event stream and
+// the prose the tool writes for a person share a file descriptor by design, and
+// they are written from different goroutines — the SIGINT handler emits while
+// the main goroutine may be halfway through a warning line. Routing both
+// through one of these makes every write of ours whole: a consumer sees a
+// complete JSON object or a complete prose line, never one inside the other.
+//
+// It guards only our own writes. A subprocess writing the same descriptor
+// cannot be locked out, which is why the ffmpeg children have their stderr
+// captured instead (see internal/media).
+type SyncWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func NewSyncWriter(w io.Writer) *SyncWriter {
+	return &SyncWriter{w: w}
+}
+
+func (s *SyncWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
+}
+
 // Emitter writes events as newline-delimited JSON. A zero writer disables it,
 // so every call site can emit unconditionally instead of guarding.
 type Emitter struct {
-	mu  sync.Mutex
-	w   io.Writer
+	w   *SyncWriter
 	now func() time.Time
 }
 
+// New builds an emitter writing to w. A *SyncWriter is adopted as it is rather
+// than wrapped again, which is how the caller's prose writes and the events end
+// up under one lock instead of two.
 func New(w io.Writer) *Emitter {
-	return &Emitter{w: w, now: time.Now}
+	if w == nil {
+		return &Emitter{now: time.Now}
+	}
+	sw, ok := w.(*SyncWriter)
+	if !ok {
+		sw = NewSyncWriter(w)
+	}
+	return &Emitter{w: sw, now: time.Now}
 }
 
 // Emit writes one event. It is safe on a nil receiver and on a disabled
 // emitter, and safe to call from several goroutines: translation runs a worker
-// pool whose progress callbacks arrive concurrently, and interleaved writes
-// would produce lines no consumer could parse.
+// pool whose progress callbacks arrive concurrently, the SIGINT handler emits
+// from a goroutine of its own, and interleaved writes would produce lines no
+// consumer could parse.
 func (e *Emitter) Emit(ev Event) {
 	if e == nil || e.w == nil {
 		return
@@ -171,7 +206,8 @@ func (e *Emitter) Emit(ev Event) {
 		return
 	}
 
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	// One Write of one whole line: the lock lives in SyncWriter, so a prose
+	// write sharing the same writer is serialised against this one too, and
+	// Marshal above stays outside it.
 	e.w.Write(append(line, '\n'))
 }

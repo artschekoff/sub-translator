@@ -36,6 +36,15 @@ var runTmpDir string
 // below need no guards.
 var ev *events.Emitter
 
+// proseErr is stderr for everything this process writes there in prose: the
+// warning lines, the fatal error line, the usage dump, the interactive prompt.
+// It is the same serialised writer the event emitter is given, so a JSON event
+// — including the one the SIGINT handler emits from its own goroutine — can
+// never land inside one of those lines, and none of them can land inside an
+// event. Both kinds of line share stderr by design; what the lock buys is that
+// each one is whole.
+var proseErr = events.NewSyncWriter(os.Stderr)
+
 // setupRunTmpDir creates the run-scoped scratch directory and arms the signal
 // handler that removes it. Go's default SIGINT disposition terminates the
 // process outright, so a deferred cleanup never runs when a user aborts a
@@ -148,14 +157,14 @@ func main() {
 	showVersion := flag.Bool("version", false, "print version and exit")
 	probeOnly := flag.Bool("probe", false, "list the file's tracks and exit")
 	eventsFlag := flag.String("events", "", "emit machine-readable events on stderr: json")
-	flag.Usage = func() { fmt.Fprint(os.Stderr, usage) }
+	flag.Usage = func() { fmt.Fprint(proseErr, usage) }
 	flag.Parse()
 
 	switch *eventsFlag {
 	case "":
 		// Disabled: Emit is a no-op, so nothing below needs a guard.
 	case "json":
-		ev = events.New(os.Stderr)
+		ev = events.New(proseErr)
 		ev.Emit(&events.Version{Events: events.ProtocolVersion, Tool: version})
 	default:
 		fatalf("invalid -events %q: the only supported value is json", *eventsFlag)
@@ -287,7 +296,7 @@ func main() {
 		// /dev/null is itself a character device, so the terminal check can
 		// report interactive when nobody is there to answer. The actionable
 		// message here must not depend on that guess being right.
-		ok, err := readConfirm(stdin, os.Stderr, fmt.Sprintf(
+		ok, err := readConfirm(stdin, proseErr, fmt.Sprintf(
 			"Transcribe the audio track with %s? This can take a while",
 			filepath.Base(whisperOpts.Model)))
 		if err != nil {
@@ -358,10 +367,10 @@ func main() {
 			// first, so a fatal translate error below would leave untranslated
 			// source text under the translated filename: precisely the artifact
 			// this branch exists to make impossible.
-			fmt.Fprintf(os.Stderr, "warning: not saving the %s transcript to %s: "+
+			fmt.Fprintf(proseErr, "warning: not saving the %s transcript to %s: "+
 				"that is where the translated subtitles go\n", *from, transcriptPath)
 		} else if err := srt.Write(transcriptPath, blocks); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: could not save transcript to %s: %v\n", transcriptPath, err)
+			fmt.Fprintf(proseErr, "warning: could not save transcript to %s: %v\n", transcriptPath, err)
 		} else {
 			fmt.Printf("Saved transcript: %s\n", transcriptPath)
 		}
@@ -429,7 +438,7 @@ func main() {
 		if len(failedBlocks) > len(first) {
 			firstStr += "…"
 		}
-		fmt.Fprintf(os.Stderr,
+		fmt.Fprintf(proseErr,
 			"warning: %d of %d blocks could not be translated and kept their original text (first: %s)\n",
 			len(failedBlocks), len(texts), firstStr)
 		ev.Emit(&events.Warning{
@@ -517,7 +526,7 @@ func fatalf(format string, args ...any) {
 // line, cleanup, exit. It never touches the event stream itself — the two
 // callers above have already emitted, each exactly once, before reaching it.
 func fatalTail(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, "error: "+format+"\n", args...)
+	fmt.Fprintf(proseErr, "error: "+format+"\n", args...)
 	// os.Exit skips deferred calls, so the scratch directory has to be removed
 	// here or every error path leaks it.
 	cleanupRunTmpDir()

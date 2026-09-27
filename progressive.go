@@ -113,7 +113,7 @@ func pickAudioStream(input string, streams []media.Stream, atrack int, from stri
 		if s, ok := media.FindAudioByLang(audio, from); ok {
 			return s, from, nil
 		}
-		fmt.Fprintf(os.Stderr, "warning: no audio track tagged lang=%s; using #%d and letting whisper detect the language\n", from, audio[0].Index)
+		fmt.Fprintf(proseErr, "warning: no audio track tagged lang=%s; using #%d and letting whisper detect the language\n", from, audio[0].Index)
 		return audio[0], "", nil
 	}
 	return audio[0], "", nil
@@ -276,7 +276,7 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 			// Say so once rather than printing a blank detection line per chunk
 			// and building a "movie..srt" sidecar out of the empty code.
 			langMissingWarned = true
-			fmt.Fprintln(os.Stderr, "warning: whisper reported no detected language; "+
+			fmt.Fprintln(proseErr, "warning: whisper reported no detected language; "+
 				"every chunk will detect its own and no source transcript will be saved — "+
 				"pass -from to settle it")
 		}
@@ -299,11 +299,11 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 			// the translation then failed — the one artifact this must not make.
 			if !sidecarSkipWarned {
 				sidecarSkipWarned = true
-				fmt.Fprintf(os.Stderr, "warning: not saving the %s transcript to %s: "+
+				fmt.Fprintf(proseErr, "warning: not saving the %s transcript to %s: "+
 					"that is where the translated subtitles go\n", lang, transcriptPath)
 			}
 		} else if err := srt.Write(transcriptPath, srt.Renumber(srcBlocks)); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: could not save transcript to %s: %v\n", transcriptPath, err)
+			fmt.Fprintf(proseErr, "warning: could not save transcript to %s: %v\n", transcriptPath, err)
 		}
 
 		ev.Emit(&events.Stage{Name: "translate", Chunk: c.Index + 1, Of: len(plan)})
@@ -319,7 +319,7 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 			return fail("chunk %d: translate: %w", c.Index+1, err)
 		}
 		if len(failed) > 0 {
-			fmt.Fprintf(os.Stderr,
+			fmt.Fprintf(proseErr,
 				"warning: chunk %d: %d of %d blocks kept their original text\n",
 				c.Index+1, len(failed), len(shifted))
 		}

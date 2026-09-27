@@ -1,9 +1,11 @@
 package media
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
-	"os"
+	"io"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -113,14 +115,106 @@ func FindSubtitleByLang(streams []Stream, lang string) (Stream, bool) {
 	return findByLang(streams, lang, "subtitle")
 }
 
+// ffmpegTailLines is how many lines of a failing ffmpeg's diagnostics travel in
+// the returned error. ffmpeg says what actually went wrong at the end of its
+// output; the banner ahead of it — the version, the build flags, the
+// configuration — explains nothing about the failure and is what made passing
+// the whole stream through so noisy.
+const ffmpegTailLines = 20
+
+// runFFmpeg runs an ffmpeg command with its stderr captured instead of
+// inherited, and folds what ffmpeg said into the error when it fails.
+//
+// Nothing but this process may write the file descriptor the event stream uses.
+// ffmpeg rewrites its progress line in place, terminated by a carriage return
+// and never by a newline, so a JSON event emitted while a progress line is in
+// flight lands in the middle of it and no line-oriented consumer can read
+// either one — which is how a cancelled run lost the single terminal event it
+// has. whisper.Run has always piped its child's stderr for this reason; this is
+// the same treatment for the four ffmpeg steps.
+//
+// The diagnostics are not thrown away. Passing stderr through was the only
+// thing that put a failing ffmpeg's explanation in front of the user, so it
+// travels in the error instead, which is where the explanation of a failure
+// belongs — and it now reaches an -events json consumer too, inside the error
+// event's message, where inherited stderr never put it.
+func runFFmpeg(cmd *exec.Cmd) error {
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("ffmpeg: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("ffmpeg: %w", err)
+	}
+	// Drained to EOF before Wait: StderrPipe's contract, and the pipe filling up
+	// would otherwise stall ffmpeg itself.
+	tail := ffmpegDiagnostics(stderr)
+	if err := cmd.Wait(); err != nil {
+		if tail != "" {
+			return fmt.Errorf("ffmpeg: %w\n%s", err, tail)
+		}
+		return fmt.Errorf("ffmpeg: %w", err)
+	}
+	return nil
+}
+
+// ffmpegDiagnostics drains r and returns the tail of what ffmpeg had to say,
+// with the progress chatter dropped.
+func ffmpegDiagnostics(r io.Reader) string {
+	var tail []string
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	sc.Split(scanLinesOrCR)
+	for sc.Scan() {
+		line := strings.TrimRight(sc.Text(), " \t")
+		if strings.TrimSpace(line) == "" || isProgressLine(line) {
+			continue
+		}
+		tail = append(tail, line)
+		if len(tail) > ffmpegTailLines {
+			tail = tail[1:]
+		}
+	}
+	if sc.Err() != nil {
+		// A line too long for the buffer must not leave the pipe unread: Wait
+		// would then block on a child stalled writing into a full pipe.
+		io.Copy(io.Discard, r)
+	}
+	return strings.Join(tail, "\n")
+}
+
+// scanLinesOrCR splits on a carriage return as well as a newline. Without it
+// ffmpeg's entire progress stream is a single enormous line and the diagnostic
+// printed after it cannot be separated from it.
+func scanLinesOrCR(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	if atEOF && len(data) == 0 {
+		return 0, nil, nil
+	}
+	if i := bytes.IndexAny(data, "\r\n"); i >= 0 {
+		return i + 1, data[:i], nil
+	}
+	if atEOF {
+		return len(data), data, nil
+	}
+	return 0, nil, nil
+}
+
+// isProgressLine reports whether a line is one of ffmpeg's in-place progress
+// updates: a run of key=value pairs opening with frame= when there is video or
+// size= when there is not. They carry nothing about a failure, and a long
+// extraction writes thousands of them — enough to push the real diagnostic out
+// of any tail that kept them.
+func isProgressLine(line string) bool {
+	s := strings.TrimLeft(line, " \t")
+	return strings.HasPrefix(s, "size=") || strings.HasPrefix(s, "frame=")
+}
+
 func ExtractSubtitle(input string, streamIndex int, outSRT string) error {
-	cmd := exec.Command("ffmpeg", "-y",
+	return runFFmpeg(exec.Command("ffmpeg", "-y",
 		"-i", input,
 		"-map", fmt.Sprintf("0:%d", streamIndex),
 		outSRT,
-	)
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	))
 }
 
 func AudioStreams(streams []Stream) []Stream {
@@ -141,9 +235,7 @@ func FindAudioByLang(streams []Stream, lang string) (Stream, bool) {
 // bundled WAV reader accepts: 16 kHz mono signed 16-bit PCM. Whisper resamples
 // to exactly this internally, so nothing is lost by doing it here.
 func ExtractAudio(input string, streamIndex int, outWAV string) error {
-	cmd := exec.Command("ffmpeg", extractAudioArgs(input, streamIndex, outWAV)...)
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	return runFFmpeg(exec.Command("ffmpeg", extractAudioArgs(input, streamIndex, outWAV)...))
 }
 
 func extractAudioArgs(input string, streamIndex int, outWAV string) []string {
@@ -189,9 +281,7 @@ func MuxSubtitle(input, srtPath, lang, title, output string) error {
 	}
 
 	args := muxArgs(input, srtPath, lang, title, output, subCodec, subCount)
-	cmd := exec.Command("ffmpeg", args...)
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	return runFFmpeg(exec.Command("ffmpeg", args...))
 }
 
 // muxArgs builds the ffmpeg argument list that copies every stream from input
@@ -239,9 +329,7 @@ func DefaultSRTPath(input, lang string) string {
 // an input option so ffmpeg skips bytes rather than decoding and discarding them,
 // which matters when this runs once per chunk over a feature film.
 func SliceWAV(inWAV string, start, dur time.Duration, outWAV string) error {
-	cmd := exec.Command("ffmpeg", sliceWAVArgs(inWAV, start, dur, outWAV)...)
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	return runFFmpeg(exec.Command("ffmpeg", sliceWAVArgs(inWAV, start, dur, outWAV)...))
 }
 
 func sliceWAVArgs(inWAV string, start, dur time.Duration, outWAV string) []string {

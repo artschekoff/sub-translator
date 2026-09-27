@@ -1133,3 +1133,90 @@ func TestTranscribeEmitsExtractTranscribeAndLanguageStages(t *testing.T) {
 		t.Errorf("language event detected = %q, want %q", languageDetected, "en")
 	}
 }
+
+// noisyFfmpegStub is an ffmpeg that behaves like the real one: a banner and
+// carriage-return-terminated progress on stderr, and the output file written as
+// the last argument. It is what makes the event stream unparseable when its
+// stderr is inherited rather than captured.
+const noisyFfmpegStub = `#!/bin/sh
+printf 'ffmpeg version 8.1.1 Copyright (c) 2000-2026 the FFmpeg developers\n' >&2
+printf '  configuration: --prefix=/opt/homebrew/Cellar/ffmpeg/8.1.1\n' >&2
+printf 'size=       0KiB time=00:00:00.00 bitrate=N/A speed=N/A    \r' >&2
+printf 'size=    7168KiB time=00:00:57.32 bitrate=1024.0kbits/s speed=  57x    \r' >&2
+out=""
+for a in "$@"; do out="$a"; done
+: > "$out"
+exit 0
+`
+
+// The branch's central claim is that -events json writes newline-delimited JSON
+// to stderr. It did not: four ffmpeg invocations inherited the same file
+// descriptor, so 40 lines of ffmpeg prose sat inside one run's stream and a
+// progress line with no newline at its end could swallow an event outright.
+//
+// This drives the real binary down the subtitle path with a deliberately noisy
+// ffmpeg and holds the whole stream to the documented rule: every line is either
+// a whole JSON event or one of this tool's own prose lines. Nothing else may be
+// there.
+func TestFfmpegProseNeverReachesTheEventStream(t *testing.T) {
+	bin := buildCLI(t)
+	dir := t.TempDir()
+	binDir := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeStub(t, filepath.Join(binDir, "ffprobe"), "#!/bin/sh\n"+`cat <<JSON
+{"streams":[
+ {"index":0,"codec_type":"subtitle","codec_name":"srt","tags":{"language":"eng"}}
+],"format":{"duration":"120.5"}}
+JSON`)
+	writeStub(t, filepath.Join(binDir, "ffmpeg"), noisyFfmpegStub)
+
+	film := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(film, []byte("not a film"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// The empty-subtitle-track failure: it reaches ExtractSubtitle — so the
+	// stub's noise is produced — and ends in one error event, without needing
+	// whisper or the network.
+	cmd := exec.Command(bin, "-events", "json", "-to", "es", "-from", "en", "-track", "0", film)
+	cmd.Env = append(os.Environ(),
+		"OPENAI_API_KEY=sk-test",
+		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"XDG_CONFIG_HOME="+filepath.Join(dir, "cfg"),
+	)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err == nil {
+		t.Fatalf("run succeeded, want the empty-subtitle-track failure:\n%s", stdout.String())
+	}
+
+	var events, prose int
+	for _, line := range strings.Split(strings.TrimSuffix(stderr.String(), "\n"), "\n") {
+		if line == "" {
+			continue
+		}
+		var m map[string]any
+		if json.Unmarshal([]byte(line), &m) == nil {
+			events++
+			continue
+		}
+		// Our own prose shares the stream by design, and a consumer is told to
+		// skip it. Nothing else is allowed to be here.
+		if strings.HasPrefix(line, "error: ") || strings.HasPrefix(line, "warning: ") {
+			prose++
+			continue
+		}
+		t.Errorf("stderr line is neither an event nor one of our prose lines: %q", line)
+	}
+	if events == 0 {
+		t.Errorf("no events on stderr at all:\n%s", stderr.String())
+	}
+	if prose != 1 {
+		t.Errorf("%d prose lines, want exactly the one \"error:\" line:\n%s", prose, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "ffmpeg version") || strings.Contains(stderr.String(), "size=") {
+		t.Errorf("ffmpeg's own output reached the event stream:\n%s", stderr.String())
+	}
+}

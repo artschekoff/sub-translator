@@ -53,8 +53,10 @@ func readLang(r *bufio.Reader, w io.Writer, label string) (string, error) {
 
 // promptLang is the interactive wrapper used by main: it reads from the shared
 // stdin, prompts on stderr so piped stdout stays clean, and exits on failure.
+// The prompt goes through proseErr, the same serialised writer the event stream
+// uses, so an event cannot land in the middle of the question.
 func promptLang(label string) string {
-	lang, err := readLang(stdin, os.Stderr, label)
+	lang, err := readLang(stdin, proseErr, label)
 	if err != nil {
 		fatalf("%v", err)
 	}

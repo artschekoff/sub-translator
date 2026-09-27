@@ -3,6 +3,8 @@ package events
 import (
 	"bytes"
 	"encoding/json"
+	"io"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -200,5 +202,76 @@ func TestDoneOmitsCoversWhenUnknownButCarriesItWhenSet(t *testing.T) {
 	known := decode(t, lines[1])
 	if known["covers"] != "2:19:08" {
 		t.Errorf(`"covers" = %v, want "2:19:08" when Covers is set`, known["covers"])
+	}
+}
+
+// byteAtATimeWriter writes its input one byte at a time, yielding between them.
+// A real file descriptor behaves this way under load: a write is not atomic, so
+// two unsynchronised writers interleave inside a line. The per-byte lock makes
+// this writer itself safe to call concurrently, so the only thing the test can
+// fail on is the interleaving the shared lock exists to prevent.
+type byteAtATimeWriter struct {
+	mu  sync.Mutex
+	buf []byte
+}
+
+func (w *byteAtATimeWriter) Write(p []byte) (int, error) {
+	for _, b := range p {
+		w.mu.Lock()
+		w.buf = append(w.buf, b)
+		w.mu.Unlock()
+		runtime.Gosched()
+	}
+	return len(p), nil
+}
+
+func (w *byteAtATimeWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return string(w.buf)
+}
+
+// The events and the tool's own prose share one file descriptor by design, and
+// they are written from different goroutines: the SIGINT handler emits while the
+// main goroutine may be halfway through a warning line. Handing both the same
+// SyncWriter is what keeps every line whole — a consumer's rule is "skip the
+// lines that are not JSON", which only works if a prose line and an event are
+// never the same line.
+func TestProseAndEventsNeverLandInsideEachOther(t *testing.T) {
+	const prose = "warning: 12 of 1834 blocks could not be translated\n"
+	out := &byteAtATimeWriter{}
+	shared := NewSyncWriter(out)
+	e := fixed(New(shared))
+
+	var wg sync.WaitGroup
+	for range 40 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			e.Emit(&Error{Kind: "cancelled", Message: "interrupted"})
+		}()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			io.WriteString(shared, prose)
+		}()
+	}
+	wg.Wait()
+
+	lines := strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n")
+	if len(lines) != 80 {
+		t.Fatalf("got %d lines, want 80:\n%s", len(lines), out.String())
+	}
+	for i, l := range lines {
+		if l+"\n" == prose {
+			continue
+		}
+		var m map[string]any
+		if err := json.Unmarshal([]byte(l), &m); err != nil {
+			t.Fatalf("line %d is neither a whole prose line nor a whole event: %q", i, l)
+		}
+		if m["type"] != string(KindError) {
+			t.Errorf("line %d = %q, want an error event", i, l)
+		}
 	}
 }
