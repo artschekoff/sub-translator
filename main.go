@@ -133,12 +133,53 @@ Examples:
   sub-translator model pull large-v3-turbo
 `
 
-func main() {
-	if handled, err := dispatchSubcommand(os.Args[1:], os.Stdout); handled {
-		if err != nil {
-			fatalf("%v", err)
+// eventsRequested reports whether argv asks for the JSON event stream. It is a
+// deliberately dumb scan over the raw arguments, and it exists for one reason:
+// flag.Parse used to be the first thing that could end the process — an unknown
+// flag printed a usage error and exited 2 before the emitter was built, so the
+// promise that "the first line of any run is always a version event" was broken
+// in precisely the case version negotiation exists for, a GUI newer than the CLI
+// it found on PATH. Knowing this one boolean early is enough to answer on the
+// stream instead. flag.Parse remains the only real parser; this decides nothing
+// else.
+func eventsRequested(args []string) bool {
+	for i, a := range args {
+		switch a {
+		case "-events", "--events":
+			return i+1 < len(args) && args[i+1] == "json"
+		case "-events=json", "--events=json":
+			return true
 		}
-		return
+	}
+	return false
+}
+
+func main() {
+	// Before anything that can exit: the subcommand dispatch and flag.Parse both
+	// used to end the process while ev was still nil.
+	wantEvents := eventsRequested(os.Args[1:])
+	if wantEvents {
+		ev = events.New(proseErr)
+		ev.Emit(&events.Version{Events: events.ProtocolVersion, Tool: version})
+	}
+
+	if verb := subcommandVerb(os.Args[1:]); verb != "" {
+		// The subcommands print plain text and emit nothing: they are not runs,
+		// there is no stage, progress or terminal event to give them, and they
+		// run before flag.Parse — so -events json used to be swallowed as a
+		// positional argument and break them ("config get: want exactly one
+		// key"). Refusing says so, with a kind and a message, instead.
+		if wantEvents {
+			fatalf("-events json is not supported by the %s subcommand: it writes plain text "+
+				"on stdout and emits no events — drop the flag (the event stream is for a "+
+				"translation run)", verb)
+		}
+		if handled, err := dispatchSubcommand(os.Args[1:], os.Stdout); handled {
+			if err != nil {
+				fatalf("%v", err)
+			}
+			return
+		}
 	}
 
 	from := flag.String("from", "", "source language (required)")
@@ -158,14 +199,33 @@ func main() {
 	probeOnly := flag.Bool("probe", false, "list the file's tracks and exit")
 	eventsFlag := flag.String("events", "", "emit machine-readable events on stderr: json")
 	flag.Usage = func() { fmt.Fprint(proseErr, usage) }
-	flag.Parse()
+	// ContinueOnError, so a usage error comes back here rather than exiting
+	// inside the flag package: flag has already printed its message and the
+	// usage text by then, which is the prose this keeps unchanged, and the exit
+	// code stays the 2 ExitOnError used.
+	flag.CommandLine.Init(os.Args[0], flag.ContinueOnError)
+	// flag's own "flag provided but not defined" line is prose on stderr like
+	// ours, so it goes through the same serialised writer.
+	flag.CommandLine.SetOutput(proseErr)
+	if err := flag.CommandLine.Parse(os.Args[1:]); err != nil {
+		ev.Emit(&events.Error{Kind: string(errOther), Message: err.Error()})
+		os.Exit(2)
+	}
 
 	switch *eventsFlag {
 	case "":
-		// Disabled: Emit is a no-op, so nothing below needs a guard.
+		// Disabled: Emit is a no-op, so nothing below needs a guard. The
+		// pre-scan above can still have switched the stream on — flag parsing
+		// stops at the first positional argument, so `movie.mkv -events json`
+		// reaches only the scan — and a version event already written is not
+		// worth taking back.
 	case "json":
-		ev = events.New(proseErr)
-		ev.Emit(&events.Version{Events: events.ProtocolVersion, Tool: version})
+		if ev == nil {
+			// A spelling the pre-scan does not know. Nothing has been emitted
+			// yet, so version is still the first line.
+			ev = events.New(proseErr)
+			ev.Emit(&events.Version{Events: events.ProtocolVersion, Tool: version})
+		}
 	default:
 		fatalf("invalid -events %q: the only supported value is json", *eventsFlag)
 	}
@@ -203,6 +263,16 @@ func main() {
 	}
 
 	if flag.NArg() < 1 {
+		// The kind is "other": there is nothing a caller can fix in its
+		// configuration, only in the argv it built — an empty path, or a file
+		// that vanished between the drop and the launch. The prose and the exit
+		// code are exactly what they were; what is new is that a consumer gets
+		// a terminal event instead of 56 lines of flag documentation and
+		// silence on the wire.
+		ev.Emit(&events.Error{
+			Kind:    string(errOther),
+			Message: "no input file: sub-translator needs the path to a video file",
+		})
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -399,6 +469,10 @@ func main() {
 
 		tmpSRT := filepath.Join(runTmpDir, "source.srt")
 		fmt.Printf("Extracting subtitle track #%d...\n", srcStream.Index)
+		// The whole pre-translate phase of a -source sub run. Without this the
+		// stream goes probe → stage translate and a window has nothing to show
+		// for the extraction and the SRT parse.
+		ev.Emit(&events.Stage{Name: "extract-subs"})
 		if err := media.ExtractSubtitle(input, srcStream.Index, tmpSRT); err != nil {
 			fatalf("extract: %v", err)
 		}
@@ -504,6 +578,9 @@ func main() {
 	}
 
 	fmt.Printf("Muxing → %s...\n", filepath.Base(outMKV))
+	// Rewriting a multi-gigabyte container takes minutes, during which the last
+	// thing a consumer heard was translate at 100%.
+	ev.Emit(&events.Stage{Name: "mux"})
 	if err := media.MuxSubtitle(input, tmpTranslated, *to, title, outMKV); err != nil {
 		fatalf("mux: %v", err)
 	}

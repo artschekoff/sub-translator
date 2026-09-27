@@ -1220,3 +1220,215 @@ JSON`)
 		t.Errorf("ffmpeg's own output reached the event stream:\n%s", stderr.String())
 	}
 }
+
+// eventsOf returns the JSON events on a stream, in order, skipping the prose
+// lines a consumer is told to skip.
+func eventsOf(stream string) []map[string]any {
+	var out []map[string]any
+	for _, line := range strings.Split(stream, "\n") {
+		var m map[string]any
+		if json.Unmarshal([]byte(line), &m) == nil && m["type"] != nil {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// eventsOfKind returns just the events of one type.
+func eventsOfKind(stream, kind string) []map[string]any {
+	var out []map[string]any
+	for _, m := range eventsOf(stream) {
+		if m["type"] == kind {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// A run with no input path used to dump 56 lines of flag documentation and exit
+// 1 with no error event at all — the argv-construction case for a wrapper (an
+// empty path, a file that vanished between the drop and the launch), and the one
+// where README and errkind.go both claim a terminal event is guaranteed.
+func TestAMissingInputArgumentEmitsATerminalErrorEvent(t *testing.T) {
+	bin := buildCLI(t)
+	cmd := exec.Command(bin, "-events", "json", "-to", "es")
+	cmd.Env = append(os.Environ(), "XDG_CONFIG_HOME="+t.TempDir())
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+
+	var exit *exec.ExitError
+	if err := cmd.Run(); !errors.As(err, &exit) {
+		t.Fatalf("want a non-zero exit, got %v\nstderr: %s", err, stderr.String())
+	}
+	if code := exit.ExitCode(); code != 1 {
+		t.Errorf("exit status %d, want 1 (the code this path has always used)", code)
+	}
+	errs := eventsOfKind(stderr.String(), "error")
+	if len(errs) != 1 {
+		t.Fatalf("%d error events, want exactly 1:\n%s", len(errs), stderr.String())
+	}
+	if kind, _ := errs[0]["kind"].(string); kind != "other" {
+		t.Errorf("error kind = %q, want %q", kind, "other")
+	}
+	// The prose is unchanged: the usage text is still what a person sees.
+	if !strings.Contains(stderr.String(), "Usage:\n  sub-translator [flags] <input>") {
+		t.Errorf("the usage text is missing from stderr:\n%s", stderr.String())
+	}
+	if stdout.String() != "" {
+		t.Errorf("stdout = %q, want nothing", stdout.String())
+	}
+}
+
+// The case version negotiation exists for: a wrapper newer than the CLI it found
+// on PATH, passing a flag that CLI does not have. flag.Parse used to print and
+// exit 2 before the emitter was built, so the run that most needed to say "I am
+// version 1" said nothing at all.
+func TestAnUnknownFlagStillCarriesVersionAndAnErrorEvent(t *testing.T) {
+	bin := buildCLI(t)
+	cmd := exec.Command(bin, "-events", "json", "-bogus", "-to", "es", "movie.mkv")
+	cmd.Env = append(os.Environ(), "XDG_CONFIG_HOME="+t.TempDir())
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+
+	var exit *exec.ExitError
+	if err := cmd.Run(); !errors.As(err, &exit) {
+		t.Fatalf("want a non-zero exit, got %v\nstderr: %s", err, stderr.String())
+	}
+	// Unchanged: 2 is what flag's own ExitOnError used for a usage error.
+	if code := exit.ExitCode(); code != 2 {
+		t.Errorf("exit status %d, want 2", code)
+	}
+
+	all := eventsOf(stderr.String())
+	if len(all) == 0 {
+		t.Fatalf("no events at all:\n%s", stderr.String())
+	}
+	if all[0]["type"] != "version" {
+		t.Errorf("first event = %v, want version", all[0]["type"])
+	}
+	if all[0]["events"] != float64(events.ProtocolVersion) {
+		t.Errorf("version event events = %v, want %d", all[0]["events"], events.ProtocolVersion)
+	}
+	errs := eventsOfKind(stderr.String(), "error")
+	if len(errs) != 1 {
+		t.Fatalf("%d error events, want exactly 1:\n%s", len(errs), stderr.String())
+	}
+	if kind, _ := errs[0]["kind"].(string); kind != "other" {
+		t.Errorf("error kind = %q, want %q", kind, "other")
+	}
+	if msg, _ := errs[0]["message"].(string); !strings.Contains(msg, "-bogus") {
+		t.Errorf("error message = %q, want it to name the flag", msg)
+	}
+	// flag's own prose is unchanged too.
+	if !strings.Contains(stderr.String(), "flag provided but not defined: -bogus") {
+		t.Errorf("flag's own message is missing:\n%s", stderr.String())
+	}
+}
+
+// The subcommands run before flag.Parse, so -events json used to be swallowed as
+// a positional argument and break them: `config get translate.model -events
+// json` failed with "config get: want exactly one key" and no event. They are
+// not runs — there is no stage, no progress and no terminal event to give them —
+// so the combination is refused, with a kind and a message, and the subcommands
+// themselves keep working untouched without the flag.
+func TestSubcommandsRefuseTheEventStreamAndKeepWorkingWithoutIt(t *testing.T) {
+	bin := buildCLI(t)
+	cfg := t.TempDir()
+
+	run := func(t *testing.T, args ...string) (string, string, int) {
+		t.Helper()
+		cmd := exec.Command(bin, args...)
+		cmd.Env = append(os.Environ(), "XDG_CONFIG_HOME="+cfg)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		err := cmd.Run()
+		code := 0
+		var exit *exec.ExitError
+		if errors.As(err, &exit) {
+			code = exit.ExitCode()
+		} else if err != nil {
+			t.Fatalf("the binary did not run: %v", err)
+		}
+		return stdout.String(), stderr.String(), code
+	}
+
+	t.Run("refused with a terminal event", func(t *testing.T) {
+		stdout, stderr, code := run(t, "config", "get", "translate.model", "-events", "json")
+		if code != 1 {
+			t.Errorf("exit status %d, want 1", code)
+		}
+		errs := eventsOfKind(stderr, "error")
+		if len(errs) != 1 {
+			t.Fatalf("%d error events, want exactly 1:\n%s", len(errs), stderr)
+		}
+		if msg, _ := errs[0]["message"].(string); !strings.Contains(msg, "config") ||
+			!strings.Contains(msg, "-events json") {
+			t.Errorf("error message = %q, want it to name the flag and the subcommand", msg)
+		}
+		if strings.Contains(stderr, "want exactly one key") {
+			t.Errorf("the flag still reaches the subcommand's own argument check:\n%s", stderr)
+		}
+		if stdout != "" {
+			t.Errorf("stdout = %q, want nothing", stdout)
+		}
+	})
+
+	t.Run("without the flag the subcommand is untouched", func(t *testing.T) {
+		stdout, stderr, code := run(t, "config", "path")
+		if code != 0 {
+			t.Errorf("exit status %d, want 0\nstderr: %s", code, stderr)
+		}
+		if !strings.Contains(stdout, "config.json") {
+			t.Errorf("stdout = %q, want the config path", stdout)
+		}
+		if got := eventsOf(stderr); len(got) != 0 {
+			t.Errorf("a subcommand emitted %d events, want none: %v", len(got), got)
+		}
+	})
+}
+
+// The subtitle path's whole pre-translate phase — extracting the track and
+// parsing it — emitted nothing, so a window went probe → stage translate with
+// minutes of silence over one of the two headline flows. The stub ffmpeg writes
+// an empty track, which fails the run right after the stage is emitted, so this
+// needs neither whisper nor the network.
+func TestTheSubtitlePathEmitsTheExtractSubsStage(t *testing.T) {
+	bin := buildCLI(t)
+	dir := t.TempDir()
+	binDir := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeStub(t, filepath.Join(binDir, "ffprobe"), "#!/bin/sh\n"+`cat <<JSON
+{"streams":[
+ {"index":0,"codec_type":"subtitle","codec_name":"srt","tags":{"language":"eng"}}
+],"format":{"duration":"120.5"}}
+JSON`)
+	writeStub(t, filepath.Join(binDir, "ffmpeg"), noisyFfmpegStub)
+
+	film := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(film, []byte("not a film"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(bin, "-events", "json", "-to", "es", "-from", "en", "-track", "0", film)
+	cmd.Env = append(os.Environ(),
+		"OPENAI_API_KEY=sk-test",
+		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"XDG_CONFIG_HOME="+filepath.Join(dir, "cfg"),
+	)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err == nil {
+		t.Fatalf("run succeeded, want the empty-subtitle-track failure:\n%s", stdout.String())
+	}
+
+	var names []string
+	for _, m := range eventsOfKind(stderr.String(), "stage") {
+		name, _ := m["name"].(string)
+		names = append(names, name)
+	}
+	if !slices.Contains(names, "extract-subs") {
+		t.Errorf("stage events = %v, want one named extract-subs:\n%s", names, stderr.String())
+	}
+}
