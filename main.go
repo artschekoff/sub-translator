@@ -50,6 +50,10 @@ func setupRunTmpDir() {
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigs
+		// Not fatalKindf: that exits 1 and this is a signal, not a failure — the
+		// shell convention below is what has to survive, unchanged, whether or
+		// not a caller is reading the event stream.
+		ev.Emit(&events.Error{Kind: string(errCancelled), Message: "interrupted"})
 		cleanupRunTmpDir()
 		// 128 + SIGINT: the shell convention for "terminated by a signal".
 		os.Exit(130)
@@ -185,25 +189,27 @@ func main() {
 		fatalf("%v", err)
 	}
 
+	// The translation settings are settled for the same reason, and before any
+	// work happens: a run with no API key has to be refused now, not discovered
+	// after an hour of transcription — or after being told the input path is
+	// wrong, which is a cheaper problem to find and fix second. This covers the
+	// progressive path too — both -fast and the ordinary run reach translation
+	// only through here.
+	if *workers != -1 && *workers < 1 {
+		fatalf("-workers must be at least 1, got %d", *workers)
+	}
+	translateOpts := resolveTranslateOptions(settings, *workers)
+	if err := translateOpts.Validate(); err != nil {
+		fatalKindf(errMissingKey, "%v", err)
+	}
+
 	if flag.NArg() < 1 {
 		flag.Usage()
 		os.Exit(1)
 	}
 	input := flag.Arg(0)
 	if _, err := os.Stat(input); err != nil {
-		fatalf("input file not found: %s", input)
-	}
-
-	// The translation settings are settled for the same reason, and before any
-	// work happens: a run with no API key has to be refused now, not discovered
-	// after an hour of transcription. This covers the progressive path too — both
-	// -fast and the ordinary run reach translation only through here.
-	if *workers != -1 && *workers < 1 {
-		fatalf("-workers must be at least 1, got %d", *workers)
-	}
-	translateOpts := resolveTranslateOptions(settings, *workers)
-	if err := translateOpts.Validate(); err != nil {
-		fatalf("%v", err)
+		fatalKindf(errProbeFailed, "input file not found: %s", input)
 	}
 
 	setupRunTmpDir()
@@ -213,7 +219,7 @@ func main() {
 	fmt.Printf("Probing %s...\n", filepath.Base(input))
 	streams, err := media.Probe(input)
 	if err != nil {
-		fatalf("probe failed: %v", err)
+		fatalKindf(errProbeFailed, "probe failed: %v", err)
 	}
 
 	subs := media.SubtitleStreams(streams)
@@ -246,7 +252,11 @@ func main() {
 		}
 		whisperOpts, err = resolveWhisper(cfg, *whisperModel, *whisperBin, *vadModel)
 		if err != nil {
-			fatalf("%v", err)
+			if kind, ok := classifyWhisperErr(err); ok {
+				fatalKindf(kind, "%v", err)
+			} else {
+				fatalf("%v", err)
+			}
 		}
 	}
 
@@ -269,7 +279,7 @@ func main() {
 	}
 
 	if source == sourceSub && len(subs) == 0 {
-		fatalf("no subtitle tracks in %s — nothing to translate", filepath.Base(input))
+		fatalKindf(errNoSubtitleTrack, "no subtitle tracks in %s — nothing to translate", filepath.Base(input))
 	}
 
 	*from = strings.TrimSpace(*from)
@@ -290,7 +300,11 @@ func main() {
 		if *fast {
 			if err := runProgressive(input, runTmpDir, streams, *atrack, *from, *to,
 				time.Duration(chunkMinutes)*time.Minute, whisperOpts, translateOpts, *out); err != nil {
-				fatalf("%v", err)
+				if kind, ok := classifyTranscribeErr(err); ok {
+					fatalKindf(kind, "%v", err)
+				} else {
+					fatalf("%v", err)
+				}
 			}
 			return
 		}
@@ -298,7 +312,11 @@ func main() {
 		var lang string
 		blocks, lang, err = transcribe(input, runTmpDir, streams, *atrack, *from, whisperOpts)
 		if err != nil {
-			fatalf("%v", err)
+			if kind, ok := classifyTranscribeErr(err); ok {
+				fatalKindf(kind, "%v", err)
+			} else {
+				fatalf("%v", err)
+			}
 		}
 		// The language whisper actually worked in wins over the one that was
 		// asked for: transcribe drops -from when no track carries that tag, and
@@ -341,13 +359,13 @@ func main() {
 				}
 			}
 			if !found {
-				fatalf("no subtitle stream at index %d", *track)
+				fatalKindf(errNoSubtitleTrack, "no subtitle stream at index %d", *track)
 			}
 		} else {
 			var ok bool
 			srcStream, ok = media.FindSubtitleByLang(subs, *from)
 			if !ok {
-				fatalf("no subtitle track tagged lang=%s — pick one from the list above with -track", *from)
+				fatalKindf(errNoSubtitleTrack, "no subtitle track tagged lang=%s — pick one from the list above with -track", *from)
 			}
 		}
 		fmt.Printf("Source: #%d  lang=%s  %q\n", srcStream.Index, srcStream.Tags.Language, srcStream.Tags.Title)
@@ -381,7 +399,9 @@ func main() {
 	})
 	fmt.Println()
 	if err != nil {
-		fatalf("translate: %v", err)
+		// translateAll returns an error only when every block failed: the
+		// endpoint refused the whole run rather than a few blocks.
+		fatalKindf(errRateLimited, "translate: %v", err)
 	}
 	if len(failedBlocks) > 0 {
 		fmt.Fprintf(os.Stderr,
@@ -452,6 +472,29 @@ func fatalf(format string, args ...any) {
 	// here or every error path leaks it.
 	cleanupRunTmpDir()
 	os.Exit(1)
+}
+
+// classifyWhisperErr says which kind a resolveWhisper failure is. Its errors
+// come back as plain strings — two of them formatted by internal/whisper,
+// which this plan puts out of scope and so cannot be given exported sentinels
+// — so this matches on the message prefix instead of errors.Is. Every error
+// resolveWhisper can return is one of these four; the false return exists so a
+// future addition there fails open to a plain, unclassified fatalf rather than
+// silently mislabelling something new.
+func classifyWhisperErr(err error) (errKind, bool) {
+	msg := err.Error()
+	switch {
+	case strings.HasPrefix(msg, "whisper binary not found at"),
+		strings.HasPrefix(msg, "whisper-cli not found"):
+		return errWhisperNotFound, true
+	case strings.HasPrefix(msg, "whisper model not found:"),
+		strings.HasPrefix(msg, "no whisper model found"):
+		return errNoModel, true
+	case strings.HasPrefix(msg, "several whisper models found"):
+		return errAmbiguousModel, true
+	default:
+		return errOther, false
+	}
 }
 
 // resolveWhisper assembles the whisper settings from flags, config and
@@ -591,6 +634,26 @@ func describeProvider(o translate.Options) string {
 // a silent stretch mid-film (ordinary — credits, a long establishing shot) from
 // a silent film, so it needs to recognise this rather than match on a string.
 var errEmptyTranscript = errors.New("transcript is empty — the audio track may be silent")
+
+// classifyTranscribeErr says which kind a failure out of transcribe or
+// runProgressive is, covering the two ways picking an audio track fails
+// (pickAudioStream, in progressive.go, is unexported and returns plain
+// errors, so this matches its message prefix rather than errors.Is) and the
+// one way transcription itself comes up empty, which does have a sentinel.
+// Everything else that can reach these paths — an extract, parse or whisper
+// failure — is not one of the kinds a caller can act on, hence the false
+// return: those stay a plain, unclassified fatalf.
+func classifyTranscribeErr(err error) (errKind, bool) {
+	switch {
+	case errors.Is(err, errEmptyTranscript):
+		return errTranscriptEmpty, true
+	case strings.HasPrefix(err.Error(), "no audio tracks in"),
+		strings.HasPrefix(err.Error(), "no audio stream at index"):
+		return errNoAudioTrack, true
+	default:
+		return errOther, false
+	}
+}
 
 // transcribeInto runs whisper over one audio file and returns its blocks and the
 // language actually used. Both the whole-file path and the chunked path go

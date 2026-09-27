@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -466,5 +467,59 @@ func TestEventsFlagRejectsAnythingButJSON(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "json") {
 		t.Errorf("error %q does not name the supported value", stderr.String())
+	}
+}
+
+// A wrapper routes on the kind — a missing key sends the user to settings, a
+// missing model offers a download. An unclassified failure would leave it with
+// nothing to do but show red text.
+func TestClassifiedErrorsCarryTheirKind(t *testing.T) {
+	bin := buildCLI(t)
+	cfg := t.TempDir()
+
+	tests := []struct {
+		name string
+		args []string
+		env  []string
+		kind string
+	}{
+		{
+			name: "missing key",
+			args: []string{"-events", "json", "-to", "es", "movie.mkv"},
+			kind: "missing_key",
+		},
+		{
+			name: "input file not found",
+			args: []string{"-events", "json", "-to", "es", "/nonexistent/movie.mkv"},
+			env:  []string{"OPENAI_API_KEY=sk-test"},
+			kind: "probe_failed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd := exec.Command(bin, tt.args...)
+			cmd.Env = append(os.Environ(), "XDG_CONFIG_HOME="+cfg)
+			cmd.Env = append(cmd.Env, tt.env...)
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
+			if err := cmd.Run(); err == nil {
+				t.Fatalf("want a non-zero exit\nstderr: %s", stderr.String())
+			}
+
+			var found string
+			for _, line := range strings.Split(stderr.String(), "\n") {
+				var m map[string]any
+				if json.Unmarshal([]byte(line), &m) != nil {
+					continue
+				}
+				if m["type"] == "error" {
+					found, _ = m["kind"].(string)
+				}
+			}
+			if found != tt.kind {
+				t.Errorf("error kind = %q, want %q\nstderr: %s", found, tt.kind, stderr.String())
+			}
+		})
 	}
 }
