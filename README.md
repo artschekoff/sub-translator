@@ -327,7 +327,7 @@ The corresponding flags — `-whisper-model`, `-whisper-bin`, `-vad-model`, `-ch
 sub-translator -events json -to es -source audio -fast movie.mkv 2> events.jsonl
 ```
 
-**Skip the lines that are not JSON.** stderr carries this tool's own prose as well as the events, by design: the `warning:` lines, the one `error:` line, the usage text, and the interactive prompts. A consumer must therefore treat a line that does not parse as JSON as human output and ignore it, rather than treating it as a protocol error. Every line this tool writes is whole — the events and the prose share one lock, so neither can land inside the other — and the ffmpeg children's output no longer reaches stderr at all: it is captured and surfaced only in the error message of a step that failed. (The visible consequence for a person is that a run no longer prints ffmpeg's progress chatter.)
+**Skip the lines that are not JSON.** stderr carries this tool's own prose as well as the events, by design: the `warning:` lines, the one `error:` line, the usage text, and the interactive prompts. A consumer must therefore treat a line that does not parse as JSON as human output and ignore it, rather than treating it as a protocol error. Every line this tool writes is whole — the events and the prose share one lock, so neither can land inside the other, and an event emitted while a line is unfinished (an interactive prompt, which ends without a newline because the answer is typed on the same line) breaks that line first rather than continuing it — and the ffmpeg children's output no longer reaches stderr at all: it is captured and surfaced only in the error message of a step that failed. (The visible consequence for a person is that a run no longer prints ffmpeg's progress chatter.)
 
 Every event carries `type` and `t` (an RFC 3339 UTC timestamp). The first line of any run is always a `version` event, so a consumer can refuse a stream it does not understand rather than guess. The shape below — every event, field and omission — was verified by running a `-fast` transcription against this code:
 
@@ -413,14 +413,14 @@ Every fatal error carries a `kind` so a program can act on the reason instead of
 
 `invalid_key` and `rate_limited` are deliberately separate: a key with a typo in it is fixed in the settings, and retrying it can never succeed, while a rate limit is waited out. The first five kinds in the table are the ones a wrapper takes to a settings screen.
 
-Every fatal path emits exactly one `error` event — a classified `fatalKindf` call emits its own `kind`; anything else falls through `fatalf`, which emits `other` — so a consumer driving this as a subprocess never sees a non-zero exit with silence on the wire.
+Every fatal path emits exactly one `error` event — a classified `fatalKindf` call emits its own `kind`; anything else falls through `fatalf`, which emits `other` — so a consumer driving this as a subprocess never sees a non-zero exit with silence on the wire. The single exception is `-events <anything but json>`: that exits 1 having emitted nothing, because the value being refused is the one that says how to answer. A consumer that builds its own argv never hits it; one that passes a format through from elsewhere should treat exit 1 with an empty stream as "this build does not speak that format".
 
 Exit codes, and the event that pairs with each:
 
 | Exit | Meaning | Terminal event |
 |---|---|---|
 | 0 | the run finished | one `done` — none for `-probe`, `-version`, `-h` or a subcommand |
-| 1 | a fatal error | one `error`, with the `kind` from the table above |
+| 1 | a fatal error | one `error`, with the `kind` from the table above (none for an unsupported `-events` value) |
 | 2 | a usage error: an unknown flag or a bad flag value | one `error`, kind `other`, after the `version` event |
 | 130 | cancelled by SIGINT or SIGTERM | one `error`, kind `cancelled` |
 

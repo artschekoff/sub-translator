@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 
 	"github.com/artschekoff/sub-translator/internal/config"
@@ -88,11 +87,11 @@ func pullModel(name string, out io.Writer) error {
 		}
 		if pct := int(done * 100 / total); pct != lastPct {
 			lastPct = pct
-			fmt.Fprintf(os.Stderr, "\r  progress: %d%% (%d/%d MB)   ",
+			fmt.Fprintf(proseErr, "\r  progress: %d%% (%d/%d MB)   ",
 				pct, done/(1<<20), total/(1<<20))
 		}
 	})
-	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(proseErr)
 	if err != nil {
 		return err
 	}

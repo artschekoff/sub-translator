@@ -141,29 +141,70 @@ type Error struct {
 
 func (*Error) kind() Kind { return KindError }
 
-// SyncWriter serialises writes to one underlying writer. The event stream and
-// the prose the tool writes for a person share a file descriptor by design, and
-// they are written from different goroutines — the SIGINT handler emits while
-// the main goroutine may be halfway through a warning line. Routing both
-// through one of these makes every write of ours whole: a consumer sees a
-// complete JSON object or a complete prose line, never one inside the other.
+// SyncWriter serialises writes to one underlying writer and remembers whether
+// the stream is at the start of a line. The event stream and the prose the tool
+// writes for a person share a file descriptor by design, and they are written
+// from different goroutines — the SIGINT handler emits while the main goroutine
+// may be halfway through a warning line, or waiting for an answer to a prompt.
+// Routing both through one of these makes every write of ours whole: a consumer
+// sees a complete JSON object or a complete prose line, never one inside the
+// other.
 //
-// It guards only our own writes. A subprocess writing the same descriptor
-// cannot be locked out, which is why the ffmpeg children have their stderr
-// captured instead (see internal/media).
+// Two mechanisms are needed for that, and the second one was learned the hard
+// way. The lock makes each write atomic, which is what keeps two writers out of
+// each other's bytes. It says nothing about column position, so an event written
+// after a prompt — "Target language code: ", deliberately without a newline,
+// because the answer is typed on the same line — still began on that line and
+// still could not be parsed. So this also tracks the last byte written, and
+// writeOnItsOwnLine breaks the line first when the stream is mid-line.
+//
+// It guards only our own writes. A subprocess writing the same descriptor cannot
+// be locked out, which is why the ffmpeg children have their stderr captured
+// instead (see internal/media).
 type SyncWriter struct {
 	mu sync.Mutex
 	w  io.Writer
+	// atLineStart is true when nothing has been written yet or the last byte
+	// written was a newline. A carriage return does not count: after a
+	// "size=… \r" fragment a reader splitting on newlines still sees whatever
+	// comes next as part of that line, which is the whole failure being
+	// prevented.
+	atLineStart bool
 }
 
 func NewSyncWriter(w io.Writer) *SyncWriter {
-	return &SyncWriter{w: w}
+	return &SyncWriter{w: w, atLineStart: true}
 }
 
 func (s *SyncWriter) Write(p []byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.w.Write(p)
+	return s.write(p)
+}
+
+// write is Write's body with the lock already held, so writeOnItsOwnLine can
+// make two writes without anything landing between them.
+func (s *SyncWriter) write(p []byte) (int, error) {
+	n, err := s.w.Write(p)
+	if n > 0 {
+		s.atLineStart = p[n-1] == '\n'
+	}
+	return n, err
+}
+
+// writeOnItsOwnLine writes p, preceded by a newline when the stream is mid-line.
+// The check and both writes happen under one lock: checking outside it would race
+// the very thing it guards, and a prose write landing between the newline and p
+// would put the break in the wrong place.
+func (s *SyncWriter) writeOnItsOwnLine(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.atLineStart {
+		if _, err := s.write([]byte{'\n'}); err != nil {
+			return 0, err
+		}
+	}
+	return s.write(p)
 }
 
 // Emitter writes events as newline-delimited JSON. A zero writer disables it,
@@ -206,8 +247,9 @@ func (e *Emitter) Emit(ev Event) {
 		return
 	}
 
-	// One Write of one whole line: the lock lives in SyncWriter, so a prose
-	// write sharing the same writer is serialised against this one too, and
-	// Marshal above stays outside it.
-	e.w.Write(append(line, '\n'))
+	// One write of one whole line, on a line of its own: the lock lives in
+	// SyncWriter, so a prose write sharing the same writer is serialised against
+	// this one and an unterminated one — a prompt, a carriage-return progress
+	// fragment — is broken off first. Marshal above stays outside the lock.
+	e.w.writeOnItsOwnLine(append(line, '\n'))
 }

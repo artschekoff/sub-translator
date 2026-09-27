@@ -163,3 +163,42 @@ func TestEveryStageNameIsEmittedAndDocumented(t *testing.T) {
 		}
 	}
 }
+
+// goFiles are the package's own source files, which two of the tests below read
+// rather than re-deriving what they claim from a copy.
+func goFiles(t *testing.T) []string {
+	t.Helper()
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasSuffix(name, ".go") && !strings.HasSuffix(name, "_test.go") {
+			out = append(out, name)
+		}
+	}
+	if len(out) < 5 {
+		t.Fatalf("found %d source files (%v); the scan itself is broken", len(out), out)
+	}
+	return out
+}
+
+// Every write this process makes to stderr has to go through proseErr, the one
+// serialised writer that also knows whether the stream is mid-line. A write
+// straight to os.Stderr is outside both guarantees, and it reopens the failure
+// the whole round is about the moment anything is emitted alongside it — which is
+// exactly what `model pull`'s carriage-return progress did. The one permitted
+// mention is the line that builds proseErr itself.
+func TestNothingWritesStderrOutsideTheSharedWriter(t *testing.T) {
+	const allowed = "var proseErr = events.NewSyncWriter(os.Stderr)"
+	for _, file := range goFiles(t) {
+		for i, line := range strings.Split(readRepoFile(t, file), "\n") {
+			if !strings.Contains(line, "os.Stderr") || strings.Contains(line, allowed) {
+				continue
+			}
+			t.Errorf("%s:%d writes stderr outside proseErr:\n\t%s", file, i+1, strings.TrimSpace(line))
+		}
+	}
+}

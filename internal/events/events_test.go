@@ -275,3 +275,74 @@ func TestProseAndEventsNeverLandInsideEachOther(t *testing.T) {
 		}
 	}
 }
+
+// The lock makes each write atomic; it says nothing about column position. The
+// two interactive prompts end without a newline on purpose — the answer is typed
+// on the same line — so an event emitted while one is on screen used to begin
+// mid-line and could not be parsed. Same failure as the ffmpeg one, in our own
+// code, on the same Cancel path.
+func TestAnEventEmittedMidLineStartsOnALineOfItsOwn(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		prose string
+	}{
+		{
+			name:  "after a prompt with no newline",
+			prose: "Target language code (e.g. en, ru, es, fr): ",
+		},
+		{
+			// A carriage return is not a line start: a reader splitting on
+			// newlines still sees what follows as part of that line.
+			name:  "after a carriage-return progress fragment",
+			prose: "size=    7168KiB time=00:00:57.32 speed=  57x    \r",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			shared := NewSyncWriter(&buf)
+			e := fixed(New(shared))
+
+			io.WriteString(shared, tt.prose)
+			e.Emit(&Error{Kind: "cancelled", Message: "interrupted"})
+
+			lines := strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n")
+			if len(lines) != 2 {
+				t.Fatalf("got %d lines, want the prose and the event on separate lines:\n%q",
+					len(lines), buf.String())
+			}
+			if lines[0] != strings.TrimSuffix(tt.prose, "\n") {
+				t.Errorf("first line = %q, want the prose unchanged", lines[0])
+			}
+			m := decode(t, lines[1])
+			if m["type"] != string(KindError) || m["kind"] != "cancelled" {
+				t.Errorf("second line = %q, want the whole cancelled event", lines[1])
+			}
+		})
+	}
+}
+
+// The line break is only for a stream that is mid-line: a run of events must not
+// grow a blank line between every pair, and prose that ended properly must not
+// gain one either.
+func TestNoLineIsBrokenWhenTheStreamIsAlreadyAtTheStartOfOne(t *testing.T) {
+	var buf bytes.Buffer
+	shared := NewSyncWriter(&buf)
+	e := fixed(New(shared))
+
+	// Nothing written yet: the very first event must not be preceded by a newline.
+	e.Emit(&Progress{Pct: 1})
+	e.Emit(&Progress{Pct: 2})
+	io.WriteString(shared, "warning: something worth saying\n")
+	e.Emit(&Progress{Pct: 3})
+
+	if strings.Contains(buf.String(), "\n\n") {
+		t.Errorf("a blank line was inserted where the stream was already at a line start:\n%q", buf.String())
+	}
+	if strings.HasPrefix(buf.String(), "\n") {
+		t.Errorf("the first event was preceded by a newline:\n%q", buf.String())
+	}
+	lines := strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n")
+	if len(lines) != 4 {
+		t.Fatalf("got %d lines, want 4:\n%q", len(lines), buf.String())
+	}
+}

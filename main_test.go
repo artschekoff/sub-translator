@@ -2129,3 +2129,164 @@ func TestHelpExitsZeroAndCarriesNoTerminalEvent(t *testing.T) {
 		})
 	}
 }
+
+// The reviewer's case, on the compiled binary: a run that omits -to reaches
+// promptLang, which writes its question without a newline because the answer is
+// typed on the same line. A SIGINT there used to glue the cancelled event onto
+// the prompt — the same terminal event, the same Cancel path and the same
+// unparseable line as the ffmpeg failure, this time in our own code. promptLang
+// is not gated on stdin being a terminal, so any run missing -to is exposed.
+func TestCancellationAtAPromptStillEmitsAParseableEvent(t *testing.T) {
+	bin := buildCLI(t)
+	dir := t.TempDir()
+	binDir := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeStub(t, filepath.Join(binDir, "ffprobe"), "#!/bin/sh\n"+`cat <<JSON
+{"streams":[
+ {"index":0,"codec_type":"subtitle","codec_name":"srt","tags":{"language":"eng"}}
+],"format":{"duration":"120.5"}}
+JSON`)
+	writeStub(t, filepath.Join(binDir, "ffmpeg"), noisyFfmpegStub)
+
+	film := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(film, []byte("not a film"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	errPath := filepath.Join(dir, "stderr.log")
+	errFile, err := os.Create(errPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer errFile.Close()
+
+	// stdin stays open and silent, so the prompt blocks exactly as it does for a
+	// person who has not typed anything yet.
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdinW.Close()
+
+	// No -to: the run reaches the target-language prompt. -source sub with a
+	// track present needs no confirmation and no whisper.
+	cmd := exec.Command(bin, "-events", "json", "-source", "sub", "-from", "en", "-track", "0", film)
+	cmd.Env = append(os.Environ(),
+		"OPENAI_API_KEY=sk-test",
+		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"XDG_CONFIG_HOME="+filepath.Join(dir, "cfg"),
+	)
+	cmd.Stdin = stdinR
+	cmd.Stdout = io.Discard
+	cmd.Stderr = errFile
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	stdinR.Close()
+
+	// The prompt itself is the signal that the run is waiting, and that the
+	// stream is now mid-line.
+	waitForEvent(t, errPath, "language code")
+	if err := cmd.Process.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	runErr := cmd.Wait()
+
+	var exit *exec.ExitError
+	if !errors.As(runErr, &exit) {
+		t.Fatalf("want a signalled exit, got %v", runErr)
+	}
+	if code := exit.ExitCode(); code != 130 {
+		t.Errorf("exit status %d, want 130", code)
+	}
+
+	stream, err := os.ReadFile(errPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	errs := eventsOfKind(string(stream), "error")
+	if len(errs) != 1 {
+		t.Fatalf("%d error events, want exactly one parseable cancelled event:\n%s", len(errs), stream)
+	}
+	if kind, _ := errs[0]["kind"].(string); kind != string(errCancelled) {
+		t.Errorf("error kind = %q, want %q", kind, errCancelled)
+	}
+	// And the prompt a person was reading is still intact on its own line.
+	if !strings.Contains(string(stream), "language code (e.g. en, ru, es, fr): \n") {
+		t.Errorf("the prompt line was not broken off before the event:\n%q", stream)
+	}
+}
+
+// boolFlagsInUsage are the flags that take no value. The scan reads the rest of
+// them as "this word is my value, not the input path", which is the only way
+// `-to es -events json` works; a boolean followed by a word means that word is
+// positional, for flag.Parse and for the scan alike. If a new boolean flag is
+// added and the test below starts failing for it, add it here.
+var boolFlagsInUsage = map[string]bool{
+	"-fast": true, "-probe": true, "-version": true,
+	// -events is the flag under test, not a subject of it.
+	"-events": true,
+}
+
+// flagInUsage matches a flag's line in the usage text.
+var flagInUsage = regexp.MustCompile(`(?m)^  (-[a-z-]+) `)
+
+// The pre-scan asks flag.CommandLine which flags take a value, so it is correct
+// only while every flag is defined above the call. The reviewer moved one below
+// it: argv that parses still worked, because the flag itself switches the stream
+// on after a successful Parse — but `-<moved flag> v -bogus -events json film`
+// silently stopped emitting and M2 was reopened with the suite green.
+//
+// This drives the real binary once per value-taking flag, taking the list from
+// the usage text so a flag added later is covered without anyone remembering to
+// come back here. The property asserted is the one that breaks: an argv the CLI
+// cannot parse still gets its version event and its error event.
+func TestEveryValueTakingFlagIsDefinedBeforeTheArgvScan(t *testing.T) {
+	bin := buildCLI(t)
+	missing := filepath.Join(t.TempDir(), "nonexistent.mkv")
+
+	names := flagInUsage.FindAllStringSubmatch(usage, -1)
+	if len(names) < 10 {
+		t.Fatalf("found %d flags in the usage text; the scan itself is broken", len(names))
+	}
+
+	tested := 0
+	for _, m := range names {
+		name := m[1]
+		if boolFlagsInUsage[name] {
+			continue
+		}
+		tested++
+		t.Run(name, func(t *testing.T) {
+			// "1" is an acceptable word for every value-taking flag here,
+			// string or int; the run never gets far enough to interpret it,
+			// because -bogus fails the parse first.
+			cmd := exec.Command(bin, name, "1", "-bogus", "-events", "json", missing)
+			cmd.Env = append(os.Environ(), "XDG_CONFIG_HOME="+t.TempDir())
+			var stdout, stderr bytes.Buffer
+			cmd.Stdout, cmd.Stderr = &stdout, &stderr
+
+			var exit *exec.ExitError
+			if err := cmd.Run(); !errors.As(err, &exit) {
+				t.Fatalf("want a non-zero exit, got %v\nstderr: %s", err, stderr.String())
+			}
+			if code := exit.ExitCode(); code != 2 {
+				t.Errorf("exit status %d, want 2", code)
+			}
+			all := eventsOf(stderr.String())
+			if len(all) == 0 || all[0]["type"] != "version" {
+				t.Fatalf("no version event: the scan stopped at %s's value, so %s is declared "+
+					"below the eventsRequested call (or it is a boolean flag missing from "+
+					"boolFlagsInUsage)\nstderr: %s", name, name, stderr.String())
+			}
+			if got := eventsOfKind(stderr.String(), "error"); len(got) != 1 {
+				t.Errorf("%d error events, want exactly 1:\n%s", len(got), stderr.String())
+			}
+		})
+	}
+	if tested < 8 {
+		t.Errorf("only %d value-taking flags were exercised, want the whole documented set", tested)
+	}
+}
