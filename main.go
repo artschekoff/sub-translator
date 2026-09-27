@@ -110,6 +110,8 @@ Flags:
   -whisper-model path to a whisper ggml model
   -whisper-bin   path to the whisper-cli binary
   -vad-model     path to a Silero VAD model
+  -probe         list the file's tracks and exit
+  -events        emit machine-readable events on stderr: json
   -version       print version and exit
 
 Examples:

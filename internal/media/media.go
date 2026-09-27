@@ -46,8 +46,9 @@ func Probe(path string) ([]Stream, error) {
 }
 
 // ContainerDuration reports how long the file runs. ffprobe gives it as a
-// string of seconds in the format object, which is why Probe now asks for
-// -show_format as well as -show_streams.
+// string of seconds in the format object, which is why this makes its own
+// ffprobe call with -show_format rather than folding into Probe, which still
+// asks only for -show_streams and is unchanged.
 func ContainerDuration(path string) (time.Duration, error) {
 	out, err := exec.Command("ffprobe",
 		"-v", "quiet",

@@ -15,7 +15,7 @@ Extracts the subtitle track from a video file, translates it through an OpenAI m
 
 **An OpenAI API key is required.** Translation is the one step this tool does not do locally; a run without a key refuses to start.
 
-[The Problem](#the-problem) · [Installation](#installation) · [Usage](#usage) · [Transcription](#transcription) · [Translation](#translation) · [Configuration](#configuration) · [How It Works](#how-it-works) · [Development](#development)
+[The Problem](#the-problem) · [Installation](#installation) · [Usage](#usage) · [Transcription](#transcription) · [Translation](#translation) · [Configuration](#configuration) · [Driving it from another program](#driving-it-from-another-program) · [How It Works](#how-it-works) · [Development](#development)
 
 </div>
 
@@ -115,6 +115,8 @@ Flags:
   -whisper-model path to a whisper ggml model
   -whisper-bin   path to the whisper-cli binary
   -vad-model     path to a Silero VAD model
+  -probe         list the file's tracks and exit
+  -events        emit machine-readable events on stderr: json
   -version       print version and exit
 ```
 
@@ -316,6 +318,68 @@ sub-translator config path
 | `translate.workers` | Batches translated at once. 4 when unset. |
 
 The corresponding flags — `-whisper-model`, `-whisper-bin`, `-vad-model`, `-chunk`, `-workers` — override the config for a single run.
+
+## Driving it from another program
+
+`-events json` makes the tool write newline-delimited JSON to **stderr**, one object per line, while stdout keeps the same human-readable output it has always had. Nothing changes without the flag:
+
+```bash
+sub-translator -events json -to es -source audio -fast movie.mkv 2> events.jsonl
+```
+
+Every event carries `type` and `t` (an RFC 3339 UTC timestamp). The first line of any run is always a `version` event, so a consumer can refuse a stream it does not understand rather than guess. The shape below — every event, field and omission — was verified by running a `-fast` transcription against this code (paths and track metadata simplified for readability, and trimmed to two of the run's chunks for length):
+
+```json
+{"type":"version","t":"2026-09-27T16:49:08Z","events":1,"tool":"1.4.0"}
+{"type":"probe","t":"2026-09-27T16:49:08Z","duration":8348.674,"audio":[{"index":1,"lang":"eng","title":"Original","codec":"ac3"}],"subtitles":[]}
+{"type":"stage","t":"2026-09-27T16:49:08Z","name":"extract"}
+{"type":"stage","t":"2026-09-27T16:49:08Z","name":"transcribe","chunk":1,"of":14,"from":"0:00:00","to":"0:10:00"}
+{"type":"progress","t":"2026-09-27T16:49:09Z","pct":100}
+{"type":"stage","t":"2026-09-27T16:49:09Z","name":"translate","chunk":1,"of":14}
+{"type":"progress","t":"2026-09-27T16:49:09Z","pct":100}
+{"type":"saved","t":"2026-09-27T16:49:09Z","path":"/…/movie.es.srt","covers":"0:10:00","watchable":true}
+{"type":"stage","t":"2026-09-27T16:49:09Z","name":"transcribe","chunk":2,"of":14,"from":"0:10:00","to":"0:20:00"}
+{"type":"progress","t":"2026-09-27T16:49:09Z","pct":100}
+{"type":"stage","t":"2026-09-27T16:49:09Z","name":"translate","chunk":2,"of":14}
+{"type":"progress","t":"2026-09-27T16:49:09Z","pct":100}
+{"type":"saved","t":"2026-09-27T16:49:09Z","path":"/…/movie.es.srt","covers":"0:20:00","watchable":true}
+{"type":"done","t":"2026-09-27T16:49:10Z","path":"/…/movie.es.srt","covers":"2:19:08"}
+```
+
+The ordinary run (no `-fast`) emits a different, shorter sequence: `probe`, then — only when transcribing audio — a bare `stage` `extract` and a bare `stage` `transcribe` with no `chunk`/`of`/`from`/`to` at all, then `progress`, then a single bare `stage` `translate`, then `progress`, then `done` with no `covers`. Reading an existing subtitle track skips the `extract`/`transcribe` stages entirely and goes straight from `probe` to the one `translate` stage. Either run may also emit a `warning` (some blocks kept their original text) before `done`, or end in a single `error` instead of `done`.
+
+A field that does not apply to the current run is left out of the JSON rather than sent as a zero or empty string — `omitempty` in the Go source means "unknown here", not "the default":
+
+- `probe.duration` — omitted when ffprobe's own duration could not be read; never sent as `0`.
+- `stage.chunk`, `stage.of`, `stage.from`, `stage.to` — only `-fast` sets these, on the `transcribe` stage (all four) and the `translate` stage (`chunk`/`of` only); the ordinary run's stage events never carry them.
+- `done.covers` — only `-fast` knows what span of the film's own runtime is covered; the ordinary run translates whatever it parsed in one pass and has no honest value to put here.
+- `warning.first` — omitted when there is nothing to list.
+
+`-probe` prints the `version` and `probe` events (or, without `-events json`, the same human-readable track listing the tool already prints) and exits without doing any work. It needs no API key and no target language:
+
+```bash
+sub-translator -events json -probe movie.mkv
+```
+
+Every fatal error carries a `kind` so a program can act on the reason instead of matching on wording. The message stays exactly as it is today:
+
+| `kind` | Raised when |
+|---|---|
+| `missing_key` | no OpenAI key in the environment or the config |
+| `whisper_not_found` | `whisper-cli` is neither configured nor on `PATH` |
+| `no_model` | no ggml model configured or discovered |
+| `ambiguous_model` | several models found, none chosen |
+| `no_audio_track` | `-source audio` (or `-fast`) on a file with no audio track, or `-atrack` pointing at one that doesn't exist |
+| `no_subtitle_track` | `-source sub` on a file with none, `-track` pointing at a stream that isn't a subtitle track, or `-from` matching no subtitle track's language |
+| `probe_failed` | the input file doesn't exist, or ffprobe could not read it |
+| `rate_limited` | the translation endpoint refused every block in the run |
+| `transcript_empty` | the audio produced no speech at all |
+| `cancelled` | SIGINT or SIGTERM — the only `error` event that isn't followed by exit code 1; the process exits 130 |
+| `other` | anything not yet classified |
+
+Every fatal path emits exactly one `error` event — a classified `fatalKindf` call emits its own `kind`; anything else falls through `fatalf`, which emits `other` — so a consumer driving this as a subprocess never sees a non-zero exit with silence on the wire.
+
+This is the same idea as `git status --porcelain` or `ffmpeg -progress`: a stable contract for programs, separate from the output meant for people.
 
 ## Languages
 
