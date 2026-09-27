@@ -476,6 +476,7 @@ func TestEventsFlagRejectsAnythingButJSON(t *testing.T) {
 func TestClassifiedErrorsCarryTheirKind(t *testing.T) {
 	bin := buildCLI(t)
 	cfg := t.TempDir()
+	input := touch(t, filepath.Join(t.TempDir(), "movie.mkv"))
 
 	tests := []struct {
 		name string
@@ -485,7 +486,7 @@ func TestClassifiedErrorsCarryTheirKind(t *testing.T) {
 	}{
 		{
 			name: "missing key",
-			args: []string{"-events", "json", "-to", "es", "movie.mkv"},
+			args: []string{"-events", "json", "-to", "es", input},
 			kind: "missing_key",
 		},
 		{

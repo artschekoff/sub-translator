@@ -189,20 +189,6 @@ func main() {
 		fatalf("%v", err)
 	}
 
-	// The translation settings are settled for the same reason, and before any
-	// work happens: a run with no API key has to be refused now, not discovered
-	// after an hour of transcription — or after being told the input path is
-	// wrong, which is a cheaper problem to find and fix second. This covers the
-	// progressive path too — both -fast and the ordinary run reach translation
-	// only through here.
-	if *workers != -1 && *workers < 1 {
-		fatalf("-workers must be at least 1, got %d", *workers)
-	}
-	translateOpts := resolveTranslateOptions(settings, *workers)
-	if err := translateOpts.Validate(); err != nil {
-		fatalKindf(errMissingKey, "%v", err)
-	}
-
 	if flag.NArg() < 1 {
 		flag.Usage()
 		os.Exit(1)
@@ -210,6 +196,18 @@ func main() {
 	input := flag.Arg(0)
 	if _, err := os.Stat(input); err != nil {
 		fatalKindf(errProbeFailed, "input file not found: %s", input)
+	}
+
+	// The translation settings are settled for the same reason, and before any
+	// work happens: a run with no API key has to be refused now, not discovered
+	// after an hour of transcription. This covers the progressive path too — both
+	// -fast and the ordinary run reach translation only through here.
+	if *workers != -1 && *workers < 1 {
+		fatalf("-workers must be at least 1, got %d", *workers)
+	}
+	translateOpts := resolveTranslateOptions(settings, *workers)
+	if err := translateOpts.Validate(); err != nil {
+		fatalKindf(errMissingKey, "%v", err)
 	}
 
 	setupRunTmpDir()
