@@ -253,7 +253,12 @@ func runOrdinary(o ordinaryOptions) error {
 		// stream goes probe → stage translate and a window has nothing to show
 		// for the extraction and the SRT parse.
 		ev.Emit(&events.Stage{Name: "extract-subs"})
-		if err := media.ExtractSubtitle(input, srcStream.Index, tmpSRT); err != nil {
+		// No progress callback here: pulling one subtitle track out of a
+		// container is a text demux, not the minutes-long decode ExtractAudio
+		// and MuxSubtitle can be, and TestOrdinaryRunSpawnsFfprobeOnlyWhenEventsAreOn
+		// pins that an off feature (nothing listening for progress here) must
+		// not cost a ContainerDuration probe it has no use for.
+		if err := media.ExtractSubtitle(input, srcStream.Index, tmpSRT, nil); err != nil {
 			return errf("extract: %v", err)
 		}
 
@@ -362,7 +367,7 @@ func runOrdinary(o ordinaryOptions) error {
 	// Rewriting a multi-gigabyte container takes minutes, during which the last
 	// thing a consumer heard was translate at 100%.
 	ev.Emit(&events.Stage{Name: "mux"})
-	if err := media.MuxSubtitle(input, tmpTranslated, to, title, outMKV); err != nil {
+	if err := media.MuxSubtitle(input, tmpTranslated, to, title, outMKV, muxProgress()); err != nil {
 		return kindErrf(errOutputUnwritable, "mux: %v", err)
 	}
 	fmt.Printf("Done: %s\n", outMKV)

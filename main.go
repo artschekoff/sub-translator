@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/artschekoff/sub-translator/internal/config"
 	"github.com/artschekoff/sub-translator/internal/events"
@@ -718,7 +719,7 @@ func transcribe(input, tmpDir string, streams []media.Stream, atrack int, from s
 	wav := filepath.Join(tmpDir, "audio.wav")
 	fmt.Printf("Extracting audio track #%d...\n", src.Index)
 	ev.Emit(&events.Stage{Name: "extract"})
-	if err := media.ExtractAudio(input, src.Index, wav); err != nil {
+	if err := media.ExtractAudio(input, src.Index, wav, extractionProgress()); err != nil {
 		return nil, "", fmt.Errorf("extract audio: %w", err)
 	}
 
@@ -753,6 +754,62 @@ func progressLine(done, total int) string {
 func pctOf(done, total int) int {
 	p, _ := strconv.Atoi(fmt.Sprintf("%.0f", float64(done)/float64(total)*100))
 	return p
+}
+
+// pctOfDuration is pctOf for the extraction and mux progress callbacks, which
+// track a position in time rather than a count of blocks. It goes through the
+// same %.0f-then-Atoi rounding as pctOf — via Seconds(), so it agrees with
+// pctOf on every ratio a shared test could compare rather than merely on the
+// ones by-hand testing happened to try — so a printed extraction percentage
+// and the one carried on the event stream can never diverge the way pctOf's
+// own fix round exists to describe.
+func pctOfDuration(done, total time.Duration) int {
+	return pctOf(int(done.Milliseconds()), int(total.Milliseconds()))
+}
+
+// mediaProgress builds the onProgress callback every ffmpeg-backed media
+// function takes: extraction and muxing used to be silent on both stdout and
+// the event stream, once ffmpeg's own stderr was captured instead of
+// inherited (see docs/superpowers/specs/2026-09-26-desktop-gui-design.md).
+// All four call sites — the ordinary run's subtitle extraction and mux, and
+// the -fast and ordinary audio extractions — share this one function rather
+// than each writing its own closure, so the printed line and the emitted
+// event can only ever agree by construction: pct is computed once and handed
+// to both.
+//
+// total<=0 means the ContainerDuration probe behind it did not learn a
+// length — an input ffprobe can't read, for instance — and nothing is
+// printed or emitted rather than a meaningless 0% or a divide-by-zero.
+func mediaProgress(label string) media.Progress {
+	return func(done, total time.Duration) {
+		if total <= 0 {
+			return
+		}
+		pct := pctOfDuration(done, total)
+		fmt.Printf("\r  %s: %d%%   ", label, pct)
+		ev.Emit(&events.Progress{Pct: pct})
+	}
+}
+
+// extractionProgress is mediaProgress for pulling an audio or subtitle track
+// out of the container.
+func extractionProgress() media.Progress {
+	return mediaProgress("extracting")
+}
+
+// muxProgress is mediaProgress for writing the translated subtitles back into
+// a new container — a multi-gigabyte rewrite that used to leave the terminal
+// reading "translate, 100%" for minutes.
+func muxProgress() media.Progress {
+	return mediaProgress("muxing")
+}
+
+// sliceProgress is mediaProgress for cutting one -fast chunk out of the
+// extracted WAV. -c copy makes this fast enough that it will rarely have
+// anything to report, but it shares the mechanism rather than being a
+// silent exception to it.
+func sliceProgress() media.Progress {
+	return mediaProgress("slicing")
 }
 
 // firstN is the first n values of v, unformatted: the actual indices, for a

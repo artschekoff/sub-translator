@@ -166,7 +166,7 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 	fullWAV := filepath.Join(tmpDir, "audio.wav")
 	fmt.Printf("Extracting audio track #%d...\n", src.Index)
 	ev.Emit(&events.Stage{Name: "extract"})
-	if err := media.ExtractAudio(input, src.Index, fullWAV); err != nil {
+	if err := media.ExtractAudio(input, src.Index, fullWAV, extractionProgress()); err != nil {
 		return fmt.Errorf("extract audio: %w", err)
 	}
 
@@ -221,7 +221,7 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 
 	for _, c := range plan {
 		chunkWAV := filepath.Join(tmpDir, fmt.Sprintf("chunk-%03d.wav", c.Index))
-		if err := media.SliceWAV(fullWAV, c.Start, c.Dur, chunkWAV); err != nil {
+		if err := media.SliceWAV(fullWAV, c.Start, c.Dur, chunkWAV, sliceProgress()); err != nil {
 			return fail("chunk %d: slice audio: %w", c.Index+1, err)
 		}
 

@@ -376,6 +376,35 @@ func TestPctOfAgreesWithThePrintedPercentage(t *testing.T) {
 	}
 }
 
+// pctOfDuration is pctOf's sibling for the extraction and mux progress
+// callbacks, which track a time.Duration pair rather than a block count. This
+// is the same invariant TestPctOfAgreesWithThePrintedPercentage pins for
+// pctOf, asserted independently of pctOfDuration's own implementation (which
+// goes through pctOf via Milliseconds()) — this test computes its "want"
+// straight from Seconds(), so a change that quietly loses sub-second
+// precision (say, truncating to whole seconds before dividing) fails here
+// even though it might still satisfy pctOf's own test.
+func TestPctOfDurationAgreesWithThePrintedPercentage(t *testing.T) {
+	for _, tt := range []struct{ done, total time.Duration }{
+		{1 * time.Second, 8 * time.Second},        // 12.5% — exact half
+		{830 * time.Millisecond, 1 * time.Second}, // sub-second precision
+		{83*time.Second + 450*time.Millisecond, 200 * time.Second},
+		{0, time.Minute},
+		{time.Minute, time.Minute},
+		{90 * time.Second, 4 * time.Minute},
+	} {
+		want := fmt.Sprintf("%.0f", tt.done.Seconds()/tt.total.Seconds()*100)
+		wantInt, err := strconv.Atoi(want)
+		if err != nil {
+			t.Fatalf("test setup: %q (from done=%v total=%v) is not an integer string", want, tt.done, tt.total)
+		}
+		if got := pctOfDuration(tt.done, tt.total); got != wantInt {
+			t.Errorf("pctOfDuration(%v, %v) = %d, want %d (the printed line's %%.0f gives %q)",
+				tt.done, tt.total, got, wantInt, want)
+		}
+	}
+}
+
 // buildCLI compiles the real binary, so a test can assert on the order main does
 // things in. Nothing else can: the ordering lives in main(), which ends in
 // os.Exit, and calling the pieces in the right order from a test only proves the
@@ -827,23 +856,22 @@ func TestTheOrdinaryRunEmitsTheContainerDoneEvent(t *testing.T) {
 
 	// A loose containsSubsequence(kindsOf(events), []string{"stage", "done"})
 	// check is satisfied by ANY earlier stage (extract-subs or translate both
-	// fire first on this path), so it never actually requires the mux stage.
-	// Pin the stage *names*, and specifically require "mux" to appear before
-	// the done event — that is the behaviour this test's name promises.
+	// fire first on this path), so it never actually requires the mux stage —
+	// and pinning only mux's *presence* before done is not much stronger: a
+	// reviewer once moved the mux emit to the very start of the run and this
+	// test still passed. Pin the whole ordered stage sequence instead — it is
+	// both stronger and simpler, and stage order is what the GUI displays.
 	var stageNames []string
-	muxIdx := -1
-	for i, e := range events {
+	for _, e := range events {
 		if e["type"] != "stage" {
 			continue
 		}
 		name, _ := e["name"].(string)
 		stageNames = append(stageNames, name)
-		if name == "mux" {
-			muxIdx = i
-		}
 	}
-	if muxIdx == -1 {
-		t.Errorf("stage names = %v, want a \"mux\" stage — the container run must announce the mux phase before writing the muxed file", stageNames)
+	wantStages := []string{"extract-subs", "translate", "mux"}
+	if !slices.Equal(stageNames, wantStages) {
+		t.Errorf("stage names = %v, want %v in that order", stageNames, wantStages)
 	}
 
 	if n := countOf(events, "done"); n != 1 {
@@ -851,10 +879,16 @@ func TestTheOrdinaryRunEmitsTheContainerDoneEvent(t *testing.T) {
 	}
 	var done map[string]any
 	doneIdx := -1
+	muxIdx := -1
 	for i, e := range events {
-		if e["type"] == "done" {
+		switch e["type"] {
+		case "done":
 			done = e
 			doneIdx = i
+		case "stage":
+			if name, _ := e["name"].(string); name == "mux" {
+				muxIdx = i
+			}
 		}
 	}
 	if muxIdx != -1 && muxIdx > doneIdx {
