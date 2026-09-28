@@ -107,12 +107,17 @@ func TestEveryErrKindIsDocumented(t *testing.T) {
 	}
 }
 
-// stageNameInSource finds the stage names the code actually emits. Two of the
-// five — extract-subs and mux — sit on paths no test can drive to completion
-// (the mux runs after a translation no compiled binary can be pointed at a test
-// endpoint for), so this is what stands between them and being deleted with the
-// suite green: the emitted set, the README's table and the spec's list have to
-// agree, and removing an emit breaks that agreement.
+// stageNameInSource finds the stage names the code actually emits, by scanning
+// the source rather than requiring a bespoke runtime test for each one. That
+// used to be the only way to reach two of the five — extract-subs and mux —
+// but is not any more: stubTranslateEndpoint lets a compiled-binary test point
+// translation at a local server instead of the real endpoint, and both are now
+// driven to completion that way (TestTheSubtitlePathEmitsTheExtractSubsStage,
+// TestTheOrdinaryRunEmitsTheContainerDoneEvent, TestTheMuxWriteIsClassified).
+// This scan still earns its place regardless: it is what stands between any of
+// the five and being deleted with the suite green, because the emitted set,
+// the README's table and the spec's list have to agree, and removing an emit
+// breaks that agreement whether or not a runtime test happens to cover it.
 var stageNameInSource = regexp.MustCompile(`(?s)events\.Stage\{[^}]*Name:\s*"([a-z-]+)"`)
 
 // stageRowInREADME matches a row of the README's stage table.

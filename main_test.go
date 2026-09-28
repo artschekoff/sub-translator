@@ -866,6 +866,92 @@ func TestTheOrdinaryRunEmitsTheContainerDoneEvent(t *testing.T) {
 	}
 }
 
+// TestTheMuxWriteIsClassified drives a real mux failure through the compiled
+// binary and asserts the error event's kind is output_unwritable. It is the
+// sibling of TestTheOrdinaryRunEmitsTheContainerDoneEvent above, which already
+// proves -mode mux is reachable through the compiled binary with nothing more
+// exotic than subtitleSourceStubs and stubTranslateEndpoint — a comment near
+// errkind_test.go once claimed a real mux failure could not be driven to
+// completion in this suite; this test is the proof that it can, by failing
+// only the ffmpeg invocation that performs the mux itself while leaving the
+// (also ffmpeg-driven) subtitle extraction that has to succeed first alone.
+//
+// The two calls are told apart by how many -i flags they carry:
+// ExtractSubtitle passes exactly one (the input file), while MuxSubtitle
+// passes two (the input file and the translated SRT) — internal/media/media.go
+// builds both argument lists, and that shape is the only thing distinguishing
+// them from the stub's side.
+func TestTheMuxWriteIsClassified(t *testing.T) {
+	srv := stubTranslateEndpoint(t)
+	bin := buildCLI(t)
+	dir := t.TempDir()
+	binDir := subtitleSourceStubs(t, dir, subtitleTrackSRT)
+
+	// Overwrite subtitleSourceStubs' ffmpeg stub, which always succeeds: this
+	// one still extracts a real subtitle track (one -i) but refuses the mux
+	// invocation (two -i's, input and the translated SRT) exactly the way a
+	// read-only output directory or a full disk would.
+	writeStub(t, filepath.Join(binDir, "ffmpeg"), `#!/bin/sh
+i_count=0
+prev=""
+out=""
+for a in "$@"; do
+  if [ "$prev" = "-i" ]; then i_count=$((i_count+1)); fi
+  prev="$a"
+  out="$a"
+done
+if [ "$i_count" -ge 2 ]; then
+  echo "ffmpeg: mux stub refuses to write the container" >&2
+  exit 1
+fi
+cat > "$out" <<'SRTBODY'
+`+subtitleTrackSRT+`
+SRTBODY
+exit 0
+`)
+
+	film := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(film, []byte("not really a film"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	cmd := exec.Command(bin, "-events", "json", "-to", "es", "-source", "sub",
+		"-from", "en", "-track", "0", "-mode", "mux", film)
+	cmd.Env = append(os.Environ(),
+		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"OPENAI_API_KEY=sk-test",
+		"OPENAI_BASE_URL="+srv.URL,
+		"XDG_CONFIG_HOME="+filepath.Join(dir, "cfg"),
+	)
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	runErr := cmd.Run()
+	var exit *exec.ExitError
+	if !errors.As(runErr, &exit) {
+		t.Fatalf("the binary did not run: %v\nstdout:\n%s\nstderr:\n%s", runErr, stdout.String(), stderr.String())
+	}
+	if code := exit.ExitCode(); code != 1 {
+		t.Errorf("exit status %d, want 1", code)
+	}
+
+	events := parseEventStream(t, stderr.Bytes())
+	var errs []map[string]any
+	for _, e := range events {
+		if e["type"] == "error" {
+			errs = append(errs, e)
+		}
+	}
+	if len(errs) != 1 {
+		t.Fatalf("%d error events, want exactly 1:\n%s", len(errs), stderr.String())
+	}
+	if kind, _ := errs[0]["kind"].(string); kind != string(errOutputUnwritable) {
+		t.Errorf("error event kind = %q, want %q\nstderr:\n%s", kind, errOutputUnwritable, stderr.String())
+	}
+	if msg, _ := errs[0]["message"].(string); !strings.HasPrefix(msg, "mux: ") {
+		t.Errorf("error event message = %q, want it to start with %q", msg, "mux: ")
+	}
+}
+
 // The event stream is an addition, not a replacement: a person running the tool
 // in a terminal must see exactly what they saw before. Anything else makes
 // -events json a breaking change for every existing user and script.
