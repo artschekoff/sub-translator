@@ -847,6 +847,7 @@ func probeEvent(input string, streams, subs []media.Stream) *events.Probe {
 	p := &events.Probe{
 		Audio:     toEvent(media.AudioStreams(streams)),
 		Subtitles: toEvent(subs),
+		Fast:      fastRule(),
 	}
 	// A duration we cannot read — missing, or ffprobe's own "N/A" — is not
 	// worth failing over: the file is still translatable, and the field is

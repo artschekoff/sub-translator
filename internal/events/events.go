@@ -69,12 +69,21 @@ func (*Version) kind() Kind { return KindVersion }
 
 type Probe struct {
 	base
-	Duration  float64  `json:"duration,omitempty"`
-	Audio     []Stream `json:"audio"`
-	Subtitles []Stream `json:"subtitles"`
+	Duration  float64   `json:"duration,omitempty"`
+	Audio     []Stream  `json:"audio"`
+	Subtitles []Stream  `json:"subtitles"`
+	Fast      *FastRule `json:"fast,omitempty"`
 }
 
 func (*Probe) kind() Kind { return KindProbe }
+
+// FastRule is the condition under which -fast is accepted, stated so a caller
+// can disable a control with a reason rather than copying the rule.
+type FastRule struct {
+	Sources         []string `json:"sources"`
+	Modes           []string `json:"modes"`
+	MinChunkMinutes int      `json:"min_chunk_minutes"`
+}
 
 type Stage struct {
 	base

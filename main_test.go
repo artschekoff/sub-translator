@@ -1153,6 +1153,69 @@ JSON`)
 	}
 }
 
+// TestTheProbeEventStatesTheFastModeRule is what lets the GUI disable its
+// checkbox without holding a copy of the rule.
+func TestTheProbeEventStatesTheFastModeRule(t *testing.T) {
+	bin := buildCLI(t)
+	dir := t.TempDir()
+
+	binDir := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stub := "#!/bin/sh\n" + `cat <<'JSON'
+{"streams":[
+ {"index":0,"codec_type":"video","codec_name":"h264","tags":{"language":"rus"}},
+ {"index":1,"codec_type":"audio","codec_name":"ac3","tags":{"language":"eng","title":"Original"}}
+],"format":{"duration":"120.5"}}
+JSON`
+	writeStub(t, filepath.Join(binDir, "ffprobe"), stub)
+
+	film := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(film, []byte("not a film"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(bin, "-events", "json", "-probe", film)
+	cmd.Env = append(os.Environ(),
+		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"XDG_CONFIG_HOME="+filepath.Join(dir, "cfg"),
+	)
+	cmd.Env = append(cmd.Env, "OPENAI_API_KEY=")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("probe failed: %v\nstderr: %s", err, stderr.String())
+	}
+
+	var probe map[string]any
+	for _, line := range strings.Split(stderr.String(), "\n") {
+		var m map[string]any
+		if json.Unmarshal([]byte(line), &m) == nil && m["type"] == "probe" {
+			probe = m
+		}
+	}
+	if probe == nil {
+		t.Fatalf("no probe event:\n%s", stderr.String())
+	}
+
+	fast, ok := probe["fast"].(map[string]any)
+	if !ok {
+		t.Fatalf("probe.fast = %#v, want an object", probe["fast"])
+	}
+	sources, _ := fast["sources"].([]any)
+	if len(sources) != 1 || sources[0] != "audio" {
+		t.Errorf("fast.sources = %v, want [\"audio\"]", fast["sources"])
+	}
+	modes, _ := fast["modes"].([]any)
+	if len(modes) != 1 || modes[0] != "srt" {
+		t.Errorf("fast.modes = %v, want [\"srt\"]", fast["modes"])
+	}
+	if fast["min_chunk_minutes"] != float64(1) {
+		t.Errorf("fast.min_chunk_minutes = %v, want 1", fast["min_chunk_minutes"])
+	}
+}
+
 // -probe is what a wrapper calls to build a track list before the user has
 // chosen anything, so it must need nothing: no API key, no target language, and
 // it must not write a file or start any work.

@@ -339,7 +339,7 @@ Every event carries `type` and `t` (an RFC 3339 UTC timestamp). The first line o
 
 ```json
 {"type":"version","t":"2026-09-27T16:49:08Z","events":1,"tool":"1.4.0"}
-{"type":"probe","t":"2026-09-27T16:49:08Z","duration":8348.674,"audio":[{"index":1,"lang":"eng","title":"Original","codec":"ac3"}],"subtitles":[]}
+{"type":"probe","t":"2026-09-27T16:49:08Z","duration":8348.674,"audio":[{"index":1,"lang":"eng","title":"Original","codec":"ac3"}],"subtitles":[],"fast":{"sources":["audio"],"modes":["srt"],"min_chunk_minutes":1}}
 {"type":"stage","t":"2026-09-27T16:49:08Z","name":"extract"}
 {"type":"stage","t":"2026-09-27T16:49:08Z","name":"transcribe","chunk":1,"of":14,"from":"0:00:00","to":"0:10:00"}
 {"type":"progress","t":"2026-09-27T16:49:09Z","pct":100}
@@ -358,6 +358,8 @@ Every event carries `type` and `t` (an RFC 3339 UTC timestamp). The first line o
 Simplified for readability, in four ways worth knowing about: the paths and the track metadata are shortened; the run's fourteen chunks are trimmed to two; each `progress` burst is shown as the single event that ends it, where a real run emits one per batch of blocks translated and one per percentage whisper reports, so a fourteen-chunk film produces hundreds of them; and the `language` line is shown where a run that was not told `-from` emits it (the verified run named its source language, so it had nothing to report).
 
 `language` is emitted once, when whisper reports a source language that differs from the one that was asked for (including when none was asked for). Everything downstream — the transcript sidecar's filename, the translation — uses the language in that event from then on.
+
+`probe.fast` states the `-fast` rule as data — the `-source` values and `-mode` values it accepts, and the minimum `-chunk`, in minutes — so a caller can disable a "fast mode" control with a reason instead of holding its own copy of the rule. It is the same object on the ordinary run's `probe` event and on `-probe`'s.
 
 The `stage` names are the five phases a run can go through:
 
@@ -381,6 +383,8 @@ A field that does not apply to the current run is left out of the JSON rather th
 - `stage.chunk`, `stage.of`, `stage.from`, `stage.to` — only `-fast` sets these, on the `transcribe` stage (all four) and the `translate` stage (`chunk`/`of` only); the ordinary run's stage events never carry them.
 - `done.covers` — only `-fast` knows what span of the film's own runtime is covered; the ordinary run translates whatever it parsed in one pass and has no honest value to put here.
 - `warning.first` — omitted when there is nothing to list.
+
+`probe.fast` is never omitted — every `probe` event states the `-fast` rule.
 
 `-probe` prints the `version` and `probe` events (or, without `-events json`, the same human-readable track listing the tool already prints) and exits without doing any work. It needs no API key and no target language:
 

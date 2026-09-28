@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -263,6 +264,32 @@ func TestValidateFastAcceptsTheWorkingCombination(t *testing.T) {
 	}
 	if err := validateFastSource(true, sourceAudio); err != nil {
 		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// TestTheStatedRuleIsTheEnforcedRule is the test that makes the single source
+// of truth real rather than aspirational: for every combination the probe event
+// says is allowed, validateFastFlags and validateFastSource must accept it, and
+// for every combination it omits, they must refuse it.
+//
+// sourceAuto is absent on purpose. validateFastSource runs after resolveSource
+// has turned auto into sub or audio — its own comment says so — so auto never
+// reaches it, and a row for it would assert about a combination the program
+// cannot produce.
+func TestTheStatedRuleIsTheEnforcedRule(t *testing.T) {
+	rule := fastRule()
+	for _, src := range []sourceMode{sourceSub, sourceAudio} {
+		for _, mode := range []outputMode{modeSRT, modeMux, modeBoth} {
+			allowed := slices.Contains(rule.Sources, src.String()) &&
+				slices.Contains(rule.Modes, mode.String())
+			errFlags := validateFastFlags(true, mode, rule.MinChunkMinutes)
+			errSource := validateFastSource(true, src)
+			accepted := errFlags == nil && errSource == nil
+			if accepted != allowed {
+				t.Errorf("source=%s mode=%s: the rule says allowed=%v, the validators say %v",
+					src, mode, allowed, accepted)
+			}
+		}
 	}
 }
 

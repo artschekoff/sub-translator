@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"time"
 
 	"github.com/artschekoff/sub-translator/internal/events"
@@ -42,6 +43,30 @@ func planChunks(total, chunkLen time.Duration) []chunkPlan {
 	return out
 }
 
+// fastSourceModes and fastOutputModes are the fast-mode rule. The validators
+// below read them, and so does the probe event, so a caller can be told the rule
+// instead of reimplementing it — and the rule cannot be changed in one place
+// only. TestTheStatedRuleIsTheEnforcedRule holds the two together.
+var (
+	fastSourceModes  = []sourceMode{sourceAudio}
+	fastOutputModes  = []outputMode{modeSRT}
+	fastMinChunkMins = 1
+)
+
+// fastRule states the rule as data, for the probe event. The names come from
+// each mode's String method, not from a conversion: both types are ints backed
+// by iota, so string(m) would yield a control character rather than "srt".
+func fastRule() *events.FastRule {
+	r := &events.FastRule{MinChunkMinutes: fastMinChunkMins}
+	for _, s := range fastSourceModes {
+		r.Sources = append(r.Sources, s.String())
+	}
+	for _, m := range fastOutputModes {
+		r.Modes = append(r.Modes, m.String())
+	}
+	return r
+}
+
 // validateFastFlags rejects the -fast combinations that depend on nothing but
 // the flags. They are split out from the source check so they can be raised
 // before any work: -fast -mode mux used to probe the container, resolve whisper,
@@ -52,11 +77,11 @@ func validateFastFlags(fast bool, mode outputMode, chunkMinutes int) error {
 	if !fast {
 		return nil
 	}
-	if mode != modeSRT {
+	if !slices.Contains(fastOutputModes, mode) {
 		return fmt.Errorf("-fast cannot be combined with -mode %s: a video container "+
 			"cannot be rewritten piece by piece — use the default -mode srt", mode)
 	}
-	if chunkMinutes < 1 {
+	if chunkMinutes < fastMinChunkMins {
 		return fmt.Errorf("-chunk must be at least 1 minute, got %d", chunkMinutes)
 	}
 	return nil
@@ -68,7 +93,7 @@ func validateFastSource(fast bool, source sourceMode) error {
 	if !fast {
 		return nil
 	}
-	if source != sourceAudio {
+	if !slices.Contains(fastSourceModes, source) {
 		return fmt.Errorf("-fast only applies to transcription; there is nothing to wait for " +
 			"when reading an existing subtitle track — use -source audio")
 	}

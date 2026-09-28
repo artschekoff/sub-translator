@@ -131,6 +131,43 @@ func TestProbeEventShape(t *testing.T) {
 	if subs, ok := m["subtitles"].([]any); !ok || len(subs) != 0 {
 		t.Errorf("subtitles = %#v, want an empty list, not null", m["subtitles"])
 	}
+	if _, present := m["fast"]; present {
+		t.Errorf(`fast = %#v, want the key omitted when Fast is nil`, m["fast"])
+	}
+}
+
+// FastRule is what lets a caller disable its fast-mode control with a reason
+// instead of copying the rule; this pins its wire shape the same way
+// TestProbeEventShape pins the rest of Probe.
+func TestProbeEventCarriesTheFastRule(t *testing.T) {
+	var buf bytes.Buffer
+	e := fixed(New(&buf))
+	e.Emit(&Probe{
+		Audio:     []Stream{},
+		Subtitles: []Stream{},
+		Fast: &FastRule{
+			Sources:         []string{"audio"},
+			Modes:           []string{"srt"},
+			MinChunkMinutes: 1,
+		},
+	})
+
+	m := decode(t, strings.TrimSpace(buf.String()))
+	fast, ok := m["fast"].(map[string]any)
+	if !ok {
+		t.Fatalf("fast = %#v, want an object", m["fast"])
+	}
+	sources, _ := fast["sources"].([]any)
+	if len(sources) != 1 || sources[0] != "audio" {
+		t.Errorf("fast.sources = %v, want [\"audio\"]", fast["sources"])
+	}
+	modes, _ := fast["modes"].([]any)
+	if len(modes) != 1 || modes[0] != "srt" {
+		t.Errorf("fast.modes = %v, want [\"srt\"]", fast["modes"])
+	}
+	if fast["min_chunk_minutes"] != float64(1) {
+		t.Errorf("fast.min_chunk_minutes = %v, want 1", fast["min_chunk_minutes"])
+	}
 }
 
 func TestVersionEventCarriesTheProtocolNumber(t *testing.T) {

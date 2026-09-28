@@ -58,7 +58,8 @@ Every event has `type` and `t` (RFC 3339 timestamp). The first line of any run i
 {"type":"version","t":"…","events":1,"tool":"1.4.0"}
 {"type":"probe","t":"…","duration":8348.674,
  "audio":[{"index":3,"lang":"eng","title":"Original (Eng)","codec":"ac3"}],
- "subtitles":[]}
+ "subtitles":[],
+ "fast":{"sources":["audio"],"modes":["srt"],"min_chunk_minutes":1}}
 {"type":"stage","t":"…","name":"extract"}
 {"type":"stage","t":"…","name":"transcribe","chunk":1,"of":14,"from":"0:00:00","to":"0:10:00"}
 {"type":"progress","t":"…","pct":42}
@@ -96,6 +97,8 @@ The GUI routes on the `kind` and falls back to the exit code, never the other wa
 Prints the `version` and `probe` events and exits without doing any work. The GUI needs the track list before the user can choose anything, and today probing is welded to the start of a run.
 
 With `-events json` it emits JSON; without it, the human-readable track listing the tool already prints. It requires only the input path — no `-to`, no key.
+
+`probe.fast` states the `-fast` rule as data — the `-source` and `-mode` values it accepts, and the minimum `-chunk` in minutes — so the window can disable its "fast mode" checkbox with a reason instead of holding a second copy of the rule. It is on every `probe` event, `-probe`'s and the ordinary run's alike, since both build it through the same `probeEvent` function.
 
 **`-probe`, `-version`, `-h` and the subcommands carry no terminal event.** None of them is a run: each emits `version` (and `-probe` its `probe`), exits 0, and emits no `done` and no `error`. A decoder shared between the probe call, a settings read and the run call must not wait for one.
 
@@ -139,7 +142,7 @@ Part 1 above is the design as built. What the build changed, and why:
 - **`-events json` is honoured exactly where `flag.Parse` honours it.** The early argv scan that lets a parse failure be reported on the stream reads argv by the same rules the flag package is about to — it stops at the first positional argument — so `movie.mkv -events json` is ignored by both rather than by only one of them. It keeps looking past a flag the CLI does not define, because that is the case it exists for.
 - **`OPENAI_BASE_URL` is now honoured, not just accepted by the internal `Options.BaseURL` a test could reach.** It was a plain environment read away from being reachable from outside the package, and until it was read in `resolveTranslateOptions` no test could drive the *compiled binary* through a successful translation — the ordinary run's event stream had none for exactly that reason. It is also independently useful for an OpenAI-compatible local server, a proxy, or Azure.
 - **Extraction and muxing report progress too, now.** Capturing ffmpeg's stderr (the first bullet above) fixed the unparseable-event problem but took the progress counter with it — forty seconds of silence on a feature film's audio extraction, in the terminal and on the stream alike. `runFFmpeg` already scanned every stderr line to build the diagnostics tail; it now also parses the `time=` field off the progress lines it was dropping and reports it before discarding them, rather than adding a second pipe with `-progress`. `ExtractAudio` and `MuxSubtitle` report against `ContainerDuration`; `SliceWAV`'s chunk already knows its own length and needs no extra probe. Both the printed line and the `progress` event are computed from the same percentage, so they cannot disagree the way `pctOf` and the printed translate line once did. `ExtractSubtitle` gained the same parameter for signature consistency but is not wired to report: pulling one subtitle track out of a container is a text demux, not a minutes-long decode, and a `ContainerDuration` probe nothing will read is exactly the unconditional-subprocess cost the probe-event work above was careful to avoid paying when nobody is listening.
-- **Still open, deliberately, and smaller than it was.** SIGINT does not kill the ffmpeg child: it is reparented to PID 1 and keeps running until its next write, which now fails with EPIPE because the pipe the capture gave it has no reader left. So it dies on its own within a write or two rather than being killed outright, and — the part that mattered for the window — it no longer holds the event stream's file descriptor, so a GUI draining stderr to EOF returns as soon as the CLI exits instead of waiting for the orphan. A child that never writes again still has to be waited out, which is what process groups would fix, and that needs its own platform testing. Also open: Part 2's copy of `validateFast`'s rules (S6).
+- **Still open, deliberately, and smaller than it was.** SIGINT does not kill the ffmpeg child: it is reparented to PID 1 and keeps running until its next write, which now fails with EPIPE because the pipe the capture gave it has no reader left. So it dies on its own within a write or two rather than being killed outright, and — the part that mattered for the window — it no longer holds the event stream's file descriptor, so a GUI draining stderr to EOF returns as soon as the CLI exits instead of waiting for the orphan. A child that never writes again still has to be waited out, which is what process groups would fix, and that needs its own platform testing.
 
 ## Part 2: The window
 
@@ -176,7 +179,7 @@ Failing all three, the GUI opens on its settings screen saying it cannot find th
 
 Subtitle tracks and audio tracks are one choice, not two: picking an audio track means transcription, picking a subtitle track means translating what is already there. When the file has no subtitle tracks the section says so rather than showing an empty box, because that is the case the whole transcription feature exists for.
 
-Fast mode is disabled unless the source is an audio track and the output is a sidecar `.srt`, mirroring what `validateFast` enforces, with a line saying why rather than a dead control.
+Fast mode is disabled unless the source is an audio track and the output is a sidecar `.srt`, with a line saying why rather than a dead control. The window reads that condition off the `probe` event's `fast` object rather than holding its own copy of the rule.
 
 **Run.** The current stage in words, a progress bar, and for `-fast` the growing coverage with a prominent note the moment the file is watchable. A Cancel button. On completion, the path, a "Show in Finder" button, and any warning about untranslated blocks — carried through from the `warning` event, because a file that is 12 blocks short of translated must not look identical to one that is not.
 
