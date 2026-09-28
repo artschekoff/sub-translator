@@ -332,6 +332,17 @@ func runOrdinary(o ordinaryOptions) error {
 			return kindErrf(errOutputUnwritable, "write SRT: %v", err)
 		}
 		fmt.Printf("Saved SRT: %s\n", srtOut)
+		// Every file this run writes gets its own saved event, the way the -fast
+		// path already reports each write. It is what -mode both needs: it
+		// produces a sidecar and a container, and done names one of them, so a
+		// "Show in Finder" reading done alone could never reach the sidecar. And
+		// it arrives when the file does — a mux over a multi-gigabyte container
+		// takes minutes, during which the sidecar is already there to open.
+		//
+		// No covers: that span is a thing only -fast knows (see events.Saved).
+		// Watchable, because everything the ordinary run writes is complete when
+		// it is written; a partial file is the -fast path's idea, not this one's.
+		ev.Emit(&events.Saved{Path: srtOut, Watchable: true})
 	}
 
 	if !mode.writesContainer() {
@@ -370,6 +381,11 @@ func runOrdinary(o ordinaryOptions) error {
 		return kindErrf(errOutputUnwritable, "mux: %v", err)
 	}
 	fmt.Printf("Done: %s\n", outMKV)
+	// The second file in -mode both, and the only one in -mode mux. Naming it
+	// here as well as on done keeps one rule for a consumer — every file the run
+	// wrote has a saved event — instead of "the container is on done and the
+	// sidecar is on saved", which is a rule with an exception in it.
+	ev.Emit(&events.Saved{Path: outMKV, Watchable: true})
 	emitDone(&events.Done{Path: outMKV})
 	return nil
 }

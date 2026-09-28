@@ -909,6 +909,77 @@ func TestTheOrdinaryRunEmitsTheContainerDoneEvent(t *testing.T) {
 	}
 }
 
+// -mode both writes two files, and done names one of them. Nothing on the
+// ordinary path emitted saved, so a consumer's "Show in Finder" could only ever
+// reach the container and had no way to learn the sidecar existed — on a run
+// whose whole point is that it produced both.
+//
+// The shape is a saved event per file, reusing the event the -fast path already
+// emits, rather than a second list on done: it arrives when the file does (the
+// sidecar lands minutes before a multi-gigabyte mux finishes), it keeps done's
+// meaning unchanged, and it leaves a consumer one rule — every file the run wrote
+// has a saved event — instead of two places to look.
+func TestModeBothNamesEveryFileItWrote(t *testing.T) {
+	srv := stubTranslateEndpoint(t)
+	bin := buildCLI(t)
+	dir := t.TempDir()
+	binDir := subtitleSourceStubs(t, dir, subtitleTrackSRT)
+
+	film := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(film, []byte("not really a film"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stderr bytes.Buffer
+	cmd := exec.Command(bin, "-events", "json", "-to", "es", "-source", "sub",
+		"-from", "en", "-track", "0", "-mode", "both", film)
+	cmd.Env = append(os.Environ(),
+		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"OPENAI_API_KEY=sk-test",
+		"OPENAI_BASE_URL="+srv.URL,
+		"XDG_CONFIG_HOME="+filepath.Join(dir, "cfg"),
+	)
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("want exit 0, got %v\nstderr:\n%s", err, stderr.String())
+	}
+
+	wantSidecar := media.DefaultSRTPath(film, "es")
+	wantContainer := media.DefaultOutputPath(film, "es")
+	// Both really are on disk: an event naming a file that was never written
+	// would be worse than no event at all.
+	for _, path := range []string{wantSidecar, wantContainer} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("-mode both did not write %s: %v", path, err)
+		}
+	}
+
+	var named []string
+	for _, e := range eventsOfKind(stderr.String(), "saved") {
+		path, _ := e["path"].(string)
+		named = append(named, path)
+		// covers is the -fast path's span of the film and the ordinary run has no
+		// honest value for it, so it must be absent rather than "".
+		if _, ok := e["covers"]; ok {
+			t.Errorf("saved for %s carries covers = %#v; the ordinary run knows no span "+
+				"of the film's runtime and must omit the field", path, e["covers"])
+		}
+	}
+	if !slices.Equal(named, []string{wantSidecar, wantContainer}) {
+		t.Errorf("saved events named %v, want %v — the sidecar as it is written, then the "+
+			"container:\n%s", named, []string{wantSidecar, wantContainer}, stderr.String())
+	}
+
+	// done is unchanged: one event, still the container.
+	dones := eventsOfKind(stderr.String(), "done")
+	if len(dones) != 1 {
+		t.Fatalf("%d done events, want exactly one:\n%s", len(dones), stderr.String())
+	}
+	if got, _ := dones[0]["path"].(string); got != wantContainer {
+		t.Errorf("done path = %q, want %q", got, wantContainer)
+	}
+}
+
 // TestTheMuxWriteIsClassified drives a real mux failure through the compiled
 // binary and asserts the error event's kind is output_unwritable. It is the
 // sibling of TestTheOrdinaryRunEmitsTheContainerDoneEvent above, which already

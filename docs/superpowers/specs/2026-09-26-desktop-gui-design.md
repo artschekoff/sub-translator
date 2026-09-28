@@ -78,6 +78,8 @@ That is one producible run, trimmed to its first chunk: a run ends in **exactly 
 {"type":"error","t":"…","kind":"invalid_key","message":"…"}
 ```
 
+`saved` names one file the run has written, and every file a run writes gets one — the `-fast` path one per chunk as the file grows, the ordinary path one per file as it lands. That is what lets the Run screen's "Show in Finder" reach both files `-mode both` produces: it writes a sidecar `.srt` and a container, and `done` names only the container, so a consumer that wants every path collects them from `saved`. `saved.covers` is omitted on the ordinary path for the same reason `done.covers` is — the span is a thing only `-fast` knows.
+
 `progress` carries a percentage for the current stage; it has no stage tag of its own, so a consumer reads it against the most recent `stage`. That holds without exception, including for the one case that used to break it: a `-fast` chunk's slice off the full WAV is ffmpeg work that can report a burst, and the chunk's `transcribe` stage is emitted before the slice runs so the burst reads against the chunk it belongs to rather than against whatever ran before it. `saved` fires after every chunk in `-fast` mode, with `watchable` true from the first one.
 
 The five stage names are the five phases of a run: `extract` (audio to WAV), `extract-subs` (an existing subtitle track out of the container, and parsed), `transcribe`, `translate`, `mux` (writing the new container). The GUI has a label for each. `extract` and `mux` now report progress like every other stage — see "Revised after implementation" below — so nothing here is a special case for the window to know about.
@@ -186,7 +188,7 @@ Subtitle tracks and audio tracks are one choice, not two: picking an audio track
 
 Fast mode is disabled unless the source is an audio track and the output is a sidecar `.srt`, with a line saying why rather than a dead control. The window reads that condition off the `probe` event's `fast` object rather than holding its own copy of the rule.
 
-**Run.** The current stage in words, a progress bar, and for `-fast` the growing coverage with a prominent note the moment the file is watchable. A Cancel button. On completion, the path, a "Show in Finder" button, and any warning about untranslated blocks — carried through from the `warning` event, because a file that is 12 blocks short of translated must not look identical to one that is not.
+**Run.** The current stage in words, a progress bar, and for `-fast` the growing coverage with a prominent note the moment the file is watchable. A Cancel button. On completion, every path the run reported through `saved` — two of them in `both` mode, the sidecar and the container — each with a "Show in Finder" button, and any warning about untranslated blocks — carried through from the `warning` event, because a file that is 12 blocks short of translated must not look identical to one that is not.
 
 **Settings.** OpenAI key (masked, with a Show toggle), model, workers, whisper binary, whisper model, VAD model, chunk length. Every one of these reads and writes the same `~/.config/sub-translator/config.json` through `sub-translator config get` and `config set`, so the GUI holds no second copy of the validation rules and a value set in either interface is seen by the other.
 

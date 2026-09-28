@@ -124,10 +124,18 @@ type Language struct {
 
 func (*Language) kind() Kind { return KindLanguage }
 
+// Saved names one file a run has written and says whether it is usable yet. The
+// -fast path emits one per chunk, as the file grows; the ordinary path emits one
+// per file it writes, which is how -mode both — a sidecar and a container — names
+// both of them rather than only the one done carries.
 type Saved struct {
 	base
-	Path      string `json:"path"`
-	Covers    string `json:"covers"`
+	Path string `json:"path"`
+	// Covers is the span of the film the file holds, which only -fast knows: the
+	// ordinary run writes whatever it parsed in one pass and has no span of the
+	// container's own runtime to report. omitempty for the reason Done.Covers has
+	// it — an absent field is "unknown", never a coverage claim of "".
+	Covers    string `json:"covers,omitempty"`
 	Watchable bool   `json:"watchable"`
 }
 
