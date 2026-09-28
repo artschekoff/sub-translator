@@ -707,11 +707,17 @@ func TestTheProbeEventStatesTheFastModeRule(t *testing.T) {
 // of truth real rather than aspirational: for every combination the probe event
 // says is allowed, validateFastFlags and validateFastSource must accept it, and
 // for every combination it omits, they must refuse it.
+//
+// sourceAuto is absent on purpose. validateFastSource runs after resolveSource
+// has turned auto into sub or audio — its own comment says so — so auto never
+// reaches it, and a row for it would assert about a combination the program
+// cannot produce.
 func TestTheStatedRuleIsTheEnforcedRule(t *testing.T) {
 	rule := fastRule()
-	for _, src := range allSourceModes() {
-		for _, mode := range allOutputModes() {
-			allowed := contains(rule.Sources, string(src)) && contains(rule.Modes, string(mode))
+	for _, src := range []sourceMode{sourceSub, sourceAudio} {
+		for _, mode := range []outputMode{modeSRT, modeMux, modeBoth} {
+			allowed := slices.Contains(rule.Sources, src.String()) &&
+				slices.Contains(rule.Modes, mode.String())
 			errFlags := validateFastFlags(true, mode, rule.MinChunkMinutes)
 			errSource := validateFastSource(true, src)
 			accepted := errFlags == nil && errSource == nil
@@ -747,18 +753,26 @@ Rewrite `validateFastFlags` and `validateFastSource` to test membership in those
 Add:
 
 ```go
-// fastRule states the rule as data, for the probe event.
+// fastRule states the rule as data, for the probe event. The names come from
+// each mode's String method, not from a conversion: both types are ints backed
+// by iota, so string(m) would yield a control character rather than "srt".
 func fastRule() *events.FastRule {
 	r := &events.FastRule{MinChunkMinutes: fastMinChunkMins}
 	for _, s := range fastSourceModes {
-		r.Sources = append(r.Sources, string(s))
+		r.Sources = append(r.Sources, s.String())
 	}
 	for _, m := range fastOutputModes {
-		r.Modes = append(r.Modes, string(m))
+		r.Modes = append(r.Modes, m.String())
 	}
 	return r
 }
 ```
+
+`sourceMode` is declared in `source.go:9` and `outputMode` in `mode.go:9`; both are
+`int` with `iota` constants and a `String()` method, and the strings the method
+returns (`"audio"`, `"sub"`, `"auto"`, `"srt"`, `"mux"`, `"both"`) are the same
+ones `parseSource` and the `-mode` flag accept. Those are the names to put on the
+wire, so a consumer can send back what it was given.
 
 - [ ] **Step 4: Add the event field** in `internal/events/events.go`
 
