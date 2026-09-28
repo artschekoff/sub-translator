@@ -673,23 +673,14 @@ func main() {
 // fatalf reports a fatal error with no kind a caller can act on. It still
 // emits exactly one error event — kind "other" — so a consumer never gets
 // silence and a bare exit code; fatalKindf is the one other path to the same
-// tail, and it emits its own kind instead, never this one, so a fatal run
+// ending, and it emits its own kind instead, never this one, so a fatal run
 // always emits exactly one error event, never two.
+//
+// It is errf plus exitWith, and nothing else: the emit, the prose line, the
+// cleanup and the exit all live in exitWith, so the shape of a fatal run is
+// described in exactly one place.
 func fatalf(format string, args ...any) {
-	msg := fmt.Sprintf(format, args...)
-	ev.Emit(&events.Error{Kind: string(errOther), Message: msg})
-	fatalTail("%s", msg)
-}
-
-// fatalTail is the ending every fatal path shares: the human-readable prose
-// line, cleanup, exit. It never touches the event stream itself — the two
-// callers above have already emitted, each exactly once, before reaching it.
-func fatalTail(format string, args ...any) {
-	fmt.Fprintf(proseErr, "error: "+format+"\n", args...)
-	// os.Exit skips deferred calls, so the scratch directory has to be removed
-	// here or every error path leaks it.
-	cleanupRunTmpDir()
-	os.Exit(1)
+	exitWith(errf(format, args...))
 }
 
 // classifyWhisperErr says which kind a resolveWhisper failure is. Its errors

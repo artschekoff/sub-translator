@@ -1,11 +1,5 @@
 package main
 
-import (
-	"fmt"
-
-	"github.com/artschekoff/sub-translator/internal/events"
-)
-
 // errKind classifies a fatal error so a program driving this tool can act on the
 // reason instead of matching on the wording. The strings are a contract: a
 // wrapper switches on them, so they are pinned by a test and must not be
@@ -61,11 +55,11 @@ func allErrKinds() []errKind {
 // reports no kind because there is nothing useful to say about it — but still
 // emits, with kind "other".
 //
-// This goes straight to fatalTail rather than through fatalf: fatalf emits its
-// own error event (kind "other"), and calling it here would double-emit —
-// once with this kind, once with "other" — for every classified failure.
+// This builds its own classified error and hands it to exitWith rather than
+// going through fatalf: fatalf's error is kind "other", so routing through it
+// would relabel every classified failure. exitWith reads the kind back off the
+// error it is given, which is how one emit serves both helpers without either
+// of them emitting a second time.
 func fatalKindf(kind errKind, format string, args ...any) {
-	msg := fmt.Sprintf(format, args...)
-	ev.Emit(&events.Error{Kind: string(kind), Message: msg})
-	fatalTail("%s", msg)
+	exitWith(kindErrf(kind, format, args...))
 }
