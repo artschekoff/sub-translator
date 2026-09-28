@@ -77,7 +77,7 @@ That is one producible run, trimmed to its first chunk: a run ends in **exactly 
 {"type":"error","t":"…","kind":"invalid_key","message":"…"}
 ```
 
-`progress` carries a percentage for the current stage; it has no stage tag of its own, so a consumer reads it against the most recent `stage`. `saved` fires after every chunk in `-fast` mode, with `watchable` true from the first one.
+`progress` carries a percentage for the current stage; it has no stage tag of its own, so a consumer reads it against the most recent `stage`. That holds without exception, including for the one case that used to break it: a `-fast` chunk's slice off the full WAV is ffmpeg work that can report a burst, and the chunk's `transcribe` stage is emitted before the slice runs so the burst reads against the chunk it belongs to rather than against whatever ran before it. `saved` fires after every chunk in `-fast` mode, with `watchable` true from the first one.
 
 The five stage names are the five phases of a run: `extract` (audio to WAV), `extract-subs` (an existing subtitle track out of the container, and parsed), `transcribe`, `translate`, `mux` (writing the new container). The GUI has a label for each. `extract` and `mux` now report progress like every other stage — see "Revised after implementation" below — so nothing here is a special case for the window to know about.
 

@@ -247,12 +247,17 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 
 	for _, c := range plan {
 		chunkWAV := filepath.Join(tmpDir, fmt.Sprintf("chunk-%03d.wav", c.Index))
-		if err := media.SliceWAV(fullWAV, c.Start, c.Dur, chunkWAV, sliceProgress()); err != nil {
-			return fail("chunk %d: slice audio: %w", c.Index+1, err)
-		}
-
-		fmt.Printf("Chunk %d/%d (%s–%s):\n", c.Index+1, len(plan),
-			formatClock(c.Start), formatClock(c.Start+c.Dur))
+		// Before the slice, not after it. A progress event carries no stage tag
+		// of its own — a consumer reads it against the most recent stage — so a
+		// slice that reported while this chunk's stage was still unannounced
+		// attributed its burst to whatever came before: extract for chunk 1, and
+		// the *previous* chunk's translate for the rest. A window showing "the
+		// current stage in words, a progress bar" then resets the bar to 0 and
+		// climbs it again under a stale label, with nothing on the wire to say
+		// the burst does not belong there.
+		//
+		// The printed "Chunk n/N" line deliberately stays below the slice, where
+		// it has always been, so stdout is byte-for-byte what it was.
 		ev.Emit(&events.Stage{
 			Name:  "transcribe",
 			Chunk: c.Index + 1,
@@ -260,6 +265,12 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 			From:  formatClock(c.Start),
 			To:    formatClock(c.Start + c.Dur),
 		})
+		if err := media.SliceWAV(fullWAV, c.Start, c.Dur, chunkWAV, sliceProgress()); err != nil {
+			return fail("chunk %d: slice audio: %w", c.Index+1, err)
+		}
+
+		fmt.Printf("Chunk %d/%d (%s–%s):\n", c.Index+1, len(plan),
+			formatClock(c.Start), formatClock(c.Start+c.Dur))
 		// The language is settled by the first chunk and then forced, so whisper
 		// cannot change its mind halfway and hand back a two-language file.
 		parsed, detected, err := transcribeInto(opts, chunkWAV,

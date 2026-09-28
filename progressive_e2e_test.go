@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/artschekoff/sub-translator/internal/events"
 	"github.com/artschekoff/sub-translator/internal/media"
 	"github.com/artschekoff/sub-translator/internal/srt"
 	"github.com/artschekoff/sub-translator/internal/translate"
@@ -508,5 +510,100 @@ func TestRunProgressiveNamesTheProvider(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("a -fast run never named %q:\n%s", want, out)
 		}
+	}
+}
+
+// A progress event carries no stage tag of its own — a consumer reads it against
+// the most recent stage event — so every burst has to be preceded by the stage it
+// belongs to. The one that was not is a -fast chunk's slice off the full WAV:
+// SliceWAV ran before the chunk's own transcribe stage was announced, so its
+// burst attributed to extract for chunk 1 and to the *previous* chunk's translate
+// for the rest. Documenting it was tried first and was the wrong trade: the
+// paragraph told the next reader that a progress bar resetting under a stale
+// label was correct behaviour.
+//
+// The slice is the only thing that reports 37% here: the ffmpeg stub emits a
+// time= line for slice invocations only (they carry -ss), placed 3:42 into a
+// ten-minute chunk, and a chunk's translation is one batch and so only ever
+// reports 100%. That makes each burst traceable to the work that produced it,
+// which is the whole property under test.
+func TestASlicesProgressAttributesToItsOwnChunksTranscribeStage(t *testing.T) {
+	dir, binDir, tmpDir, _ := progressiveStubs(t, dialogueSRT)
+	stubTranslator(t, nil)
+
+	// Replaces progressiveStubs' silent ffmpeg: same output file, but a slice
+	// (recognised by -ss, exactly as sliceWAVArgs builds it) also reports its
+	// position the way real ffmpeg does — on stderr, terminated by a carriage
+	// return. The full-WAV extraction stays silent, so any progress event before
+	// the first transcribe stage could only have come from a slice.
+	writeStub(t, filepath.Join(binDir, "ffmpeg"), `#!/bin/sh
+out=""
+slicing=0
+for a in "$@"; do
+  if [ "$a" = "-ss" ]; then slicing=1; fi
+  out="$a"
+done
+printf 'RIFFWAVE' > "$out"
+if [ "$slicing" = "1" ]; then
+  printf 'frame=1 time=00:03:42.00 bitrate=N/A\r' >&2
+fi
+exit 0
+`)
+
+	input := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(input, []byte("not really a film"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	streams := []media.Stream{{Index: 0, CodecType: "video"}, {Index: 1, CodecType: "audio"}}
+	streams[1].Tags.Language = "eng"
+	opts := whisper.Options{Bin: filepath.Join(binDir, "stub-whisper"), Model: filepath.Join(dir, "ggml-test.bin")}
+
+	saved := ev
+	t.Cleanup(func() { ev = saved })
+	var buf bytes.Buffer
+	ev = events.New(&buf)
+
+	captureStdout(t, func() {
+		if err := runProgressive(input, tmpDir, streams, -1, "en", "es",
+			10*time.Minute, opts, translate.Options{}, ""); err != nil {
+			t.Fatalf("runProgressive() = %v, want success", err)
+		}
+	})
+
+	const slicePct = 37 // 3:42 of a ten-minute chunk
+	type stage struct {
+		name  string
+		chunk int
+	}
+	var last stage
+	var slicesSeen int
+	for _, e := range eventsOf(buf.String()) {
+		switch e["type"] {
+		case "stage":
+			name, _ := e["name"].(string)
+			chunk, _ := e["chunk"].(float64)
+			last = stage{name: name, chunk: int(chunk)}
+		case "progress":
+			pct, _ := e["pct"].(float64)
+			if int(pct) != slicePct {
+				continue
+			}
+			slicesSeen++
+			if last.name != "transcribe" {
+				t.Errorf("the slice for chunk %d reported %d%% against stage %q, "+
+					"want transcribe: a consumer reads progress against the most recent stage, "+
+					"so this burst is displayed under the wrong label\n%s",
+					slicesSeen, slicePct, last.name, buf.String())
+			}
+			if last.chunk != slicesSeen {
+				t.Errorf("slice %d of the run reported against transcribe chunk %d, want chunk %d",
+					slicesSeen, last.chunk, slicesSeen)
+			}
+		}
+	}
+	// Three chunks, three slices: an assertion that never ran is not evidence.
+	if slicesSeen != 3 {
+		t.Fatalf("%d slice progress events, want 3 — the stub stopped reporting and the "+
+			"loop above asserted nothing\n%s", slicesSeen, buf.String())
 	}
 }
