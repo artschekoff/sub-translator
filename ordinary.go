@@ -14,11 +14,23 @@ import (
 	"github.com/artschekoff/sub-translator/internal/whisper"
 )
 
-// ordinaryOptions is everything the default pipeline needs: one field for every
-// value it used to read out of a flag pointer or a config file. It mirrors what
-// runProgressive takes, so the two paths read alike and neither reaches for a
-// flag variable behind the other's back — which is also what lets a test drive
-// this path with nothing but a struct literal.
+// ordinaryOptions is one field for every value the default pipeline used to
+// read out of a flag pointer. It mirrors what runProgressive takes, so the two
+// paths read alike and neither reaches for a flag variable behind the other's
+// back.
+//
+// It is not the whole of the run's input, and a caller should not read it as
+// such: on the -source audio path runOrdinary still calls config.Load() itself
+// and hands the result to resolveWhisper, so the whisper binary, model and VAD
+// settings come off disk ($XDG_CONFIG_HOME, else $HOME) rather than through
+// this struct. That is what main did before the extraction and it is left
+// alone here, because the load is deliberately late — it is the one that fails
+// loudly on a broken config file, where main's own earlier load ignores the
+// error. The visible cost is that a test driving this path has to set
+// XDG_CONFIG_HOME to stop the developer's own settings deciding the answer;
+// ordinary_test.go does. Threading the config through as a field would make
+// the struct honest and is the obvious next move, but it changes which load
+// reports a broken file, so it is a change of behaviour rather than a comment.
 type ordinaryOptions struct {
 	// input is the video file, and tmpDir the run-scoped scratch directory its
 	// working files go in. tmpDir is passed rather than read off runTmpDir for
@@ -57,9 +69,20 @@ type ordinaryOptions struct {
 }
 
 // runOrdinary is the whole run after the flags are settled: probe, extract or
-// read subtitles, transcribe, translate, write, and optionally mux. It returns
-// instead of exiting so a test can drive it, and every error it returns carries
-// a kind — exitWith, in main, is the one place one of them becomes an exit.
+// read subtitles, transcribe, translate, write, and optionally mux. All 24 of
+// the failures it used to exit on are returned instead, each carrying a kind —
+// exitWith, in main, is the one place one of them becomes an exit.
+//
+// One path out of here still ends the process rather than returning, and a
+// test has to know about it: promptLang, called below for a missing -from or
+// -to, exits when the prompt gets no answer. So runOrdinary is drivable by a
+// test that supplies both languages, and a test that leaves one empty with a
+// closed stdin will lose its process instead of seeing an error. That is not a
+// gap in this extraction so much as one left outside it: promptLang lives in
+// ui.go, was never one of main's 34 exits, and converting it means changing
+// its signature and every other caller's. It is the honest next step, and it
+// is a task of its own. Nothing about the error-event contract is affected
+// meanwhile — that path emits exactly once, through fatalf into exitWith.
 //
 // The -fast fork lives in here rather than in main because it cannot be decided
 // any earlier: whether "auto" means transcription is a question only

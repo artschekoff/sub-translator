@@ -26,7 +26,7 @@ var version = "dev"
 // runTmpDir is the one scratch directory a run owns: the extracted WAV, the
 // whisper output and the intermediate SRTs all live inside it. It is a package
 // variable because the two ways this program ends without unwinding the stack —
-// fatalf's os.Exit and a SIGINT — both have to be able to remove it, and a
+// exitWith's os.Exit and a SIGINT — both have to be able to remove it, and a
 // feature film's 16 kHz WAV is well over a gigabyte to leave behind.
 var runTmpDir string
 
@@ -349,6 +349,12 @@ func main() {
 		// code are exactly what they were; what is new is that a consumer gets
 		// a terminal event instead of 56 lines of flag documentation and
 		// silence on the wire.
+		//
+		// This is the one fatal path that does not go through exitWith, and the
+		// reason is the line it prints: a person with no input path needs the
+		// usage text, not "error: no input file". exitWith would print the
+		// latter, so the emit and the exit are spelled out here instead — the
+		// same single error event, the same exit 1, arrived at by hand.
 		ev.Emit(&events.Error{
 			Kind:    string(errOther),
 			Message: "no input file: sub-translator needs the path to a video file",
@@ -417,7 +423,10 @@ func main() {
 //
 // It is errf plus exitWith, and nothing else: the emit, the prose line, the
 // cleanup and the exit all live in exitWith, so the shape of a fatal run is
-// described in exactly one place.
+// described in one place — with one deliberate exception. The missing-input
+// path above hand-rolls its own emit and exit because it must print the usage
+// text where exitWith would print the "error: ..." line; it is the only other
+// code that describes that shape, and it is annotated there.
 func fatalf(format string, args ...any) {
 	exitWith(errf(format, args...))
 }

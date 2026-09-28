@@ -17,7 +17,6 @@ type fatalError struct {
 }
 
 func (e *fatalError) Error() string { return e.msg }
-func (e *fatalError) Kind() errKind { return e.kind }
 
 // kindErrf builds a classified failure. It is the value-returning twin of
 // fatalKindf, which exits.
@@ -33,6 +32,10 @@ func errf(format string, args ...any) error {
 // kindOf reads the kind off an error, through any number of %w wrappings. An
 // error that carries no kind is errOther: honest, because nothing has claimed
 // to know what it is.
+//
+// This is the only accessor: fatalError deliberately has no Kind() method, so
+// there is no way to ask a *fatalError for its kind that stops at the outermost
+// error and quietly answers "other" for a wrapped one.
 func kindOf(err error) errKind {
 	var fe *fatalError
 	if errors.As(err, &fe) {
@@ -44,9 +47,12 @@ func kindOf(err error) errKind {
 // exitWith is the one place a returned error becomes an exit: it emits the
 // single error event a fatal run owes its consumer, prints the human-readable
 // line, removes the scratch directory and exits 1. Everything fatal goes
-// through here — fatalf and fatalKindf are now thin wrappers that build the
-// error and hand it over — so "exactly one error event per fatal run" is a
-// property of one function rather than of 34 call sites.
+// through here — fatalf and fatalKindf are thin wrappers that build the error
+// and hand it over, and runOrdinary's 24 returned errors arrive through main —
+// so "exactly one error event per fatal run" is a property of one function
+// rather than of every call site that can fail. The one deliberate exception is
+// the missing-input path in main, which prints the usage text instead of an
+// error: line and so emits and exits on its own; its comment says why.
 //
 // The message is printed with a literal %s rather than the caller's own format
 // string, so a message that happens to contain a percent sign (an ffmpeg
