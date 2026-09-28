@@ -43,10 +43,11 @@ func planChunks(total, chunkLen time.Duration) []chunkPlan {
 	return out
 }
 
-// fastSourceModes and fastOutputModes are the fast-mode rule. The validators
-// below read them, and so does the probe event, so a caller can be told the rule
-// instead of reimplementing it — and the rule cannot be changed in one place
-// only. TestTheStatedRuleIsTheEnforcedRule holds the two together.
+// fastSourceModes, fastOutputModes and fastMinChunkMins are the fast-mode rule.
+// The validators below read them, and so does the probe event, so a caller can
+// be told the rule instead of reimplementing it — and the rule cannot be
+// changed in one place only. TestTheStatedRuleIsTheEnforcedRule holds all three
+// together, the chunk floor included.
 var (
 	fastSourceModes  = []sourceMode{sourceAudio}
 	fastOutputModes  = []outputMode{modeSRT}
