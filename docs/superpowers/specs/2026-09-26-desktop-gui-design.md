@@ -119,7 +119,7 @@ Every fatal error gains a `kind` so a caller can act on it rather than match on 
 | `no_subtitle_track` | `-source sub` on a file with none |
 | `probe_failed` | ffprobe could not read the file |
 | `output_unwritable` | a path the user chose — the sidecar `.srt` or the muxed container — could not be written |
-| `rate_limited` | the endpoint returned HTTP 429 for every block |
+| `rate_limited` | every block failed, and the last failure recorded was the endpoint throttling it — HTTP 429 |
 | `transcript_empty` | the audio produced no speech |
 | `cancelled` | SIGINT or SIGTERM |
 | `other` | anything not yet classified — a usage error, an unreachable endpoint, a mangled reply |

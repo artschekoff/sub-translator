@@ -416,7 +416,7 @@ Every fatal error carries a `kind` so a program can act on the reason instead of
 | `no_subtitle_track` | `-source sub` on a file with none, `-track` pointing at a stream that isn't a subtitle track, or `-from` matching no subtitle track's language |
 | `probe_failed` | the input file doesn't exist, or ffprobe could not read it |
 | `output_unwritable` | a path the user chose — the sidecar `.srt`, or the muxed container — could not be written: a read-only directory, a full disk, a name the filesystem refuses |
-| `rate_limited` | the translation endpoint returned HTTP 429 for every block in the run |
+| `rate_limited` | every block in the run failed to translate, and the last failure the run recorded was the endpoint throttling it — HTTP 429 |
 | `transcript_empty` | the audio produced no speech at all |
 | `cancelled` | SIGINT or SIGTERM |
 | `other` | anything not yet classified — including a usage error, an unreachable endpoint, and a reply the model mangled |
