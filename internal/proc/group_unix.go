@@ -27,15 +27,10 @@ func detach(cmd *exec.Cmd) {
 // detaching it. A group that is already gone is the outcome being asked for,
 // not a failure.
 func KillGroup(pid int) error {
-	// Two things at once: pid is alive, and it really is a group leader, so
-	// -pid names its own group and not one it merely belongs to. The second
-	// half matters because the registry holds nothing but ints — a pid the
-	// kernel has already reaped and handed to somebody else would otherwise be
-	// a stranger's group to kill.
-	if pgid, err := syscall.Getpgid(pid); err != nil || pgid != pid {
-		return nil
-	}
-	// A negative pid is kill(2)'s way of naming a process group.
+	// A negative pid is kill(2)'s way of naming a process group. pid is a group
+	// leader because Start made it one, and it has not been reaped because Wait
+	// removes a reaped child from the registry before KillAllGroups can read it
+	// — the registry is what makes -pid safe to name here.
 	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil {
 		if errors.Is(err, syscall.ESRCH) {
 			return nil

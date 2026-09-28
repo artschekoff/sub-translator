@@ -175,7 +175,10 @@ func Run(o Options, progress func(pct int)) (Result, error) {
 		io.Copy(io.Discard, stderr)
 	}
 
-	if err := cmd.Wait(); err != nil {
+	// proc.Wait, not cmd.Wait: it drops the reaped child from the set of process
+	// groups a cancel kills. Every path below this point has already been through
+	// it, and there is no path from proc.Start to here that skips it.
+	if err := proc.Wait(cmd); err != nil {
 		if scanErr != nil {
 			// Include both the command error and the stderr read error
 			err = fmt.Errorf("%w (stderr read: %v)", err, scanErr)

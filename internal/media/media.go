@@ -168,7 +168,9 @@ func runFFmpeg(cmd *exec.Cmd, report func(time.Duration)) error {
 	// Drained to EOF before Wait: StderrPipe's contract, and the pipe filling up
 	// would otherwise stall ffmpeg itself.
 	tail := ffmpegDiagnostics(stderr, report)
-	if err := cmd.Wait(); err != nil {
+	// proc.Wait, not cmd.Wait: it drops the reaped child from the set of process
+	// groups a cancel kills, and every path out of here goes through it.
+	if err := proc.Wait(cmd); err != nil {
 		if tail != "" {
 			return fmt.Errorf("ffmpeg: %w\n%s", err, tail)
 		}

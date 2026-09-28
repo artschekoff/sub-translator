@@ -16,7 +16,7 @@ import (
 func waitFor(t *testing.T, cmd *exec.Cmd, d time.Duration, what string) {
 	t.Helper()
 	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
+	go func() { done <- Wait(cmd) }()
 	select {
 	case <-done:
 	case <-time.After(d):
@@ -101,21 +101,64 @@ func TestKillGroupOnAnAlreadyExitedChildIsNotAnError(t *testing.T) {
 	}
 }
 
-// A pid that is alive but leads no group of its own is not this package's to
-// kill: -pid would name whatever group the process merely belongs to, which in
-// a terminal is the user's own foreground job. The test binary itself is such a
-// process, and killing its group would take the test run with it.
-func TestKillGroupRefusesAPidThatLeadsNoGroup(t *testing.T) {
-	cmd := exec.Command("sh", "-c", "sleep 0.3")
-	// Deliberately not Start: this child inherits the test binary's group.
-	if err := cmd.Start(); err != nil {
+// registered reports whether pid is one of the groups a cancel would kill right
+// now. The registry is the whole of KillAllGroups' target list, so this is the
+// direct question — in-package on purpose, because the answer is not otherwise
+// observable without provoking pid reuse.
+func registered(pid int) bool {
+	mu.Lock()
+	defer mu.Unlock()
+	for _, p := range groups {
+		if p == pid {
+			return true
+		}
+	}
+	return false
+}
+
+// The registry's whole claim is that membership means "started and not reaped
+// yet". A pid that stayed on the list after its child was reaped would be a pid
+// the kernel is free to hand to somebody else — and the next cancel would
+// SIGKILL that stranger's process group, not ours. Nothing else in this package
+// re-checks that, so Wait dropping the entry is the claim.
+func TestWaitDropsTheReapedChildFromTheRegistry(t *testing.T) {
+	cmd := exec.Command("sh", "-c", "exit 0")
+	if err := Start(cmd); err != nil {
 		t.Fatal(err)
 	}
-	if err := KillGroup(cmd.Process.Pid); err != nil {
-		t.Errorf("KillGroup on a non-leader: %v, want nil", err)
+	pid := cmd.Process.Pid
+	if !registered(pid) {
+		t.Fatalf("Start did not register pid %d", pid)
 	}
-	if err := cmd.Wait(); err != nil {
-		t.Errorf("a child that leads no group did not exit cleanly: %v", err)
+	if err := Wait(cmd); err != nil {
+		t.Fatal(err)
+	}
+	if registered(pid) {
+		t.Errorf("pid %d is still on the kill list after Wait reaped it: a cancel "+
+			"would name a process group the kernel has been free to reuse since", pid)
+	}
+}
+
+// The same claim made about the walk rather than the slice: once every child has
+// been waited for, a cancel has nothing left to kill. This is the state a run
+// spends most of its life in — between the extraction and the transcription, or
+// between two -fast chunks.
+func TestKillAllGroupsTargetsNothingOnceEveryChildIsWaitedFor(t *testing.T) {
+	var pids []int
+	for i := 0; i < 3; i++ {
+		cmd := exec.Command("sh", "-c", "exit 0")
+		if err := Start(cmd); err != nil {
+			t.Fatal(err)
+		}
+		pids = append(pids, cmd.Process.Pid)
+		if err := Wait(cmd); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, pid := range pids {
+		if registered(pid) {
+			t.Errorf("reaped pid %d is still on the kill list", pid)
+		}
 	}
 }
 
@@ -189,8 +232,10 @@ func TestKillAllGroupsRacesStartAndWait(t *testing.T) {
 			t.Fatal(err)
 		}
 		// The kill and this Wait are deliberately unordered: whichever gets
-		// there first, neither may touch memory the other is writing.
-		_ = cmd.Wait()
+		// there first, neither may touch memory the other is writing, and the
+		// unregister inside Wait runs against the handler's read of the same
+		// registry.
+		_ = Wait(cmd)
 	}
 
 	close(stop)

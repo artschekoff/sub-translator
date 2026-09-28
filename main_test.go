@@ -605,6 +605,12 @@ const untranslatableBlockSRT = "1\n00:00:01,000 --> 00:00:03,000\nHello there\n\
 
 const refusedBlockMarker = "UNTRANSLATABLE"
 
+// untranslatableDialogueSRT is dialogueSRT with refusedBlockMarker in the second
+// block, so a run driven through stubTranslateEndpointRefusingSomeBlocks ends at
+// the second of progressive.go's two done emits — the one that follows the
+// blocks_untranslated warning.
+const untranslatableDialogueSRT = `printf '1\n00:00:01,000 --> 00:00:03,000\n%s one\n\n2\n00:00:05,000 --> 00:00:07,000\nUNTRANSLATABLE %s\n\n' "$tag" "$tag" > "$outbase.srt"`
+
 // stubTranslateEndpointRefusingSomeBlocks behaves like stubTranslateEndpoint,
 // except any block whose source text contains marker is answered with a
 // mismatched key instead of a translation. mapReply requires the reply's key
@@ -2765,10 +2771,49 @@ func TestACancelInFlightWinsOverAnyOtherEnding(t *testing.T) {
 			name: "the same success with no cancel in flight",
 			mode: "done-alone", wantCode: 0, wantErrors: 0, wantDones: 1,
 		},
+		// The two above pin emitDone itself. These pin the pipeline to using
+		// it: reverting any of the done emits to a bare ev.Emit leaves the
+		// helper's own tests green, because nothing else holds a finished run
+		// to asking whether a cancel got there first.
+		{
+			name: "an ordinary run finishing as the cancel lands",
+			mode: "ordinary-run-while-cancelling", wantCode: 130, wantErrors: 0, wantDones: 0,
+		},
+		{
+			name: "an ordinary mux run finishing as the cancel lands",
+			mode: "ordinary-mux-run-while-cancelling", wantCode: 130, wantErrors: 0, wantDones: 0,
+		},
+		{
+			name: "a -fast run finishing as the cancel lands",
+			mode: "progressive-run-while-cancelling", wantCode: 130, wantErrors: 0, wantDones: 0,
+		},
+		{
+			name: "a -fast run with untranslated blocks finishing as the cancel lands",
+			mode: "progressive-partial-while-cancelling", wantCode: 130, wantErrors: 0, wantDones: 0,
+		},
+		// And the same two runs with no cancel, so the absence asserted above is
+		// an absence of something these runs really do emit.
+		{
+			name: "an ordinary run with no cancel in flight",
+			mode: "ordinary-run", wantCode: 0, wantErrors: 0, wantDones: 1,
+		},
+		{
+			name: "an ordinary mux run with no cancel in flight",
+			mode: "ordinary-mux-run", wantCode: 0, wantErrors: 0, wantDones: 1,
+		},
+		{
+			name: "a -fast run with no cancel in flight",
+			mode: "progressive-run", wantCode: 0, wantErrors: 0, wantDones: 1,
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			cmd := exec.Command(os.Args[0], "-test.run=^TestCancelHandoffChild$")
-			cmd.Env = append(os.Environ(), "SUB_TRANSLATOR_CANCEL_HANDOFF="+tt.mode)
+			// The child ends in os.Exit, which skips t.Cleanup, so it is given a
+			// scratch root this test owns and removes.
+			cmd.Env = append(os.Environ(),
+				"SUB_TRANSLATOR_CANCEL_HANDOFF="+tt.mode,
+				"TMPDIR="+t.TempDir(),
+			)
 			var stderr bytes.Buffer
 			cmd.Stdout = io.Discard
 			cmd.Stderr = &stderr
@@ -2821,12 +2866,147 @@ func TestCancelHandoffChild(t *testing.T) {
 	case "done-alone":
 		emitDone(&events.Done{Path: "/tmp/subtitles.srt"})
 		os.Exit(0)
+
+	case "ordinary-run", "ordinary-run-while-cancelling":
+		if strings.HasSuffix(mode, "-while-cancelling") {
+			cancelling.Store(true)
+		}
+		runOrdinaryWithStubs(t, modeSRT)
+		os.Exit(0)
+
+	case "ordinary-mux-run", "ordinary-mux-run-while-cancelling":
+		if strings.HasSuffix(mode, "-while-cancelling") {
+			cancelling.Store(true)
+		}
+		runOrdinaryWithStubs(t, modeMux)
+		os.Exit(0)
+
+	case "progressive-run", "progressive-run-while-cancelling":
+		if strings.HasSuffix(mode, "-while-cancelling") {
+			cancelling.Store(true)
+		}
+		runProgressiveWithStubs(t, nil)
+		os.Exit(0)
+
+	case "progressive-partial-while-cancelling":
+		srv := stubTranslateEndpointRefusingSomeBlocks(t, refusedBlockMarker)
+		cancelling.Store(true)
+		runProgressiveWithStubs(t, srv)
+		os.Exit(0)
+
 	default:
 		t.Fatalf("unknown mode %q", mode)
 	}
 	// Only a branch that failed to exit reaches this.
 	fmt.Fprintf(proseErr, "the child returned from mode %s without exiting\n", mode)
 	os.Exit(99)
+}
+
+// proc's registry is the list of process groups a cancel kills, and an entry
+// only leaves it when the child is waited for through proc.Wait. A caller that
+// starts a child and waits for it with a bare cmd.Wait therefore leaves a pid on
+// that list for the rest of the run — reaped, and free to be handed to somebody
+// else by the kernel, whose process group the next cancel would then SIGKILL.
+//
+// That invariant lives in internal/media and internal/whisper, where proc cannot
+// see it, so it is asserted here: after a whole run, nothing is left running.
+// Reverting either call site to cmd.Wait fails this.
+func TestAFinishedRunLeavesNothingOnTheKillList(t *testing.T) {
+	t.Run("the ordinary run, which starts ffmpeg", func(t *testing.T) {
+		before := proc.Running()
+		saved := ev
+		t.Cleanup(func() { ev = saved })
+		ev = events.New(nil)
+		captureStdout(t, func() { runOrdinaryWithStubs(t, modeSRT) })
+		if got := proc.Running(); got != before {
+			t.Errorf("%d process group(s) still on the kill list after a finished run, want %d: "+
+				"a child was started and never waited for through proc.Wait", got, before)
+		}
+	})
+	t.Run("the -fast run, which starts whisper too", func(t *testing.T) {
+		before := proc.Running()
+		saved := ev
+		t.Cleanup(func() { ev = saved })
+		ev = events.New(nil)
+		captureStdout(t, func() { runProgressiveWithStubs(t, nil) })
+		if got := proc.Running(); got != before {
+			t.Errorf("%d process group(s) still on the kill list after a finished run, want %d: "+
+				"a child was started and never waited for through proc.Wait", got, before)
+		}
+	})
+}
+
+// runOrdinaryWithStubs drives a whole default run — subtitle track in, translated
+// SRT out — against the same stubs TestRunOrdinaryEndsInOneDoneEvent uses. It
+// exists so the cancel check in front of that run's done event is asserted
+// through the pipeline rather than on the helper that holds it.
+func runOrdinaryWithStubs(t *testing.T, out outputMode) {
+	t.Helper()
+	dir := t.TempDir()
+	binDir := subtitleSourceStubs(t, dir, subtitleTrackSRT)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	stubTranslator(t, nil)
+
+	input := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(input, []byte("not really a film"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tmpDir := filepath.Join(dir, "scratch")
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runOrdinary(ordinaryOptions{
+		input:  input,
+		tmpDir: tmpDir,
+		from:   "en",
+		to:     "es",
+		source: sourceSub,
+		track:  0,
+		atrack: -1,
+		mode:   out,
+		translateOpts: translate.Options{
+			APIKey:  "sk-test",
+			Model:   translate.DefaultModel,
+			Workers: 4,
+		},
+	}); err != nil {
+		t.Fatalf("runOrdinary() = %v, want success", err)
+	}
+}
+
+// runProgressiveWithStubs is the same for the -fast path. A non-nil srv is a
+// translation endpoint that refuses some blocks, which is what reaches the
+// second of progressive.go's two done emits — the one that follows the
+// blocks_untranslated warning.
+func runProgressiveWithStubs(t *testing.T, srv *httptest.Server) {
+	t.Helper()
+	body := dialogueSRT
+	opts := translate.Options{}
+	if srv != nil {
+		body = untranslatableDialogueSRT
+		opts = translate.Options{APIKey: "sk-test", Model: translate.DefaultModel, BaseURL: srv.URL}
+	} else {
+		stubTranslator(t, nil)
+	}
+
+	dir, binDir, tmpDir, _ := progressiveStubs(t, body)
+
+	input := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(input, []byte("not really a film"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	streams := []media.Stream{{Index: 0, CodecType: "video"}, {Index: 1, CodecType: "audio"}}
+	streams[1].Tags.Language = "eng"
+	whisperOpts := whisper.Options{
+		Bin:   filepath.Join(binDir, "stub-whisper"),
+		Model: filepath.Join(dir, "ggml-test.bin"),
+	}
+
+	if err := runProgressive(input, tmpDir, streams, -1, "en", "es",
+		10*time.Minute, whisperOpts, opts, ""); err != nil {
+		t.Fatalf("runProgressive() = %v, want success", err)
+	}
 }
 
 // The failure side of the exit-code/terminal-event pairing is well covered; the
