@@ -2963,6 +2963,13 @@ func TestACancelKillsTheChildrenBeforeRemovingTheScratchDirectory(t *testing.T) 
 // e2e cancellation test covers this only by winning a scheduling race — with the
 // guard disabled it went green 32 times in 33 — so the branch is tested here
 // directly instead, deterministically, one subprocess per ending.
+//
+// Every row below raises the flag *before* the run, so this table covers one
+// direction only, however many rows it grows. The other direction — the cancel
+// arriving second — is
+// TestACancelArrivingAfterTheEndingAddsNoSecondTerminalEvent, and the reason it
+// is a separate test rather than more rows here is that this test's name would
+// stop being true.
 func TestACancelInFlightWinsOverAnyOtherEnding(t *testing.T) {
 	for _, tt := range []struct {
 		name string
