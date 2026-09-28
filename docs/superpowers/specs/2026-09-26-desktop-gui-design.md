@@ -50,7 +50,9 @@ Three additions, useful on their own for anyone scripting the tool.
 
 Writes newline-delimited JSON to **stderr**. stdout keeps carrying the human output unchanged, so `-events json` composes with everything else.
 
-Every event has `type` and `t` (RFC 3339 timestamp). The first line of any run is always a `version` event, so a future change can be detected rather than guessed at:
+stderr already carries other things, and the design has to say what a consumer does about them: the tool's own `warning:` lines, the one `error:` line, `flag.Usage`'s text and the interactive prompts all share that stream. **A line that does not parse as JSON is human prose and must be skipped, not treated as a protocol error.** That is the rule, and it is only safe because every line the tool writes is whole. Two things are needed for that, not one: the event emitter and the prose writes share a lock, so neither can land inside the other's bytes; and because a lock says nothing about column position — an interactive prompt ends without a newline, since the answer is typed on the same line — the emitter also breaks an unfinished line before writing an event. The ffmpeg children — which write carriage-return-terminated progress with no newline at all, and so could put an event inside a line no line-oriented decoder could read — have their stderr captured instead of inherited, the way `whisper.Run` always did. A failing ffmpeg's diagnostics travel in the error message rather than on the stream.
+
+Every event has `type` and `t` (RFC 3339 timestamp). The first line of any run is always a `version` event, so a future change can be detected rather than guessed at — including on an argv this CLI cannot parse, which is the case the negotiation exists for:
 
 ```json
 {"type":"version","t":"…","events":1,"tool":"1.4.0"}
@@ -62,19 +64,42 @@ Every event has `type` and `t` (RFC 3339 timestamp). The first line of any run i
 {"type":"progress","t":"…","pct":42}
 {"type":"language","t":"…","detected":"en"}
 {"type":"stage","t":"…","name":"translate","chunk":1,"of":14}
+{"type":"progress","t":"…","pct":87}
 {"type":"saved","t":"…","path":"/…/movie.es.srt","covers":"0:10:00","watchable":true}
 {"type":"warning","t":"…","kind":"blocks_untranslated","count":12,"total":1834,"first":[204,205,206]}
 {"type":"done","t":"…","path":"/…/movie.es.srt","covers":"2:19:08"}
-{"type":"error","t":"…","kind":"missing_key","message":"…"}
 ```
 
-`progress` carries a percentage for the current stage. `saved` fires after every chunk in `-fast` mode, with `watchable` true from the first one.
+That is one producible run, trimmed to its first chunk: a run ends in **exactly one** of `done` or `error`, never both, and a `warning` always precedes the ending. An `error` event replaces the `done`:
+
+```json
+{"type":"error","t":"…","kind":"invalid_key","message":"…"}
+```
+
+`progress` carries a percentage for the current stage; it has no stage tag of its own, so a consumer reads it against the most recent `stage`. `saved` fires after every chunk in `-fast` mode, with `watchable` true from the first one.
+
+The five stage names are the five phases of a run: `extract` (audio to WAV), `extract-subs` (an existing subtitle track out of the container, and parsed), `transcribe`, `translate`, `mux` (writing the new container). The GUI has a label for each; the two ffmpeg-bound ones, `extract` and `mux`, report no progress inside themselves and the window has to stay honest about that.
+
+Exit codes, and the terminal event each pairs with:
+
+| Exit | Meaning | Terminal event |
+|---|---|---|
+| 0 | the run finished | one `done` — none for `-probe`, `-version`, `-h` or a subcommand |
+| 1 | a fatal error | one `error` with a `kind` — except an unsupported `-events` value, which cannot be answered in a format it does not understand |
+| 2 | a usage error: an unknown flag or a bad flag value | one `error`, kind `other`, after `version` |
+| 130 | cancelled by SIGINT or SIGTERM | one `error`, kind `cancelled` |
+
+The GUI routes on the `kind` and falls back to the exit code, never the other way round.
 
 ### `-probe`
 
 Prints the `version` and `probe` events and exits without doing any work. The GUI needs the track list before the user can choose anything, and today probing is welded to the start of a run.
 
 With `-events json` it emits JSON; without it, the human-readable track listing the tool already prints. It requires only the input path — no `-to`, no key.
+
+**`-probe`, `-version`, `-h` and the subcommands carry no terminal event.** None of them is a run: each emits `version` (and `-probe` its `probe`), exits 0, and emits no `done` and no `error`. A decoder shared between the probe call, a settings read and the run call must not wait for one.
+
+`-events json` composes with the `config` and `model` subcommands rather than being refused by them, so a wrapper can append the flag to every invocation uniformly: the flag is taken out of the arguments the subcommand itself counts, the subcommand's own plain-text output on stdout is unchanged, and the stream carries the `version` event alone. The Settings screen still reads and writes through them as text.
 
 ### Typed errors
 
@@ -83,18 +108,33 @@ Every fatal error gains a `kind` so a caller can act on it rather than match on 
 | `kind` | Raised when |
 |---|---|
 | `missing_key` | no OpenAI key in the environment or the config |
+| `invalid_key` | the endpoint rejected the key: HTTP 401 or 403 |
 | `whisper_not_found` | `whisper-cli` is neither configured nor on `PATH` |
 | `no_model` | no ggml model configured or discovered |
 | `ambiguous_model` | several models found, none chosen |
 | `no_audio_track` | the file has no audio to transcribe |
 | `no_subtitle_track` | `-source sub` on a file with none |
 | `probe_failed` | ffprobe could not read the file |
-| `rate_limited` | the translation endpoint refused everything |
+| `rate_limited` | the endpoint returned HTTP 429 for every block |
 | `transcript_empty` | the audio produced no speech |
 | `cancelled` | SIGINT or SIGTERM |
-| `other` | anything not yet classified |
+| `other` | anything not yet classified — a usage error, an unreachable endpoint, a mangled reply |
 
-The first four are what the GUI routes to its settings screen.
+The first five are what the GUI routes to its settings screen. `invalid_key` is separate from `rate_limited` because the two lead to different places: a key with a typo in it is corrected in Settings and retrying it can never succeed, while a rate limit is waited out on the Run screen. Folding them together sent the most likely first-run error to a Retry button that re-ran the whole transcription.
+
+### Revised after implementation
+
+Part 1 above is the design as built. What the build changed, and why:
+
+- **The skip rule and the captured ffmpeg stderr.** "Newline-delimited JSON on stderr" was written without reckoning with what already writes there. Four ffmpeg invocations inherited the stream, and because ffmpeg's progress lines end in a carriage return with no newline, an event emitted during one was unparseable — which destroyed the `cancelled` event on the path most likely to produce it. The decision stands (stderr, not a dedicated fd) but now comes with two obligations: skip the non-JSON lines, and let no foreign writer near the stream.
+- **`invalid_key`, and `rate_limited` narrowed to 429.** The original table had no kind for a rejected key, so a typo was reported as a rate limit and routed to a Retry button. Anything that is neither refusal — an unreachable endpoint, a reply the model mangled — is now `other`, which is honest: it is not something the GUI can route on.
+- **Five stage names, two of them new.** `extract-subs` and `mux` were invisible phases: the `-source sub` flow went `probe` → `stage translate` with nothing in between, and a container rewrite left the window reading "translate, 100%" for minutes.
+- **The exit-code table, including 2.** A usage error exits 2, which appeared nowhere in this document, and used to exit from inside the flag package before the emitter existed — so the one case version negotiation is for produced no `version` event. It now emits `version`, then `error`, then exits 2.
+- **The sample stream.** The original chained `warning → done → error`, which no run can produce. Replaced with one producible run plus the `error` alternative, because a decoder test written from the old sample would have encoded an impossible sequence as a fixture.
+- **An event never starts mid-line, and a lock alone did not achieve that.** The first attempt gave the events and the prose one mutex, which makes each write atomic; a SIGINT at an interactive prompt still glued the `cancelled` event onto the prompt's unfinished line, losing the same terminal event on the same Cancel path as the ffmpeg problem. The writer now tracks whether the last byte was a newline — a carriage return does not count — and the emitter breaks the line under the same lock.
+- **The subcommands compose with the flag.** Refusing `-events json` on `config`/`model` was tried and reversed: the flag was ignored (so effectively worked) on `config path` and `config list` before the event stream existed, and refusing it shipped a regression on an invocation a script may already hold. They join `-probe` and `-version` as invocations that emit `version` and no terminal event.
+- **`-events json` is honoured exactly where `flag.Parse` honours it.** The early argv scan that lets a parse failure be reported on the stream reads argv by the same rules the flag package is about to — it stops at the first positional argument — so `movie.mkv -events json` is ignored by both rather than by only one of them. It keeps looking past a flag the CLI does not define, because that is the case it exists for.
+- **Still open, deliberately, and smaller than it was.** SIGINT does not kill the ffmpeg child: it is reparented to PID 1 and keeps running until its next write, which now fails with EPIPE because the pipe the capture gave it has no reader left. So it dies on its own within a write or two rather than being killed outright, and — the part that mattered for the window — it no longer holds the event stream's file descriptor, so a GUI draining stderr to EOF returns as soon as the CLI exits instead of waiting for the orphan. A child that never writes again still has to be waited out, which is what process groups would fix, and that needs its own platform testing. Also open: no kind for an unwritable output path (S4), and Part 2's copy of `validateFast`'s rules (S6).
 
 ## Part 2: The window
 
@@ -181,7 +221,7 @@ The run screen replaces the card with a stage line, a progress bar and the growi
 
 ### Errors lead somewhere
 
-An `error` event with `kind` of `missing_key`, `whisper_not_found`, `no_model` or `ambiguous_model` switches to Settings, focuses the field at fault, and shows the message above it. Every other kind stays on the Run screen with the message and a Retry button.
+An `error` event with `kind` of `missing_key`, `invalid_key`, `whisper_not_found`, `no_model` or `ambiguous_model` switches to Settings, focuses the field at fault, and shows the message above it. Every other kind stays on the Run screen with the message and a Retry button.
 
 This is the owner's stated requirement: a missing key is not a failure to report, it is a setup step to complete.
 

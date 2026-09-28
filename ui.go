@@ -53,8 +53,14 @@ func readLang(r *bufio.Reader, w io.Writer, label string) (string, error) {
 
 // promptLang is the interactive wrapper used by main: it reads from the shared
 // stdin, prompts on stderr so piped stdout stays clean, and exits on failure.
+// The prompt goes through proseErr, the same serialised writer the event stream
+// uses, so an event cannot land in the middle of the question. Note that the
+// question deliberately ends without a newline — the answer is typed on the same
+// line — so the lock alone would not be enough: what makes this true is that
+// proseErr knows the stream is mid-line and the emitter breaks the line before
+// writing an event (internal/events.SyncWriter).
 func promptLang(label string) string {
-	lang, err := readLang(stdin, os.Stderr, label)
+	lang, err := readLang(stdin, proseErr, label)
 	if err != nil {
 		fatalf("%v", err)
 	}

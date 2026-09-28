@@ -15,7 +15,7 @@ Extracts the subtitle track from a video file, translates it through an OpenAI m
 
 **An OpenAI API key is required.** Translation is the one step this tool does not do locally; a run without a key refuses to start.
 
-[The Problem](#the-problem) · [Installation](#installation) · [Usage](#usage) · [Transcription](#transcription) · [Translation](#translation) · [Configuration](#configuration) · [How It Works](#how-it-works) · [Development](#development)
+[The Problem](#the-problem) · [Installation](#installation) · [Usage](#usage) · [Transcription](#transcription) · [Translation](#translation) · [Configuration](#configuration) · [Driving it from another program](#driving-it-from-another-program) · [How It Works](#how-it-works) · [Development](#development)
 
 </div>
 
@@ -115,6 +115,8 @@ Flags:
   -whisper-model path to a whisper ggml model
   -whisper-bin   path to the whisper-cli binary
   -vad-model     path to a Silero VAD model
+  -probe         list the file's tracks and exit
+  -events        emit machine-readable events on stderr: json
   -version       print version and exit
 ```
 
@@ -316,6 +318,113 @@ sub-translator config path
 | `translate.workers` | Batches translated at once. 4 when unset. |
 
 The corresponding flags — `-whisper-model`, `-whisper-bin`, `-vad-model`, `-chunk`, `-workers` — override the config for a single run.
+
+## Driving it from another program
+
+`-events json` makes the tool write newline-delimited JSON to **stderr**, one object per line, while stdout keeps the same human-readable output it has always had. Nothing changes without the flag:
+
+```bash
+sub-translator -events json -to es -source audio -fast movie.mkv 2> events.jsonl
+```
+
+**Skip the lines that are not JSON.** stderr carries this tool's own prose as well as the events, by design: the `warning:` lines, the one `error:` line, the usage text, and the interactive prompts. A consumer must therefore treat a line that does not parse as JSON as human output and ignore it, rather than treating it as a protocol error. Every line this tool writes is whole — the events and the prose share one lock, so neither can land inside the other, and an event emitted while a line is unfinished (an interactive prompt, which ends without a newline because the answer is typed on the same line) breaks that line first rather than continuing it — and the ffmpeg children's output no longer reaches stderr at all: it is captured and surfaced only in the error message of a step that failed. (The visible consequence for a person is that a run no longer prints ffmpeg's progress chatter.)
+
+Every event carries `type` and `t` (an RFC 3339 UTC timestamp). The first line of any run is always a `version` event, so a consumer can refuse a stream it does not understand rather than guess. The shape below — every event, field and omission — was verified by running a `-fast` transcription against this code:
+
+```json
+{"type":"version","t":"2026-09-27T16:49:08Z","events":1,"tool":"1.4.0"}
+{"type":"probe","t":"2026-09-27T16:49:08Z","duration":8348.674,"audio":[{"index":1,"lang":"eng","title":"Original","codec":"ac3"}],"subtitles":[]}
+{"type":"stage","t":"2026-09-27T16:49:08Z","name":"extract"}
+{"type":"stage","t":"2026-09-27T16:49:08Z","name":"transcribe","chunk":1,"of":14,"from":"0:00:00","to":"0:10:00"}
+{"type":"progress","t":"2026-09-27T16:49:09Z","pct":100}
+{"type":"language","t":"2026-09-27T16:49:09Z","detected":"en"}
+{"type":"stage","t":"2026-09-27T16:49:09Z","name":"translate","chunk":1,"of":14}
+{"type":"progress","t":"2026-09-27T16:49:09Z","pct":100}
+{"type":"saved","t":"2026-09-27T16:49:09Z","path":"/…/movie.es.srt","covers":"0:10:00","watchable":true}
+{"type":"stage","t":"2026-09-27T16:49:09Z","name":"transcribe","chunk":2,"of":14,"from":"0:10:00","to":"0:20:00"}
+{"type":"progress","t":"2026-09-27T16:49:09Z","pct":100}
+{"type":"stage","t":"2026-09-27T16:49:09Z","name":"translate","chunk":2,"of":14}
+{"type":"progress","t":"2026-09-27T16:49:09Z","pct":100}
+{"type":"saved","t":"2026-09-27T16:49:09Z","path":"/…/movie.es.srt","covers":"0:20:00","watchable":true}
+{"type":"done","t":"2026-09-27T16:49:10Z","path":"/…/movie.es.srt","covers":"2:19:08"}
+```
+
+Simplified for readability, in four ways worth knowing about: the paths and the track metadata are shortened; the run's fourteen chunks are trimmed to two; each `progress` burst is shown as the single event that ends it, where a real run emits one per batch of blocks translated and one per percentage whisper reports, so a fourteen-chunk film produces hundreds of them; and the `language` line is shown where a run that was not told `-from` emits it (the verified run named its source language, so it had nothing to report).
+
+`language` is emitted once, when whisper reports a source language that differs from the one that was asked for (including when none was asked for). Everything downstream — the transcript sidecar's filename, the translation — uses the language in that event from then on.
+
+The `stage` names are the five phases a run can go through:
+
+| `stage.name` | The phase |
+|---|---|
+| `extract` | decoding the chosen audio track to a 16 kHz WAV (`-source audio`) |
+| `extract-subs` | extracting an existing subtitle track and parsing it (`-source sub`) |
+| `transcribe` | whisper.cpp turning audio into text; carries `chunk`/`of`/`from`/`to` under `-fast` |
+| `translate` | the OpenAI round trips; carries `chunk`/`of` under `-fast` |
+| `mux` | writing the new container (`-mode mux`/`both`) |
+
+`progress` carries no stage of its own: a consumer reads it against the most recent `stage` event, which is always the one immediately before the burst.
+
+`warning` reports blocks that could not be translated and kept their original text. Its `kind` is currently always `"blocks_untranslated"` — it is there so a second kind of warning can be added without breaking a consumer — `count` is how many blocks kept their source text, and `total` is how many blocks the run produced in all (for `-fast`, the whole film's merged blocks, not one chunk's). A warning always precedes `done`, never follows it.
+
+The ordinary run (no `-fast`) emits a different, shorter sequence: `probe`, then — only when transcribing audio — a bare `stage` `extract` and a bare `stage` `transcribe` with no `chunk`/`of`/`from`/`to` at all, then `progress`, then a single bare `stage` `translate`, then `progress`, then `done` with no `covers`. Reading an existing subtitle track emits `stage` `extract-subs` instead of the two transcription stages. `-mode mux` or `both` adds a `stage` `mux` after translation. Either run may also emit a `warning` before `done`, or end in a single `error` instead of `done`.
+
+A field that does not apply to the current run is left out of the JSON rather than sent as a zero or empty string — `omitempty` in the Go source means "unknown here", not "the default":
+
+- `probe.duration` — omitted when ffprobe's own duration could not be read; never sent as `0`.
+- `stage.chunk`, `stage.of`, `stage.from`, `stage.to` — only `-fast` sets these, on the `transcribe` stage (all four) and the `translate` stage (`chunk`/`of` only); the ordinary run's stage events never carry them.
+- `done.covers` — only `-fast` knows what span of the film's own runtime is covered; the ordinary run translates whatever it parsed in one pass and has no honest value to put here.
+- `warning.first` — omitted when there is nothing to list.
+
+`-probe` prints the `version` and `probe` events (or, without `-events json`, the same human-readable track listing the tool already prints) and exits without doing any work. It needs no API key and no target language:
+
+```bash
+sub-translator -events json -probe movie.mkv
+```
+
+**`-probe`, `-version`, `-h` and the subcommands carry no terminal event.** None of them is a run: each emits `version` (and `-probe` its `probe`), exits 0, and emits no `done` and no `error`. A decoder shared between a probe call, a settings read and a run must not wait for a terminal event on those.
+
+**`-events json` composes with the `config` and `model` subcommands.** They print plain text on stdout and have no run to report, so the flag is taken out of the arguments the subcommand counts — `config get translate.model -events json` is still a one-key `get` — the stdout is identical to the same command without the flag, and the stream carries the `version` event alone:
+
+```bash
+sub-translator config get translate.model -events json
+```
+
+so a wrapper can append `-events json` to every invocation it makes, including the ones that read and write settings.
+
+**Write `-events json` before the input path.** Like every flag this tool takes, it is only read while the arguments still look like flags: `sub-translator movie.mkv -events json` treats the flag as a positional argument and emits nothing, exactly as `-to es` after the path would be ignored.
+
+Every fatal error carries a `kind` so a program can act on the reason instead of matching on wording. The message stays exactly as it is today:
+
+| `kind` | Raised when |
+|---|---|
+| `missing_key` | no OpenAI key in the environment or the config |
+| `invalid_key` | the translation endpoint rejected the key — HTTP 401 or 403 |
+| `whisper_not_found` | `whisper-cli` is neither configured nor on `PATH` |
+| `no_model` | no ggml model configured or discovered |
+| `ambiguous_model` | several models found, none chosen |
+| `no_audio_track` | `-source audio` (or `-fast`) on a file with no audio track, or `-atrack` pointing at one that doesn't exist |
+| `no_subtitle_track` | `-source sub` on a file with none, `-track` pointing at a stream that isn't a subtitle track, or `-from` matching no subtitle track's language |
+| `probe_failed` | the input file doesn't exist, or ffprobe could not read it |
+| `rate_limited` | the translation endpoint returned HTTP 429 for every block in the run |
+| `transcript_empty` | the audio produced no speech at all |
+| `cancelled` | SIGINT or SIGTERM |
+| `other` | anything not yet classified — including a usage error, an unreachable endpoint, and a reply the model mangled |
+
+`invalid_key` and `rate_limited` are deliberately separate: a key with a typo in it is fixed in the settings, and retrying it can never succeed, while a rate limit is waited out. The first five kinds in the table are the ones a wrapper takes to a settings screen.
+
+Every fatal path emits exactly one `error` event — a classified `fatalKindf` call emits its own `kind`; anything else falls through `fatalf`, which emits `other` — so a consumer driving this as a subprocess never sees a non-zero exit with silence on the wire. The single exception is `-events <anything but json>`: that exits 1 having emitted nothing, because the value being refused is the one that says how to answer. A consumer that builds its own argv never hits it; one that passes a format through from elsewhere should treat exit 1 with an empty stream as "this build does not speak that format".
+
+Exit codes, and the event that pairs with each:
+
+| Exit | Meaning | Terminal event |
+|---|---|---|
+| 0 | the run finished | one `done` — none for `-probe`, `-version`, `-h` or a subcommand |
+| 1 | a fatal error | one `error`, with the `kind` from the table above (none for an unsupported `-events` value) |
+| 2 | a usage error: an unknown flag or a bad flag value | one `error`, kind `other`, after the `version` event |
+| 130 | cancelled by SIGINT or SIGTERM | one `error`, kind `cancelled` |
+
+This is the same idea as `git status --porcelain` or `ffmpeg -progress`: a stable contract for programs, separate from the output meant for people.
 
 ## Languages
 

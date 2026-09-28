@@ -1,6 +1,11 @@
 package media
 
 import (
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -194,5 +199,128 @@ func TestSliceWAVArgsSubSecondPrecision(t *testing.T) {
 	}
 	if args[iT+1] != "0.250" {
 		t.Errorf("-t = %q, want 0.250", args[iT+1])
+	}
+}
+
+// stubFfmpeg puts a shell script named ffmpeg first on PATH for the rest of the
+// test. exec.Command resolves the name when the command is built, so the
+// environment has to be in place before the call under test runs.
+func stubFfmpeg(t *testing.T, script string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("the ffmpeg stub is a POSIX shell script")
+	}
+	binDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(binDir, "ffmpeg"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// captureProcessStderr swaps os.Stderr for a pipe and returns everything written
+// to the real file descriptor while fn runs — which is what an ffmpeg child
+// inheriting our stderr would land in.
+func captureProcessStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved := os.Stderr
+	os.Stderr = w
+	collected := make(chan string, 1)
+	go func() {
+		b, _ := io.ReadAll(r)
+		collected <- string(b)
+	}()
+	fn()
+	os.Stderr = saved
+	w.Close()
+	out := <-collected
+	r.Close()
+	return out
+}
+
+// ffmpegNoise is what a real ffmpeg writes to stderr: a banner, then progress
+// lines rewritten in place with a carriage return and no newline at all. The
+// event stream shares that file descriptor, so a JSON event emitted while one of
+// these is in flight is unparseable — which is how a cancelled run lost its only
+// terminal event.
+const ffmpegNoise = `printf 'ffmpeg version 8.1.1 Copyright (c) 2000-2026 the FFmpeg developers\n' >&2
+printf '  built with Apple clang version 21.0.0\n' >&2
+printf 'size=       0KiB time=00:00:00.00 bitrate=N/A speed=N/A    \r' >&2
+printf 'size=    7168KiB time=00:00:57.32 bitrate=1024.0kbits/s speed=  57x    \r' >&2
+`
+
+// A successful ffmpeg step must write nothing to the stream the events go to.
+func TestASuccessfulFfmpegWritesNothingToOurStderr(t *testing.T) {
+	stubFfmpeg(t, "#!/bin/sh\n"+ffmpegNoise+"out=\"\"\nfor a in \"$@\"; do out=\"$a\"; done\n: > \"$out\"\nexit 0\n")
+
+	out := filepath.Join(t.TempDir(), "audio.wav")
+	var err error
+	leaked := captureProcessStderr(t, func() {
+		err = ExtractAudio("movie.mkv", 1, out)
+	})
+	if err != nil {
+		t.Fatalf("ExtractAudio() = %v, want success", err)
+	}
+	if leaked != "" {
+		t.Errorf("ffmpeg wrote %d bytes to our stderr, want none:\n%q", len(leaked), leaked)
+	}
+}
+
+// Capturing ffmpeg's stderr must not cost the user the diagnostics: before this,
+// a failing ffmpeg explained itself only because its output was passed straight
+// through. Now the explanation travels in the error — which also puts it in front
+// of an -events json consumer, who never saw the inherited stream at all.
+func TestAFailingFfmpegsDiagnosticsTravelInTheError(t *testing.T) {
+	const diagnostic = "movie.mkv: Invalid data found when processing input"
+	stubFfmpeg(t, "#!/bin/sh\n"+ffmpegNoise+"printf '"+diagnostic+"\\n' >&2\nexit 1\n")
+
+	out := filepath.Join(t.TempDir(), "audio.wav")
+	var err error
+	leaked := captureProcessStderr(t, func() {
+		err = ExtractAudio("movie.mkv", 1, out)
+	})
+	if err == nil {
+		t.Fatal("ExtractAudio() = nil, want the stub's failure")
+	}
+	if leaked != "" {
+		t.Errorf("ffmpeg wrote %d bytes to our stderr, want none:\n%q", len(leaked), leaked)
+	}
+	for _, want := range []string{diagnostic, "ffmpeg", "exit status 1"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not carry %q", err, want)
+		}
+	}
+	// The progress chatter is the one thing worth dropping: a feature film's
+	// extraction writes thousands of those lines and they say nothing about the
+	// failure.
+	if strings.Contains(err.Error(), "size=") {
+		t.Errorf("error carries ffmpeg's progress chatter:\n%s", err)
+	}
+}
+
+// The diagnostic that matters is the last thing ffmpeg says, and on a long run it
+// arrives after thousands of carriage-return-terminated progress fragments. A
+// scan that split on newlines alone would see all of them as one line and lose
+// the diagnostic with it.
+func TestFfmpegDiagnosticsKeepsTheDiagnosticBehindTheProgressChatter(t *testing.T) {
+	var raw strings.Builder
+	raw.WriteString("ffmpeg version 8.1.1\n")
+	for i := range 5000 {
+		fmt.Fprintf(&raw, "size=%8dKiB time=00:00:00.00 speed=57x    \r", i)
+	}
+	raw.WriteString("Conversion failed!\n")
+
+	got := ffmpegDiagnostics(strings.NewReader(raw.String()))
+	if !strings.Contains(got, "Conversion failed!") {
+		t.Errorf("diagnostics lost the failure line:\n%q", got)
+	}
+	if strings.Contains(got, "size=") {
+		t.Errorf("diagnostics kept progress chatter:\n%q", got)
+	}
+	if lines := strings.Count(got, "\n") + 1; lines > ffmpegTailLines {
+		t.Errorf("diagnostics kept %d lines, want at most %d", lines, ffmpegTailLines)
 	}
 }

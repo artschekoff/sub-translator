@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 
 	"github.com/artschekoff/sub-translator/internal/config"
@@ -88,11 +87,11 @@ func pullModel(name string, out io.Writer) error {
 		}
 		if pct := int(done * 100 / total); pct != lastPct {
 			lastPct = pct
-			fmt.Fprintf(os.Stderr, "\r  progress: %d%% (%d/%d MB)   ",
+			fmt.Fprintf(proseErr, "\r  progress: %d%% (%d/%d MB)   ",
 				pct, done/(1<<20), total/(1<<20))
 		}
 	})
-	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(proseErr)
 	if err != nil {
 		return err
 	}
@@ -100,14 +99,28 @@ func pullModel(name string, out io.Writer) error {
 	return nil
 }
 
+// subcommandVerb names the subcommand argv asks for, or "" for an ordinary
+// translation run. main needs to know this before dispatching — the event
+// stream is not available to a subcommand and asking for it has to be refused
+// rather than silently swallowed as a positional argument — so the list of
+// verbs lives here, in one place, rather than once per caller.
+func subcommandVerb(args []string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	switch args[0] {
+	case "config", "model":
+		return args[0]
+	default:
+		return ""
+	}
+}
+
 // dispatchSubcommand runs a subcommand when args start with one. It reports
 // whether it handled the call, so main can fall through to normal flag parsing
 // for an ordinary translation run.
 func dispatchSubcommand(args []string, out io.Writer) (bool, error) {
-	if len(args) == 0 {
-		return false, nil
-	}
-	switch args[0] {
+	switch subcommandVerb(args) {
 	case "config":
 		return true, runConfig(args[1:], out)
 	case "model":
