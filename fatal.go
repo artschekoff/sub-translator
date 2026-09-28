@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/artschekoff/sub-translator/internal/events"
 )
@@ -58,21 +59,47 @@ func kindOf(err error) errKind {
 // string, so a message that happens to contain a percent sign (an ffmpeg
 // progress line, a model name) cannot be re-interpreted as a verb.
 func exitWith(err error) {
-	if cancelling.Load() {
-		// This is not a failure of its own: it is the child the signal handler
-		// has just killed, surfacing here as "signal: killed" while the handler
-		// is still on its way to exit 130. The cancelled event is already on the
-		// stream, so reporting this one would break the single-error-event
-		// promise, and exiting 1 would tell a wrapper the run failed rather
-		// than that the user cancelled it. End the run the way the handler is
-		// about to, and say nothing.
-		cleanupRunTmpDir()
-		os.Exit(130)
-	}
+	yieldIfCancelling()
 	ev.Emit(&events.Error{Kind: string(kindOf(err)), Message: err.Error()})
 	fmt.Fprintf(proseErr, "error: %s\n", err.Error())
 	// os.Exit skips deferred calls, so the scratch directory has to be removed
 	// here or every error path leaks it.
 	cleanupRunTmpDir()
 	os.Exit(1)
+}
+
+// yieldIfCancelling hands the ending to the signal handler when a cancel is
+// already in flight, and returns immediately when there is none.
+//
+// Whatever reached it is not a run of its own any more. Either it is the child
+// the handler has just killed, surfacing as "signal: killed", or it is a run
+// that happened to finish in the same instant; either way the cancelled event is
+// already on the stream — the handler raises the flag only after emitting it —
+// so a second terminal event here would break the one-terminal-event promise,
+// and exiting 1 or 0 would tell a wrapper the run failed or succeeded rather
+// than that the user cancelled it.
+//
+// So it waits for the handler rather than racing it. That also keeps the handler
+// the only place the scratch directory is removed, so it cannot go while the
+// children are still being killed. The wait is bounded, because a handler wedged
+// in os.RemoveAll must not hang the process forever: if it ever elapses, this
+// ends the run the way the handler would have, in the same order.
+func yieldIfCancelling() {
+	if !cancelling.Load() {
+		return
+	}
+	time.Sleep(cancelHandoffTimeout)
+	shutdownAfterCancel()
+	os.Exit(130)
+}
+
+// emitDone is the success twin of exitWith: the one place a run's terminal done
+// event is written, so the check that has to come before it is written once
+// instead of at all four success returns. Without it, a cancel arriving in a
+// run's last milliseconds put a cancelled event and a done event on the same
+// stream and exited 0 — two terminal events, and the one a Cancel button
+// believes is whichever it read last.
+func emitDone(d *events.Done) {
+	yieldIfCancelling()
+	ev.Emit(d)
 }

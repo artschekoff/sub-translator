@@ -411,7 +411,7 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 			Total: len(outBlocks),
 			First: first,
 		})
-		ev.Emit(&events.Done{Path: outPath, Covers: formatClock(total)})
+		emitDone(&events.Done{Path: outPath, Covers: formatClock(total)})
 		notifyDone("Subtitles ready, with gaps",
 			fmt.Sprintf("%s — %d blocks untranslated", filepath.Base(outPath), len(failedAll)))
 		return nil
@@ -419,7 +419,7 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 
 	fmt.Printf("Done: %s covers the full %s — reload subtitles in your player\n",
 		outPath, formatClock(total))
-	ev.Emit(&events.Done{Path: outPath, Covers: formatClock(total)})
+	emitDone(&events.Done{Path: outPath, Covers: formatClock(total)})
 	notifyDone("Subtitles ready", filepath.Base(outPath))
 	return nil
 }

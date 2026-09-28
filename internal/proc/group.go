@@ -5,12 +5,12 @@
 // keep working — a full ffmpeg pass over a feature film, continuing after the
 // user pressed Cancel. Capturing their stderr means an orphan dies of EPIPE on
 // its next write, but a child that never writes again is not reached by that at
-// all. So each child is put in a process group of its own before it starts, and
-// the signal handler kills those groups outright.
+// all. So each child is started in a process group of its own, and the signal
+// handler kills those groups outright.
 //
-// Detach and KillGroup are per-platform (group_unix.go, group_windows.go); the
-// registry they both feed is here, because there is nothing platform-specific
-// about a slice.
+// Start and KillAllGroups are here; the two operations that have no
+// cross-platform spelling — putting a child in its own group, and killing that
+// group — are in group_unix.go and group_windows.go.
 package proc
 
 import (
@@ -18,46 +18,55 @@ import (
 	"sync"
 )
 
-// The concurrency contract: started is appended to by whichever goroutine is
-// launching a child and read by the signal handler's goroutine, which is
-// always a different one, so every touch of the slice goes through mu.
+// The concurrency contract, and the reason Start exists instead of a bare
+// Detach the caller follows with its own cmd.Start:
 //
-// What mu cannot order is cmd.Process. os/exec sets that field inside Start,
-// after Detach has handed the command back, and nothing here can synchronise
-// with it. A child whose Start has not finished when the signal lands is
-// therefore skipped. The window is the width of a fork and what it costs is the
-// orphan this package exists to prevent — the behaviour without this package at
-// all, never anything worse.
+// groups is appended to by whichever goroutine is launching a child and read by
+// the signal handler's goroutine, which is always a different one. mu orders
+// those, but a mutex around the slice would not be enough if the slice held
+// *exec.Cmd: os/exec writes cmd.Process inside Start and cmd.ProcessState
+// inside Wait, and a handler reading either would be a data race — undefined,
+// not merely unlucky. So Start does the whole launch under mu and records the
+// pid, an int copied while the lock is held. The handler reads ints and nothing
+// else, and no child can be half-started as far as the registry is concerned:
+// either it is in and killable, or Start has not returned and there is no
+// process yet.
 var (
-	mu      sync.Mutex
-	started []*exec.Cmd
+	mu     sync.Mutex
+	groups []int
 )
 
-// register records a detached command so KillAllGroups can find it later.
-func register(cmd *exec.Cmd) {
+// Start puts cmd's child in a process group of its own, starts it, and records
+// the group so KillAllGroups can find it. It is the only way this program
+// starts a subprocess it may later have to kill, and it replaces cmd.Start at
+// the call site.
+//
+// The group attributes have to be set before the fork and the pid only exists
+// after it, which is why this is one call rather than two: holding mu across
+// the whole launch is what keeps the registry free of half-started children.
+func Start(cmd *exec.Cmd) error {
 	mu.Lock()
 	defer mu.Unlock()
-	started = append(started, cmd)
+
+	detach(cmd)
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	groups = append(groups, cmd.Process.Pid)
+	return nil
 }
 
-// KillAllGroups kills the process group of every child detached this run that
-// is still running. It is what the signal handler calls, and it has to run
-// before the scratch directory is removed: a surviving ffmpeg would go on
-// writing into a directory being deleted underneath it.
+// KillAllGroups kills the process group of every child started this run. It is
+// what the signal handler calls, and it has to run before the scratch directory
+// is removed: a surviving ffmpeg would go on writing into a directory being
+// deleted underneath it.
 func KillAllGroups() {
 	mu.Lock()
-	live := make([]*exec.Cmd, len(started))
-	copy(live, started)
+	live := make([]int, len(groups))
+	copy(live, groups)
 	mu.Unlock()
 
-	for _, cmd := range live {
-		// ProcessState is non-nil only once Wait has reaped the child. Skipping
-		// those is more than tidiness: the kernel is free to hand a reaped pid
-		// to somebody else, and killing a recycled process group would kill a
-		// stranger.
-		if cmd.Process == nil || cmd.ProcessState != nil {
-			continue
-		}
-		_ = KillGroup(cmd)
+	for _, pid := range live {
+		_ = KillGroup(pid)
 	}
 }

@@ -139,10 +139,10 @@ func Run(o Options, progress func(pct int)) (Result, error) {
 	cmd.Stdout = io.Discard
 
 	// A transcription is the longest thing this program starts, so it is the
-	// child most worth being able to kill: in its own process group it goes
-	// when the run is cancelled instead of transcribing on alone.
-	proc.Detach(cmd)
-	if err := cmd.Start(); err != nil {
+	// child most worth being able to kill: proc.Start gives it a process group
+	// of its own, so it goes when the run is cancelled instead of transcribing
+	// on alone.
+	if err := proc.Start(cmd); err != nil {
 		return Result{}, fmt.Errorf("whisper: %w", err)
 	}
 

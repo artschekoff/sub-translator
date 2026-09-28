@@ -8,32 +8,35 @@ import (
 	"syscall"
 )
 
-// Detach puts cmd's child in a process group of its own and records it for
-// KillAllGroups. It must be called before cmd.Start: SysProcAttr is read while
-// the process is being forked, and setting it afterwards does nothing at all.
-func Detach(cmd *exec.Cmd) {
-	if cmd == nil {
-		return
-	}
+// detach asks for a process group of its own for the child cmd is about to
+// fork. Setpgid with no Pgid makes the child the leader of a brand-new group,
+// so the group id is the child's own pid — which is what Start records and
+// KillGroup kills.
+//
+// It has to happen before the fork: SysProcAttr is read while the process is
+// being created, and setting it afterwards does nothing at all.
+func detach(cmd *exec.Cmd) {
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
-	// Setpgid with no Pgid makes the child the leader of a brand-new group, so
-	// the group id is the child's own pid.
 	cmd.SysProcAttr.Setpgid = true
-	register(cmd)
 }
 
-// KillGroup kills every process in cmd's group — the child and anything it
-// spawned — rather than the child alone, which is the whole point of detaching
-// it. A group that is already gone is the outcome being asked for, not a
-// failure, so ESRCH comes back as success.
-func KillGroup(cmd *exec.Cmd) error {
-	if cmd == nil || cmd.Process == nil {
+// KillGroup kills every process in the group pid leads — the child and anything
+// it spawned — rather than the child alone, which is the whole point of
+// detaching it. A group that is already gone is the outcome being asked for,
+// not a failure.
+func KillGroup(pid int) error {
+	// Two things at once: pid is alive, and it really is a group leader, so
+	// -pid names its own group and not one it merely belongs to. The second
+	// half matters because the registry holds nothing but ints — a pid the
+	// kernel has already reaped and handed to somebody else would otherwise be
+	// a stranger's group to kill.
+	if pgid, err := syscall.Getpgid(pid); err != nil || pgid != pid {
 		return nil
 	}
 	// A negative pid is kill(2)'s way of naming a process group.
-	if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil {
+	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil {
 		if errors.Is(err, syscall.ESRCH) {
 			return nil
 		}

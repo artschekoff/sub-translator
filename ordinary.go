@@ -339,7 +339,7 @@ func runOrdinary(o ordinaryOptions) error {
 		fmt.Println("Done.")
 		// !writesContainer() implies writesSRT() (mode.go), so srtOut was set
 		// just above — the file the "Done." line refers to.
-		ev.Emit(&events.Done{Path: srtOut})
+		emitDone(&events.Done{Path: srtOut})
 		return nil
 	}
 
@@ -371,6 +371,6 @@ func runOrdinary(o ordinaryOptions) error {
 		return kindErrf(errOutputUnwritable, "mux: %v", err)
 	}
 	fmt.Printf("Done: %s\n", outMKV)
-	ev.Emit(&events.Done{Path: outMKV})
+	emitDone(&events.Done{Path: outMKV})
 	return nil
 }

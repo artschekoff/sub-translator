@@ -24,6 +24,7 @@ import (
 	"github.com/artschekoff/sub-translator/internal/config"
 	"github.com/artschekoff/sub-translator/internal/events"
 	"github.com/artschekoff/sub-translator/internal/media"
+	"github.com/artschekoff/sub-translator/internal/proc"
 	"github.com/artschekoff/sub-translator/internal/translate"
 	"github.com/artschekoff/sub-translator/internal/whisper"
 )
@@ -2670,6 +2671,162 @@ JSON`)
 			}
 		})
 	}
+}
+
+// The one ordering the brief spelled out, and the one thing a comment cannot
+// enforce: the children die before the scratch directory they are writing into is
+// removed. Swapping the two calls in shutdownAfterCancel left the whole main
+// package green when this was written, which is why the ordering gets a test of
+// its own rather than a sentence.
+//
+// The child creates a file in the scratch directory over and over, which is the
+// observable shape of what ffmpeg does there. If it is still alive when
+// os.RemoveAll walks the directory, it drops another entry in behind the walk and
+// the final rmdir fails with ENOTEMPTY — the leaked scratch directory a real
+// cancel in the wrong order leaves behind, and the error os.RemoveAll returns is
+// discarded by design.
+func TestACancelKillsTheChildrenBeforeRemovingTheScratchDirectory(t *testing.T) {
+	dir, err := os.MkdirTemp("", "sub-translator-ordering-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+
+	restore := runTmpDir
+	runTmpDir = dir
+	t.Cleanup(func() { runTmpDir = restore })
+
+	cmd := exec.Command("sh", "-c",
+		`i=0; while [ $i -lt 200000 ]; do : > "$1/f$i"; i=$((i+1)); done`, "sh", dir)
+	if err := proc.Start(cmd); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait until it is genuinely writing, so the assertion is not made against a
+	// child that has not reached the directory yet.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if names, err := os.ReadDir(dir); err == nil && len(names) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the child never wrote into the scratch directory")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	shutdownAfterCancel()
+
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		names, _ := os.ReadDir(dir)
+		t.Errorf("the scratch directory survived the cancel holding %d entries: "+
+			"the child was still writing into it while it was being removed", len(names))
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Error("the child outlived the cancel by five seconds")
+	}
+}
+
+// The cancel has to beat every other ending a run can have, and the two that can
+// reach the exit after it are a failure (exitWith) and a success (emitDone). The
+// e2e cancellation test covers this only by winning a scheduling race — with the
+// guard disabled it went green 32 times in 33 — so the branch is tested here
+// directly instead, deterministically, one subprocess per ending.
+func TestACancelInFlightWinsOverAnyOtherEnding(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		// mode is handed to the child half below.
+		mode string
+		// what a wrapper must see: the exit code, and how many of each terminal
+		// event reached the stream.
+		wantCode   int
+		wantErrors int
+		wantDones  int
+	}{
+		{
+			name: "a killed child surfacing as a failure",
+			mode: "error-while-cancelling", wantCode: 130, wantErrors: 0, wantDones: 0,
+		},
+		{
+			name: "a run that finished in the same instant",
+			mode: "done-while-cancelling", wantCode: 130, wantErrors: 0, wantDones: 0,
+		},
+		{
+			name: "the same failure with no cancel in flight",
+			mode: "error-alone", wantCode: 1, wantErrors: 1, wantDones: 0,
+		},
+		{
+			name: "the same success with no cancel in flight",
+			mode: "done-alone", wantCode: 0, wantErrors: 0, wantDones: 1,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd := exec.Command(os.Args[0], "-test.run=^TestCancelHandoffChild$")
+			cmd.Env = append(os.Environ(), "SUB_TRANSLATOR_CANCEL_HANDOFF="+tt.mode)
+			var stderr bytes.Buffer
+			cmd.Stdout = io.Discard
+			cmd.Stderr = &stderr
+
+			code := 0
+			if err := cmd.Run(); err != nil {
+				var exit *exec.ExitError
+				if !errors.As(err, &exit) {
+					t.Fatalf("running the child half: %v", err)
+				}
+				code = exit.ExitCode()
+			}
+
+			if code != tt.wantCode {
+				t.Errorf("exit status %d, want %d\n%s", code, tt.wantCode, stderr.String())
+			}
+			if got := eventsOfKind(stderr.String(), "error"); len(got) != tt.wantErrors {
+				t.Errorf("%d error events, want %d\n%s", len(got), tt.wantErrors, stderr.String())
+			}
+			if got := eventsOfKind(stderr.String(), "done"); len(got) != tt.wantDones {
+				t.Errorf("%d done events, want %d\n%s", len(got), tt.wantDones, stderr.String())
+			}
+		})
+	}
+}
+
+// TestCancelHandoffChild is the child half of the test above: it runs in a
+// subprocess of this test binary, because the branch under test ends in os.Exit
+// and nothing in-process survives that.
+func TestCancelHandoffChild(t *testing.T) {
+	mode := os.Getenv("SUB_TRANSLATOR_CANCEL_HANDOFF")
+	if mode == "" {
+		t.Skip("the child half of TestACancelInFlightWinsOverAnyOtherEnding")
+	}
+	ev = events.New(proseErr)
+	// There is no signal handler in this process, so the handoff wait is what
+	// elapses rather than the handler's own exit arriving first. Shortened so
+	// each case costs milliseconds instead of five seconds.
+	cancelHandoffTimeout = 50 * time.Millisecond
+
+	switch mode {
+	case "error-while-cancelling":
+		cancelling.Store(true)
+		exitWith(kindErrf(errProbeFailed, "ffmpeg: signal: killed"))
+	case "error-alone":
+		exitWith(kindErrf(errProbeFailed, "ffmpeg: signal: killed"))
+	case "done-while-cancelling":
+		cancelling.Store(true)
+		emitDone(&events.Done{Path: "/tmp/subtitles.srt"})
+	case "done-alone":
+		emitDone(&events.Done{Path: "/tmp/subtitles.srt"})
+		os.Exit(0)
+	default:
+		t.Fatalf("unknown mode %q", mode)
+	}
+	// Only a branch that failed to exit reaches this.
+	fmt.Fprintf(proseErr, "the child returned from mode %s without exiting\n", mode)
+	os.Exit(99)
 }
 
 // The failure side of the exit-code/terminal-event pairing is well covered; the

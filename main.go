@@ -42,6 +42,12 @@ var runTmpDir string
 // makes the cancel the only ending a cancelled run can have.
 var cancelling atomic.Bool
 
+// cancelHandoffTimeout is how long the main goroutine waits for the signal
+// handler to finish a cancel before ending the run itself. The handler's own
+// exit normally lands first and this never elapses; it exists so a handler
+// wedged in os.RemoveAll cannot hang the process forever. A test shortens it.
+var cancelHandoffTimeout = 5 * time.Second
+
 // ev carries the machine-readable event stream. It is disabled unless
 // -events json is passed, and Emit is a no-op when disabled, so the call sites
 // below need no guards.
@@ -78,16 +84,31 @@ func setupRunTmpDir() {
 		// Raised only now: everything downstream of it is entitled to assume
 		// the cancelled event is already on the stream.
 		cancelling.Store(true)
-		// Before the scratch directory goes, not after: a surviving ffmpeg
-		// would go on writing into a directory being deleted underneath it,
-		// and on a feature film that pass runs for minutes after the user
-		// pressed Cancel. The signal reaches this process alone — the children
-		// are reparented to PID 1 — so nothing but this kills them.
-		proc.KillAllGroups()
-		cleanupRunTmpDir()
+		shutdownAfterCancel()
 		// 128 + SIGINT: the shell convention for "terminated by a signal".
 		os.Exit(130)
 	}()
+}
+
+// shutdownAfterCancel is the order a cancelled run turns on: the children die
+// first, and only then does the scratch directory they were writing into go.
+// The signal reaches this process alone — the children are reparented to PID 1 —
+// so nothing but KillAllGroups kills them.
+//
+// Reversed, a still-live ffmpeg goes on writing into a directory being deleted
+// underneath it. On Unix it does not even fail: the unlinked file stays writable
+// through the open fd, so it fills a gigabyte nobody can reach by name, while
+// os.RemoveAll races the child's next open(O_CREAT) and can return with the
+// directory still there. On a feature film the symptom — a leaked scratch
+// directory and disk churn after Cancel — is indistinguishable from the bug this
+// whole change was made to fix.
+//
+// It is a named function rather than two lines inside the handler so that a test
+// can hold it to that order. Swap the two calls and
+// TestACancelKillsTheChildrenBeforeRemovingTheScratchDirectory goes red.
+func shutdownAfterCancel() {
+	proc.KillAllGroups()
+	cleanupRunTmpDir()
 }
 
 func cleanupRunTmpDir() {

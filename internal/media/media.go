@@ -32,6 +32,14 @@ type ProbeResult struct {
 	} `json:"format"`
 }
 
+// The three ffprobe calls in this file — here, in ContainerDuration and in
+// WAVDuration — deliberately do not go through proc.Start, although every ffmpeg
+// here does. They are bounded metadata reads: they write nothing, they hold no
+// handle on the run's scratch directory, and .Output() waits for them before it
+// returns, so the worst an orphaned one can cost is a metadata read's worth of
+// CPU. Staying in the CLI's own process group also means a terminal Ctrl-C
+// reaches them directly, by kernel delivery, rather than by way of our handler.
+// The children worth the machinery are the ones that run for minutes.
 func Probe(path string) ([]Stream, error) {
 	out, err := exec.Command("ffprobe",
 		"-v", "quiet",
@@ -150,11 +158,11 @@ func runFFmpeg(cmd *exec.Cmd, report func(time.Duration)) error {
 	if err != nil {
 		return fmt.Errorf("ffmpeg: %w", err)
 	}
-	// Every ffmpeg this package runs comes through here — the subtitle
-	// extraction, the audio extraction, the mux and each -fast slice — so this
-	// one call is what makes all four killable when a run is cancelled.
-	proc.Detach(cmd)
-	if err := cmd.Start(); err != nil {
+	// proc.Start, not cmd.Start: the child gets a process group of its own so a
+	// cancelled run can kill it. Every ffmpeg this package runs comes through
+	// here — the subtitle extraction, the audio extraction, the mux and each
+	// -fast slice — so this one call covers all four.
+	if err := proc.Start(cmd); err != nil {
 		return fmt.Errorf("ffmpeg: %w", err)
 	}
 	// Drained to EOF before Wait: StderrPipe's contract, and the pipe filling up
