@@ -67,17 +67,36 @@ var ev *events.Emitter
 // each one is whole.
 var proseErr = events.NewSyncWriter(os.Stderr)
 
-// setupRunTmpDir creates the run-scoped scratch directory and arms the signal
-// handler that removes it. Go's default SIGINT disposition terminates the
-// process outright, so a deferred cleanup never runs when a user aborts a
-// twenty-minute transcription with Ctrl-C.
+// setupRunTmpDir creates the run-scoped scratch directory. The handler that
+// removes it is armed separately and earlier, by armCancelHandler, and it
+// tolerates an empty runTmpDir for exactly that reason.
 func setupRunTmpDir() {
 	dir, err := os.MkdirTemp("", "sub-translator-*")
 	if err != nil {
 		fatalf("create temp dir: %v", err)
 	}
 	runTmpDir = dir
+}
 
+// armCancelHandler takes SIGINT and SIGTERM off Go's default disposition, which
+// terminates the process outright: a deferred cleanup never runs when a user
+// aborts a twenty-minute transcription with Ctrl-C, and a consumer sees no
+// terminal event and a wait status of "signalled" rather than exit 130 — which
+// appears nowhere in the documented exit-code table.
+//
+// It is called as early as there is anything honest to say, which is as soon as
+// -events has been read off argv and the emitter exists: everything after that
+// point — parsing the mode and the source, loading the config, stat-ing the
+// input, -probe's own ffprobe, validating the translation settings — used to run
+// under the default disposition, and -probe on a damaged file can sit in ffprobe
+// for a while. Arming it any earlier would buy exit 130 with nothing on the
+// stream, which is a different contract violation rather than a fix.
+//
+// What is left is the argv scan itself: a few string comparisons with no syscall
+// in them, before the emitter could exist at all. The handler is armed before the
+// scratch directory is created, so cleanupRunTmpDir has to tolerate an empty
+// runTmpDir — it does, and that is the only coupling between the two.
+func armCancelHandler() {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -337,6 +356,13 @@ func main() {
 		ev = events.New(proseErr)
 		ev.Emit(&events.Version{Events: events.ProtocolVersion, Tool: version})
 	}
+
+	// Armed here, not with the scratch directory further down: everything between
+	// the two — Parse, the mode and source checks, config.Load, the input's stat,
+	// -probe's ffprobe, the translate-options check — otherwise ran under Go's
+	// default SIGINT disposition and ended the process by signal, with no
+	// terminal event and no exit 130.
+	armCancelHandler()
 
 	// ContinueOnError, so a usage error comes back here rather than exiting
 	// inside the flag package: flag has already printed its message and the

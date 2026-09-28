@@ -2539,6 +2539,79 @@ JSON`)
 	})
 }
 
+// A cancel used to be reportable only once the run's scratch directory existed,
+// because that is where the handler was armed. Everything before it — flag
+// parsing, the mode and source checks, config.Load, the input's stat, -probe's
+// own ffprobe, the translation-settings check — ran under Go's default SIGINT
+// disposition, which terminates the process by the signal: a consumer saw zero
+// terminal events and a wait status of "signalled", whose ExitCode() is -1 and
+// which appears nowhere in the documented exit-code table.
+//
+// -probe is the widest part of that window and the easiest to hold open
+// deterministically: ffprobe can run long on a damaged file, so the stub here
+// announces itself and then sleeps, and the cancel is sent once it has. The run
+// must report that cancel the way any other cancel is reported — one
+// error{cancelled} and exit 130 — rather than dying by signal.
+func TestACancelBeforeTheRunsSetupWorkStillExits130(t *testing.T) {
+	bin := buildCLI(t)
+	dir := t.TempDir()
+
+	binDir := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	started := filepath.Join(dir, "ffprobe-started")
+	writeStub(t, filepath.Join(binDir, "ffprobe"), "#!/bin/sh\ntouch "+started+"\nsleep 10\nexit 1\n")
+
+	film := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(film, []byte("not a film"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(bin, "-events", "json", "-probe", film)
+	cmd.Env = append(os.Environ(),
+		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"XDG_CONFIG_HOME="+filepath.Join(dir, "cfg"),
+		"OPENAI_API_KEY=",
+	)
+	cmd.Stdout = io.Discard
+	stderr := startWithPipedStderr(t, cmd)
+
+	// Inside the probe, so the cancel lands before anything the old arming point
+	// could have covered — there is no scratch directory on this path at all.
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		if _, err := os.Stat(started); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the stub ffprobe never ran:\n%s", stderr.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := cmd.Process.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+
+	runErr := cmd.Wait()
+	var exit *exec.ExitError
+	if !errors.As(runErr, &exit) {
+		t.Fatalf("want a non-zero exit, got %v\n%s", runErr, stderr.String())
+	}
+	if code := exit.ExitCode(); code != 130 {
+		// -1 is what a process terminated by a signal reports, and it is the
+		// original defect: no row of the exit-code table describes it.
+		t.Errorf("exit status %d, want 130 (a signalled process reports -1)\n%s", code, stderr.String())
+	}
+	errs := eventsOfKind(stderr.String(), "error")
+	if len(errs) != 1 {
+		t.Fatalf("%d error events, want exactly one:\n%s", len(errs), stderr.String())
+	}
+	if kind, _ := errs[0]["kind"].(string); kind != string(errCancelled) {
+		t.Errorf("error kind = %q, want %q", kind, errCancelled)
+	}
+}
+
 // waitForEvent polls a stderr file until it carries a line with the given
 // substring, which is how a test knows a subprocess has reached a stage without
 // guessing at a sleep.
@@ -3095,6 +3168,7 @@ func TestCancelHandoffChild(t *testing.T) {
 		// The cancel-arrives-second modes need a real armed handler: the whole
 		// question is what the handler does when it finds the ending already
 		// written.
+		armCancelHandler()
 		setupRunTmpDir()
 	}
 	// There is no signal handler in this process, so the handoff wait is what

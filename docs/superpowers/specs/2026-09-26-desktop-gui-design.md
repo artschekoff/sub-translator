@@ -93,6 +93,8 @@ Exit codes, and the terminal event each pairs with:
 | 2 | a usage error: an unknown flag or a bad flag value | one `error`, kind `other`, after `version` |
 | 130 | cancelled by SIGINT or SIGTERM | one `error`, kind `cancelled` |
 
+The handler that reports a cancel is armed as soon as `-events` has been read off argv — before the mode and source checks, `config.Load`, the input's `os.Stat`, `-probe`'s own ffprobe and the translation-settings check — so a cancel during any of them is reported the same way as any other: one `error` with kind `cancelled`, and exit 130. All of that used to run under Go's default SIGINT disposition, which terminates the process by the signal: no terminal event, and a wait status whose `ExitCode()` is `-1`, matching no row above. What is left is the argv scan itself, a few string comparisons with no syscall in them, before the emitter could exist to answer in.
+
 The exit code is always the one the single terminal event pairs with, so the two can never disagree and the stream alone says what happened. That is what settles the case a Cancel button reaches most often — the user pressing it in the second the run finishes. The cancel arrives after the `done` is already on the wire, adds no second terminal event, and the run **exits 0**: the work completed, the file `done` names is complete on disk, and there was nothing left to cancel. A cancel arriving after an `error` exits 1 for the same reason. 130 is reserved for a cancel that is genuinely the run's ending, which is the only case in which `error{cancelled}` is emitted at all.
 
 The GUI routes on the `kind` and falls back to the exit code, never the other way round.
