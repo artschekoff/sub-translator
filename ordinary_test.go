@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/artschekoff/sub-translator/internal/events"
@@ -175,5 +176,143 @@ func TestRunOrdinaryEndsInOneDoneEvent(t *testing.T) {
 	}
 	if n := len(eventsOfKind(stream.String(), "error")); n != 0 {
 		t.Errorf("%d error events on a successful run, want none:\n%s", n, stream.String())
+	}
+}
+
+// TestAnUnwritableOutputPathIsClassified drives a run whose -out lands inside a
+// directory this process cannot write to, and asserts the failure carries
+// errOutputUnwritable rather than errOther: the GUI picks this path, so it is
+// the one write failure a user can fix by choosing somewhere else, and the GUI
+// needs the kind to say so.
+func TestAnUnwritableOutputPathIsClassified(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits do not apply on Windows")
+	}
+	dir := t.TempDir()
+	binDir := subtitleSourceStubs(t, dir, subtitleTrackSRT)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	stubTranslator(t, nil)
+
+	input := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(input, []byte("not really a film"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tmpDir := filepath.Join(dir, "scratch")
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	locked := filepath.Join(dir, "locked")
+	if err := os.Mkdir(locked, 0o500); err != nil { // readable, not writable
+		t.Fatal(err)
+	}
+	// t.TempDir's own cleanup has to be able to remove this directory's
+	// contents, which needs write permission restored first.
+	t.Cleanup(func() { os.Chmod(locked, 0o700) })
+	out := filepath.Join(locked, "out.srt")
+
+	saved := ev
+	t.Cleanup(func() { ev = saved })
+	ev = events.New(&bytes.Buffer{})
+
+	var err error
+	stdout := captureStdout(t, func() {
+		err = runOrdinary(ordinaryOptions{
+			input:  input,
+			tmpDir: tmpDir,
+			from:   "en",
+			to:     "es",
+			source: sourceSub,
+			track:  0,
+			atrack: -1,
+			mode:   modeSRT,
+			out:    out,
+			translateOpts: translate.Options{
+				APIKey:  "sk-test",
+				Model:   translate.DefaultModel,
+				Workers: 4,
+			},
+		})
+	})
+
+	if err == nil {
+		t.Fatalf("runOrdinary() = nil, want an error — %s is not writable\n%s", locked, stdout)
+	}
+	if got, want := kindOf(err), errOutputUnwritable; got != want {
+		t.Errorf("kindOf(err) = %q, want %q\nerror: %v", got, want, err)
+	}
+	// srt.Write fails at the CreateTemp step — locked has no write permission at
+	// all, so it cannot even start the file it would later rename onto out — and
+	// the resulting message names that temp file inside locked rather than out
+	// itself. It still names the directory the user chose, which is the part a
+	// person acts on.
+	if !strings.Contains(err.Error(), locked) {
+		t.Errorf("err.Error() = %q, want it to name the path %q", err.Error(), locked)
+	}
+}
+
+// TestScratchWritesAreNotOutputWrites asserts that a failure writing the run's
+// own scratch SRT — never a path the user chose — stays errOther. Classifying
+// it as errOutputUnwritable would make the kind a lie: the GUI's "choose
+// somewhere else" has nothing to offer for a path it never showed anyone.
+//
+// -mode mux is what reaches the scratch write: it is the one write that
+// happens before the sidecar write (writesSRT() is false for modeMux, so that
+// site is skipped) and before the mux itself, which this test never reaches.
+// The scratch path, tmpDir/translated.srt, is pre-created as a directory so
+// srt.Write's rename onto it fails without touching tmpDir's own permissions —
+// which would also fail the earlier, unrelated source.srt extraction write and
+// prove nothing about the site this test is after.
+func TestScratchWritesAreNotOutputWrites(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX rename-onto-a-directory semantics do not apply on Windows")
+	}
+	dir := t.TempDir()
+	binDir := subtitleSourceStubs(t, dir, subtitleTrackSRT)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	stubTranslator(t, nil)
+
+	input := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(input, []byte("not really a film"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tmpDir := filepath.Join(dir, "scratch")
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Stand in the way of the scratch write: srt.Write renames a temp file onto
+	// this path, and a rename onto an existing directory fails.
+	if err := os.Mkdir(filepath.Join(tmpDir, "translated.srt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	saved := ev
+	t.Cleanup(func() { ev = saved })
+	ev = events.New(&bytes.Buffer{})
+
+	var err error
+	stdout := captureStdout(t, func() {
+		err = runOrdinary(ordinaryOptions{
+			input:  input,
+			tmpDir: tmpDir,
+			from:   "en",
+			to:     "es",
+			source: sourceSub,
+			track:  0,
+			atrack: -1,
+			mode:   modeMux,
+			translateOpts: translate.Options{
+				APIKey:  "sk-test",
+				Model:   translate.DefaultModel,
+				Workers: 4,
+			},
+		})
+	})
+
+	if err == nil {
+		t.Fatalf("runOrdinary() = nil, want an error — the scratch path is a directory\n%s", stdout)
+	}
+	if got, want := kindOf(err), errOther; got != want {
+		t.Errorf("kindOf(err) = %q, want %q — the user never chose this path\nerror: %v", got, want, err)
 	}
 }

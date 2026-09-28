@@ -610,10 +610,20 @@ var errEmptyTranscript = errors.New("transcript is empty — the audio track may
 // away in a fmt.Errorf, where no prefix matcher could recover it — which is
 // why the wrapped sentinels are the thing being matched now.
 //
+// The kindOf check above the switch is the same recovery for a site that
+// already built a classified error with kindErrf — the per-chunk output write
+// in progressive.go — rather than one more sentinel to add to it: fail wraps
+// with %w, so the kind survives the trip through here, and this must run
+// before the switch below or classifyTranscribeErr would relabel it "other"
+// exactly as its own doc paragraph describes.
+//
 // Everything else that can reach these paths — an extract, parse or whisper
 // failure — is not one of the kinds a caller can act on, hence the false
 // return: those stay a plain, unclassified fatalf.
 func classifyTranscribeErr(err error) (errKind, bool) {
+	if kind := kindOf(err); kind != errOther {
+		return kind, true
+	}
 	switch {
 	case errors.Is(err, errEmptyTranscript):
 		return errTranscriptEmpty, true

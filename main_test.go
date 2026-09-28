@@ -1954,6 +1954,53 @@ func TestBothRunPathsClassifyARefusedTranslation(t *testing.T) {
 	})
 }
 
+// TestTheFastPathClassifiesAnUnwritableOutputPath is the -fast counterpart of
+// TestAnUnwritableOutputPathIsClassified: runProgressive's own per-chunk write
+// now builds a kindErrf(errOutputUnwritable, …) error, but that error still has
+// to survive the trip back through runOrdinary's o.fast branch, which used to
+// flatten every unrecognised failure out of runProgressive to "other" via
+// errf("%v", err) — exactly the same loss classifyTranscribeErr's own doc
+// comment already describes for the sentinels above. classifyTranscribeErr now
+// checks kindOf(err) before falling through to the switch, which is what this
+// asserts directly, the same way the sibling subtests above assert the
+// existing sentinels survive that switch.
+func TestTheFastPathClassifiesAnUnwritableOutputPath(t *testing.T) {
+	dir, binDir, tmpDir, _ := progressiveStubs(t, dialogueSRT)
+	stubTranslator(t, nil)
+
+	input := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(input, []byte("not really a film"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	streams := []media.Stream{{Index: 0, CodecType: "video"}, {Index: 1, CodecType: "audio"}}
+	streams[1].Tags.Language = "eng"
+	opts := whisper.Options{
+		Bin:   filepath.Join(binDir, "stub-whisper"),
+		Model: filepath.Join(dir, "ggml-test.bin"),
+	}
+
+	// runProgressive is handed "" for out, so it writes the same default sidecar
+	// path media.DefaultSRTPath computes. Pre-creating a directory there makes
+	// the first chunk's write fail without needing real filesystem permissions.
+	outPath := media.DefaultSRTPath(input, "es")
+	if err := os.Mkdir(outPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	err := runProgressive(input, tmpDir, streams, -1, "en", "es",
+		10*time.Minute, opts, translate.Options{}, "")
+	if err == nil {
+		t.Fatal("runProgressive() = nil, want an error — the output path is a directory")
+	}
+	kind, ok := classifyTranscribeErr(err)
+	if !ok {
+		t.Fatalf("classifyTranscribeErr(%v) = (%q, false), want a classified kind", err, kind)
+	}
+	if kind != errOutputUnwritable {
+		t.Errorf("classifyTranscribeErr(%v) = %q, want %q", err, kind, errOutputUnwritable)
+	}
+}
+
 // The ordinary run's translate failure is the one classification a real binary
 // can be driven into with a genuine connection failure rather than a status
 // refusal: OPENAI_BASE_URL (Task 1) is pointed at 127.0.0.1:1, a port nothing

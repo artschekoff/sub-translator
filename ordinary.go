@@ -325,7 +325,7 @@ func runOrdinary(o ordinaryOptions) error {
 	if mode.writesSRT() {
 		srtOut = srtOutputPath(input, to, o.out, mode)
 		if err := srt.Write(srtOut, outBlocks); err != nil {
-			return errf("write SRT: %v", err)
+			return kindErrf(errOutputUnwritable, "write SRT: %v", err)
 		}
 		fmt.Printf("Saved SRT: %s\n", srtOut)
 	}
@@ -363,7 +363,7 @@ func runOrdinary(o ordinaryOptions) error {
 	// thing a consumer heard was translate at 100%.
 	ev.Emit(&events.Stage{Name: "mux"})
 	if err := media.MuxSubtitle(input, tmpTranslated, to, title, outMKV); err != nil {
-		return errf("mux: %v", err)
+		return kindErrf(errOutputUnwritable, "mux: %v", err)
 	}
 	fmt.Printf("Done: %s\n", outMKV)
 	ev.Emit(&events.Done{Path: outMKV})

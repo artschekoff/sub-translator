@@ -13,18 +13,19 @@ import (
 // rather than left to whatever the constant happens to say.
 func TestErrKindsAreTheDocumentedStrings(t *testing.T) {
 	want := map[errKind]string{
-		errMissingKey:      "missing_key",
-		errInvalidKey:      "invalid_key",
-		errWhisperNotFound: "whisper_not_found",
-		errNoModel:         "no_model",
-		errAmbiguousModel:  "ambiguous_model",
-		errNoAudioTrack:    "no_audio_track",
-		errNoSubtitleTrack: "no_subtitle_track",
-		errProbeFailed:     "probe_failed",
-		errRateLimited:     "rate_limited",
-		errTranscriptEmpty: "transcript_empty",
-		errCancelled:       "cancelled",
-		errOther:           "other",
+		errMissingKey:       "missing_key",
+		errInvalidKey:       "invalid_key",
+		errWhisperNotFound:  "whisper_not_found",
+		errNoModel:          "no_model",
+		errAmbiguousModel:   "ambiguous_model",
+		errNoAudioTrack:     "no_audio_track",
+		errNoSubtitleTrack:  "no_subtitle_track",
+		errProbeFailed:      "probe_failed",
+		errOutputUnwritable: "output_unwritable",
+		errRateLimited:      "rate_limited",
+		errTranscriptEmpty:  "transcript_empty",
+		errCancelled:        "cancelled",
+		errOther:            "other",
 	}
 	for k, s := range want {
 		if string(k) != s {

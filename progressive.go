@@ -342,7 +342,12 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 		}
 
 		if err := srt.Write(outPath, srt.Renumber(outBlocks)); err != nil {
-			return fail("chunk %d: write %s: %w", c.Index+1, outPath, err)
+			// outPath is srtOutputPath's answer — the user's own -out, or the
+			// default sidecar path next to their film — never a scratch file, so
+			// a failure writing it is one they can fix by choosing somewhere
+			// else. kindErrf's message is %v-formatted, so wrapping it here with
+			// %w leaves this error's text exactly what it was.
+			return fail("chunk %d: write %s: %w", c.Index+1, outPath, kindErrf(errOutputUnwritable, "%v", err))
 		}
 
 		// Whether this is the first watchable file, rather than whether this is

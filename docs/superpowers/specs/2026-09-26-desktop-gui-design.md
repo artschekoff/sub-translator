@@ -115,12 +115,15 @@ Every fatal error gains a `kind` so a caller can act on it rather than match on 
 | `no_audio_track` | the file has no audio to transcribe |
 | `no_subtitle_track` | `-source sub` on a file with none |
 | `probe_failed` | ffprobe could not read the file |
+| `output_unwritable` | a path the user chose — the sidecar `.srt` or the muxed container — could not be written |
 | `rate_limited` | the endpoint returned HTTP 429 for every block |
 | `transcript_empty` | the audio produced no speech |
 | `cancelled` | SIGINT or SIGTERM |
 | `other` | anything not yet classified — a usage error, an unreachable endpoint, a mangled reply |
 
 The first five are what the GUI routes to its settings screen. `invalid_key` is separate from `rate_limited` because the two lead to different places: a key with a typo in it is corrected in Settings and retrying it can never succeed, while a rate limit is waited out on the Run screen. Folding them together sent the most likely first-run error to a Retry button that re-ran the whole transcription.
+
+`output_unwritable` is not a settings problem: the GUI is what offers the save path in the first place, so it stays on the Run screen with the message and a Retry button, the same as `rate_limited` — the fix is to leave the message on screen while the person picks a different location and presses Retry, not to jump to a form field that had nothing wrong with it.
 
 ### Revised after implementation
 
@@ -135,7 +138,7 @@ Part 1 above is the design as built. What the build changed, and why:
 - **The subcommands compose with the flag.** Refusing `-events json` on `config`/`model` was tried and reversed: the flag was ignored (so effectively worked) on `config path` and `config list` before the event stream existed, and refusing it shipped a regression on an invocation a script may already hold. They join `-probe` and `-version` as invocations that emit `version` and no terminal event.
 - **`-events json` is honoured exactly where `flag.Parse` honours it.** The early argv scan that lets a parse failure be reported on the stream reads argv by the same rules the flag package is about to — it stops at the first positional argument — so `movie.mkv -events json` is ignored by both rather than by only one of them. It keeps looking past a flag the CLI does not define, because that is the case it exists for.
 - **`OPENAI_BASE_URL` is now honoured, not just accepted by the internal `Options.BaseURL` a test could reach.** It was a plain environment read away from being reachable from outside the package, and until it was read in `resolveTranslateOptions` no test could drive the *compiled binary* through a successful translation — the ordinary run's event stream had none for exactly that reason. It is also independently useful for an OpenAI-compatible local server, a proxy, or Azure.
-- **Still open, deliberately, and smaller than it was.** SIGINT does not kill the ffmpeg child: it is reparented to PID 1 and keeps running until its next write, which now fails with EPIPE because the pipe the capture gave it has no reader left. So it dies on its own within a write or two rather than being killed outright, and — the part that mattered for the window — it no longer holds the event stream's file descriptor, so a GUI draining stderr to EOF returns as soon as the CLI exits instead of waiting for the orphan. A child that never writes again still has to be waited out, which is what process groups would fix, and that needs its own platform testing. Also open: no kind for an unwritable output path (S4), and Part 2's copy of `validateFast`'s rules (S6).
+- **Still open, deliberately, and smaller than it was.** SIGINT does not kill the ffmpeg child: it is reparented to PID 1 and keeps running until its next write, which now fails with EPIPE because the pipe the capture gave it has no reader left. So it dies on its own within a write or two rather than being killed outright, and — the part that mattered for the window — it no longer holds the event stream's file descriptor, so a GUI draining stderr to EOF returns as soon as the CLI exits instead of waiting for the orphan. A child that never writes again still has to be waited out, which is what process groups would fix, and that needs its own platform testing. Also open: Part 2's copy of `validateFast`'s rules (S6).
 
 ## Part 2: The window
 

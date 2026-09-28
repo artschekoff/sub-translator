@@ -20,6 +20,13 @@ const (
 	errNoAudioTrack    errKind = "no_audio_track"
 	errNoSubtitleTrack errKind = "no_subtitle_track"
 	errProbeFailed     errKind = "probe_failed"
+
+	// errOutputUnwritable is a path the user chose that cannot be written: a
+	// read-only directory, a full disk, a name the filesystem refuses. Separate
+	// from errOther because the GUI picks the save path, so this is the one
+	// write failure a user can fix by choosing somewhere else.
+	errOutputUnwritable errKind = "output_unwritable"
+
 	errRateLimited     errKind = "rate_limited"
 	errTranscriptEmpty errKind = "transcript_empty"
 	errCancelled       errKind = "cancelled"
@@ -43,6 +50,7 @@ func allErrKinds() []errKind {
 		errNoAudioTrack,
 		errNoSubtitleTrack,
 		errProbeFailed,
+		errOutputUnwritable,
 		errRateLimited,
 		errTranscriptEmpty,
 		errCancelled,
