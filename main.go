@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/artschekoff/sub-translator/internal/config"
 	"github.com/artschekoff/sub-translator/internal/events"
@@ -389,285 +388,25 @@ func main() {
 	setupRunTmpDir()
 	defer cleanupRunTmpDir()
 
-	// Detect subtitle track
-	fmt.Printf("Probing %s...\n", filepath.Base(input))
-	streams, err := media.Probe(input)
-	if err != nil {
-		fatalKindf(errProbeFailed, "probe failed: %v", err)
+	if err := runOrdinary(ordinaryOptions{
+		input:         input,
+		tmpDir:        runTmpDir,
+		from:          *from,
+		to:            *to,
+		source:        source,
+		track:         *track,
+		atrack:        *atrack,
+		mode:          mode,
+		out:           *out,
+		fast:          *fast,
+		chunkMinutes:  chunkMinutes,
+		whisperModel:  *whisperModel,
+		whisperBin:    *whisperBin,
+		vadModel:      *vadModel,
+		translateOpts: translateOpts,
+	}); err != nil {
+		exitWith(err)
 	}
-	subs := media.SubtitleStreams(streams)
-	// probeEvent's own work — a second ffprobe call for the duration — must
-	// not happen at all when nothing is listening: Go evaluates the argument
-	// before Emit's nil check runs, so calling this unconditionally would
-	// spawn that subprocess on every ordinary run, -events json or not.
-	if ev != nil {
-		ev.Emit(probeEvent(input, streams, subs))
-	}
-
-	if len(subs) > 0 {
-		// Many releases ship untagged tracks, and the listing is what tells you
-		// which -track to pass.
-		fmt.Print(formatTracks(subs))
-	}
-
-	source, needsConfirm, err := resolveSource(source, len(subs) > 0, stdinIsTerminal())
-	if err != nil {
-		fatalf("%v", err)
-	}
-
-	// The one -fast check that genuinely needs resolveSource to have run: only
-	// now is it known whether "auto" found a subtitle track.
-	if err := validateFastSource(*fast, source); err != nil {
-		fatalf("%v", err)
-	}
-
-	// Whisper is resolved before anything is asked of the user: a missing
-	// binary or model is a prerequisite failure, and making someone answer a
-	// scary confirmation and type a language code first only to be told
-	// whisper-cli is not installed wastes their time.
-	var whisperOpts whisper.Options
-	if source == sourceAudio {
-		cfg, err := config.Load()
-		if err != nil {
-			fatalf("%v", err)
-		}
-		whisperOpts, err = resolveWhisper(cfg, *whisperModel, *whisperBin, *vadModel)
-		if err != nil {
-			if kind, ok := classifyWhisperErr(err); ok {
-				fatalKindf(kind, "%v", err)
-			} else {
-				fatalf("%v", err)
-			}
-		}
-	}
-
-	if needsConfirm {
-		fmt.Printf("No subtitle tracks in %s.\n", filepath.Base(input))
-		// stdinIsTerminal cannot tell a real terminal from /dev/null, because
-		// /dev/null is itself a character device, so the terminal check can
-		// report interactive when nobody is there to answer. The actionable
-		// message here must not depend on that guess being right.
-		ok, err := readConfirm(stdin, proseErr, fmt.Sprintf(
-			"Transcribe the audio track with %s? This can take a while",
-			filepath.Base(whisperOpts.Model)))
-		if err != nil {
-			fatalf("no subtitle tracks, and the transcription prompt got no answer; " +
-				"pass -source audio to transcribe the audio track")
-		}
-		if !ok {
-			fatalf("nothing to do")
-		}
-	}
-
-	if source == sourceSub && len(subs) == 0 {
-		fatalKindf(errNoSubtitleTrack, "no subtitle tracks in %s — nothing to translate", filepath.Base(input))
-	}
-
-	*from = strings.TrimSpace(*from)
-	*to = strings.TrimSpace(*to)
-
-	// In audio mode whisper detects the source language, so only the target is
-	// genuinely required.
-	if *from == "" && source == sourceSub {
-		*from = promptLang("Source")
-	}
-	if *to == "" {
-		*to = promptLang("Target")
-	}
-
-	var blocks []srt.Block
-
-	if source == sourceAudio {
-		if *fast {
-			if err := runProgressive(input, runTmpDir, streams, *atrack, *from, *to,
-				time.Duration(chunkMinutes)*time.Minute, whisperOpts, translateOpts, *out); err != nil {
-				if kind, ok := classifyTranscribeErr(err); ok {
-					fatalKindf(kind, "%v", err)
-				} else {
-					fatalf("%v", err)
-				}
-			}
-			return
-		}
-
-		var lang string
-		blocks, lang, err = transcribe(input, runTmpDir, streams, *atrack, *from, whisperOpts)
-		if err != nil {
-			if kind, ok := classifyTranscribeErr(err); ok {
-				fatalKindf(kind, "%v", err)
-			} else {
-				fatalf("%v", err)
-			}
-		}
-		// The language whisper actually worked in wins over the one that was
-		// asked for: transcribe drops -from when no track carries that tag, and
-		// translating from a language the transcript is not in would be worse
-		// than useless.
-		*from = reportDetectedLanguage(*from, lang)
-
-		// Transcription is by far the most expensive step here; keeping its
-		// output costs one small file. A media library on a NAS share or a
-		// read-only mount makes this write fail routinely, and throwing away an
-		// hour of CPU over a sidecar file would be indefensible — so it warns
-		// and carries on to the translation the user actually asked for.
-		transcriptPath := media.DefaultSRTPath(input, *from)
-		if transcriptPath == srtOutputPath(input, *to, *out, mode) {
-			// Source and target are the same language — reachable by mis-guessing
-			// a film's language, or by -to en on an English film — so the sidecar
-			// and the translation want the same file. The sidecar is written
-			// first, so a fatal translate error below would leave untranslated
-			// source text under the translated filename: precisely the artifact
-			// this branch exists to make impossible.
-			fmt.Fprintf(proseErr, "warning: not saving the %s transcript to %s: "+
-				"that is where the translated subtitles go\n", *from, transcriptPath)
-		} else if err := srt.Write(transcriptPath, blocks); err != nil {
-			fmt.Fprintf(proseErr, "warning: could not save transcript to %s: %v\n", transcriptPath, err)
-		} else {
-			fmt.Printf("Saved transcript: %s\n", transcriptPath)
-		}
-	} else {
-		var srcStream media.Stream
-		if *track >= 0 {
-			found := false
-			for _, s := range subs {
-				if s.Index == *track {
-					srcStream = s
-					found = true
-					break
-				}
-			}
-			if !found {
-				fatalKindf(errNoSubtitleTrack, "no subtitle stream at index %d", *track)
-			}
-		} else {
-			var ok bool
-			srcStream, ok = media.FindSubtitleByLang(subs, *from)
-			if !ok {
-				fatalKindf(errNoSubtitleTrack, "no subtitle track tagged lang=%s — pick one from the list above with -track", *from)
-			}
-		}
-		fmt.Printf("Source: #%d  lang=%s  %q\n", srcStream.Index, srcStream.Tags.Language, srcStream.Tags.Title)
-
-		tmpSRT := filepath.Join(runTmpDir, "source.srt")
-		fmt.Printf("Extracting subtitle track #%d...\n", srcStream.Index)
-		// The whole pre-translate phase of a -source sub run. Without this the
-		// stream goes probe → stage translate and a window has nothing to show
-		// for the extraction and the SRT parse.
-		ev.Emit(&events.Stage{Name: "extract-subs"})
-		if err := media.ExtractSubtitle(input, srcStream.Index, tmpSRT); err != nil {
-			fatalf("extract: %v", err)
-		}
-
-		blocks, err = srt.Parse(tmpSRT)
-		if err != nil {
-			fatalf("parse SRT: %v", err)
-		}
-		if len(blocks) == 0 {
-			fatalf("subtitle track #%d is empty — nothing to translate", srcStream.Index)
-		}
-	}
-	fmt.Printf("Parsed %d subtitle blocks\n", len(blocks))
-
-	// Translate
-	client, err := newTranslateClient(withLangs(translateOpts, *from, *to))
-	if err != nil {
-		fatalf("%v", err)
-	}
-	fmt.Printf("Translating %s → %s via %s...\n", *from, *to, describeProvider(translateOpts))
-	ev.Emit(&events.Stage{Name: "translate"})
-	texts := srt.Texts(blocks)
-	translated, failedBlocks, err := client.TranslateAll(texts, func(done, total int) {
-		fmt.Print(progressLine(done, total))
-		ev.Emit(&events.Progress{Pct: pctOf(done, total)})
-	})
-	fmt.Println()
-	if err != nil {
-		// translateAll returns an error only when every block failed: the
-		// endpoint refused the whole run rather than a few blocks. Which refusal
-		// it was is the error's to say, not this call site's — hard-coding
-		// errRateLimited here is what reported a mistyped key as a rate limit.
-		fatalKindf(classifyTranslateErr(err), "translate: %v", err)
-	}
-	if len(failedBlocks) > 0 {
-		first := firstN(failedBlocks, 3)
-		firstStr := fmt.Sprint(first)
-		if len(failedBlocks) > len(first) {
-			firstStr += "…"
-		}
-		fmt.Fprintf(proseErr,
-			"warning: %d of %d blocks could not be translated and kept their original text (first: %s)\n",
-			len(failedBlocks), len(texts), firstStr)
-		ev.Emit(&events.Warning{
-			Kind:  "blocks_untranslated",
-			Count: len(failedBlocks),
-			Total: len(texts),
-			First: first,
-		})
-	}
-
-	// Rebuild blocks
-	outBlocks, err := srt.WithTexts(blocks, translated)
-	if err != nil {
-		fatalf("rebuild: %v", err)
-	}
-
-	// AVI and friends can't embed subtitle tracks — fall back to a sidecar.
-	mode, note := resolveMode(mode, media.ContainerSupportsEmbeddedSubs(input))
-	if note != "" {
-		fmt.Println(note)
-	}
-
-	// Inside the run-scoped directory, not a fixed name in $TMPDIR: two runs on
-	// two different films would otherwise share the file, and a mux could pick
-	// up the other run's subtitles.
-	tmpTranslated := filepath.Join(runTmpDir, "translated.srt")
-
-	var srtOut string
-	if mode.writesSRT() {
-		srtOut = srtOutputPath(input, *to, *out, mode)
-		if err := srt.Write(srtOut, outBlocks); err != nil {
-			fatalf("write SRT: %v", err)
-		}
-		fmt.Printf("Saved SRT: %s\n", srtOut)
-	}
-
-	if !mode.writesContainer() {
-		fmt.Println("Done.")
-		// !writesContainer() implies writesSRT() (mode.go), so srtOut was set
-		// just above — the file the "Done." line refers to.
-		ev.Emit(&events.Done{Path: srtOut})
-		return
-	}
-
-	if err := srt.Write(tmpTranslated, outBlocks); err != nil {
-		fatalf("write temp SRT: %v", err)
-	}
-
-	// Mux
-	outMKV := *out
-	if outMKV == "" {
-		outMKV = media.DefaultOutputPath(input, *to)
-	}
-	langTitle := map[string]string{
-		"es": "Spanish", "fr": "French", "de": "German",
-		"it": "Italian", "pt": "Portuguese", "ru": "Russian",
-		"zh": "Chinese", "ja": "Japanese", "ko": "Korean",
-		"ar": "Arabic", "pl": "Polish", "nl": "Dutch",
-	}
-	title := langTitle[*to]
-	if title == "" {
-		title = *to
-	}
-
-	fmt.Printf("Muxing → %s...\n", filepath.Base(outMKV))
-	// Rewriting a multi-gigabyte container takes minutes, during which the last
-	// thing a consumer heard was translate at 100%.
-	ev.Emit(&events.Stage{Name: "mux"})
-	if err := media.MuxSubtitle(input, tmpTranslated, *to, title, outMKV); err != nil {
-		fatalf("mux: %v", err)
-	}
-	fmt.Printf("Done: %s\n", outMKV)
-	ev.Emit(&events.Done{Path: outMKV})
 }
 
 // fatalf reports a fatal error with no kind a caller can act on. It still

@@ -119,7 +119,12 @@ var stageRowInREADME = regexp.MustCompile("(?m)^\\| `([a-z-]+)` \\|")
 
 func TestEveryStageNameIsEmittedAndDocumented(t *testing.T) {
 	emitted := map[string]bool{}
-	for _, file := range []string{"main.go", "progressive.go"} {
+	// Every source file, not a hand-written list of the two that happened to
+	// hold the emits: lifting main()'s pipeline into ordinary.go moved
+	// extract-subs and mux out of a hard-coded {main.go, progressive.go} and
+	// failed this test for a reason that had nothing to do with what it checks.
+	// goFiles is the same list the stderr test reads, and it cannot go stale.
+	for _, file := range goFiles(t) {
 		for _, m := range stageNameInSource.FindAllStringSubmatch(readRepoFile(t, file), -1) {
 			emitted[m[1]] = true
 		}
