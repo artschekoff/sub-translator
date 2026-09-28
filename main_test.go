@@ -824,17 +824,41 @@ func TestTheOrdinaryRunEmitsTheContainerDoneEvent(t *testing.T) {
 	}
 
 	events := parseEventStream(t, stderr.Bytes())
-	if got := kindsOf(events); !containsSubsequence(got, []string{"stage", "done"}) {
-		t.Errorf("event kinds = %v, want a mux stage before the done event", got)
+
+	// A loose containsSubsequence(kindsOf(events), []string{"stage", "done"})
+	// check is satisfied by ANY earlier stage (extract-subs or translate both
+	// fire first on this path), so it never actually requires the mux stage.
+	// Pin the stage *names*, and specifically require "mux" to appear before
+	// the done event — that is the behaviour this test's name promises.
+	var stageNames []string
+	muxIdx := -1
+	for i, e := range events {
+		if e["type"] != "stage" {
+			continue
+		}
+		name, _ := e["name"].(string)
+		stageNames = append(stageNames, name)
+		if name == "mux" {
+			muxIdx = i
+		}
 	}
+	if muxIdx == -1 {
+		t.Errorf("stage names = %v, want a \"mux\" stage — the container run must announce the mux phase before writing the muxed file", stageNames)
+	}
+
 	if n := countOf(events, "done"); n != 1 {
 		t.Fatalf("%d done events, want exactly one:\n%s", n, stderr.String())
 	}
 	var done map[string]any
-	for _, e := range events {
+	doneIdx := -1
+	for i, e := range events {
 		if e["type"] == "done" {
 			done = e
+			doneIdx = i
 		}
+	}
+	if muxIdx != -1 && muxIdx > doneIdx {
+		t.Errorf("mux stage at event index %d came after the done event at index %d, want the mux stage before done", muxIdx, doneIdx)
 	}
 	wantPath := media.DefaultOutputPath(film, "es")
 	if got, _ := done["path"].(string); got != wantPath {
@@ -1931,13 +1955,25 @@ func TestBothRunPathsClassifyARefusedTranslation(t *testing.T) {
 }
 
 // The ordinary run's translate failure is the one classification a real binary
-// can be driven into without a way to point it at a test endpoint: an
-// unreachable proxy makes every request fail at the connection, so translateAll
-// returns "all N blocks failed" with an error that is not a status refusal at
-// all. That is the assertion this wants — the call site hard-coded
-// errRateLimited, so a connection failure, a malformed reply and a mistyped key
-// all arrived as "the endpoint is throttling you". Now the error is asked what
-// it was, and something that is neither refusal reports "other".
+// can be driven into with a genuine connection failure rather than a status
+// refusal: OPENAI_BASE_URL (Task 1) is pointed at 127.0.0.1:1, a port nothing
+// ever listens on, so every request fails to connect and translateAll returns
+// "all N blocks failed" with an error that is not a status refusal at all.
+// That is the assertion this wants — the call site hard-coded errRateLimited,
+// so a connection failure, a malformed reply and a mistyped key all arrived as
+// "the endpoint is throttling you". Now the error is asked what it was, and
+// something that is neither refusal reports "other".
+//
+// An earlier version of this test relied on HTTPS_PROXY/HTTP_PROXY instead,
+// with a comment claiming "the request never leaves the machine: no network,
+// and deterministic". That claim was false: cmd.Env appends to os.Environ(),
+// and most getenv implementations return the *first* match for a duplicated
+// name, so an ambient HTTPS_PROXY/HTTP_PROXY already present in the test
+// runner's environment silently outranked the one this test set, making the
+// failure mode — and sometimes the outcome — depend on where the suite ran.
+// Routing through OPENAI_BASE_URL instead removes the dependency on any
+// environment variable this process does not fully control: the CLI reads
+// OPENAI_BASE_URL itself and there is exactly one way to set it.
 func TestTheOrdinaryRunAsksTheErrorWhichRefusalItWas(t *testing.T) {
 	bin := buildCLI(t)
 	dir := t.TempDir()
@@ -1968,10 +2004,11 @@ exit 0
 		"OPENAI_API_KEY=sk-test",
 		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"XDG_CONFIG_HOME="+filepath.Join(dir, "cfg"),
-		// Port 1 has nothing listening, and Go's http transport reads these, so
-		// the request never leaves the machine: no network, and deterministic.
-		"HTTPS_PROXY=http://127.0.0.1:1",
-		"HTTP_PROXY=http://127.0.0.1:1",
+		// Port 1 has nothing listening, so every request fails at connect —
+		// deterministically, and without depending on any ambient proxy
+		// variable this process does not fully control (see the doc comment
+		// above).
+		"OPENAI_BASE_URL=http://127.0.0.1:1",
 	)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
