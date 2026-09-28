@@ -252,3 +252,46 @@ func TestKillAllGroupsRacesStartAndWait(t *testing.T) {
 	close(stop)
 	wg.Wait()
 }
+
+// Start has to leave every child leading a group of its own, whatever the caller
+// did to cmd.SysProcAttr first. Setpgid with a non-zero Pgid makes the child
+// *join* that group instead: the pid Start then records is not a group leader, so
+// KillGroup's kill(-pid) either finds nothing — tolerated as ESRCH, meaning the
+// child is never killed — or SIGKILLs whatever unrelated group happens to own
+// that id.
+//
+// The Pgid planted here is this test binary's own, which is the nastiest version
+// of the mistake and the cheapest to arrange: a real group, in the same session,
+// that the child is allowed to join, and one whose destruction would take the
+// test runner with it. Nothing kills it here — the assertion is that the child
+// never joined it.
+func TestStartLeavesTheChildLeadingItsOwnGroupEvenIfAPgidWasSet(t *testing.T) {
+	ours, err := syscall.Getpgid(syscall.Getpid())
+	if err != nil {
+		t.Fatalf("Getpgid: %v", err)
+	}
+
+	cmd := exec.Command("sh", "-c", "sleep 30")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Pgid: ours}
+	if err := Start(cmd); err != nil {
+		t.Fatal(err)
+	}
+	pid := cmd.Process.Pid
+	t.Cleanup(func() {
+		_ = KillGroup(pid)
+		_ = Wait(cmd)
+	})
+
+	group, err := syscall.Getpgid(pid)
+	if err != nil {
+		t.Fatalf("Getpgid(child): %v", err)
+	}
+	if group != pid {
+		what := fmt.Sprintf("group %d", group)
+		if group == ours {
+			what = fmt.Sprintf("this test binary's own group (%d)", ours)
+		}
+		t.Errorf("the child leads %s, want its own group (%d): KillGroup would aim "+
+			"kill(-%d) at a group this child does not lead", what, pid, pid)
+	}
+}

@@ -9,9 +9,18 @@ import (
 )
 
 // detach asks for a process group of its own for the child cmd is about to
-// fork. Setpgid with no Pgid makes the child the leader of a brand-new group,
-// so the group id is the child's own pid — which is what Start records and
-// KillGroup kills.
+// fork. Setpgid with a zero Pgid makes the child the leader of a brand-new
+// group, so the group id is the child's own pid — which is what Start records
+// and KillGroup kills.
+//
+// Pgid is cleared rather than assumed zero, and that is the whole of the second
+// line's job. With Setpgid true and a Pgid the caller left set, the child
+// *joins* that group instead of leading a new one: the pid Start records is then
+// not a group leader, and KillGroup's kill(-pid) either finds nothing (ESRCH,
+// which KillGroup tolerates, so the child is never killed at all) or, if a group
+// with that id does exist, SIGKILLs an unrelated process group. No caller sets
+// SysProcAttr today, so this is latent rather than live; it is one line, and the
+// failure it forecloses is a kill aimed at a stranger.
 //
 // It has to happen before the fork: SysProcAttr is read while the process is
 // being created, and setting it afterwards does nothing at all.
@@ -20,6 +29,7 @@ func detach(cmd *exec.Cmd) {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
 	cmd.SysProcAttr.Setpgid = true
+	cmd.SysProcAttr.Pgid = 0
 }
 
 // KillGroup kills every process in the group pid leads — the child and anything
