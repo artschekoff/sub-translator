@@ -73,6 +73,20 @@ type Probe struct {
 	Audio     []Stream  `json:"audio"`
 	Subtitles []Stream  `json:"subtitles"`
 	Fast      *FastRule `json:"fast,omitempty"`
+	// EmbedsSubtitles says whether this container accepts an embedded subtitle
+	// track. It is here for the reason Fast is: a caller offering a choice
+	// between a sidecar, an embedded track and both would otherwise need its own
+	// copy of the rule, and the CLI silently downgrades mux and both to a
+	// sidecar for a container that cannot take one.
+	//
+	// A pointer, not a plain bool, and the omitempty is the reason. false is the
+	// answer that matters here — it is the AVI case — and on a plain bool
+	// omitempty would drop precisely that answer, leaving "cannot embed"
+	// indistinguishable from "nobody asked". Every probe event sets it, exactly
+	// as every probe event sets Fast, so it is never in fact omitted; the
+	// pointer is what makes a future call site that forgets say "unknown"
+	// instead of "no".
+	EmbedsSubtitles *bool `json:"embeds_subtitles,omitempty"`
 }
 
 func (*Probe) kind() Kind { return KindProbe }

@@ -1225,6 +1225,78 @@ JSON`
 	}
 }
 
+// The File screen offers sidecar, embed, or both — and for a container that
+// cannot carry a subtitle track the CLI silently downgrades mux and both to a
+// sidecar, announcing it on stdout and nowhere on the wire. A consumer then has
+// to hold its own copy of the "AVI cannot embed" rule, which is the exact thing
+// probe.fast exists to prevent.
+//
+// So the probe event states it, and this drives the compiled binary on one
+// container that takes an embedded track and one that does not. Same stubs, same
+// argv, one letter of difference in the filename: nothing but the container's own
+// extension may decide the answer, which is why both cases are one test.
+func TestTheProbeEventSaysWhetherTheContainerTakesAnEmbeddedTrack(t *testing.T) {
+	bin := buildCLI(t)
+	dir := t.TempDir()
+
+	binDir := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeStub(t, filepath.Join(binDir, "ffprobe"), "#!/bin/sh\n"+`cat <<'JSON'
+{"streams":[
+ {"index":0,"codec_type":"video","codec_name":"h264"},
+ {"index":1,"codec_type":"audio","codec_name":"ac3","tags":{"language":"eng"}}
+],"format":{"duration":"120.5"}}
+JSON`)
+
+	for _, tt := range []struct {
+		name string
+		file string
+		want bool
+	}{
+		{"an MKV, which takes an embedded track", "movie.mkv", true},
+		{"an AVI, which does not", "movie.avi", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			film := filepath.Join(dir, tt.file)
+			if err := os.WriteFile(film, []byte("not a film"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			cmd := exec.Command(bin, "-events", "json", "-probe", film)
+			cmd.Env = append(os.Environ(),
+				"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+				"XDG_CONFIG_HOME="+filepath.Join(dir, "cfg"),
+				"OPENAI_API_KEY=",
+			)
+			var stdout, stderr bytes.Buffer
+			cmd.Stdout, cmd.Stderr = &stdout, &stderr
+			if err := cmd.Run(); err != nil {
+				t.Fatalf("probe failed: %v\nstderr: %s", err, stderr.String())
+			}
+
+			probes := eventsOfKind(stderr.String(), "probe")
+			if len(probes) != 1 {
+				t.Fatalf("%d probe events, want exactly one:\n%s", len(probes), stderr.String())
+			}
+			// Read through the raw JSON, not a decoded struct: an absent field and
+			// a false one decode alike into a bool, and the whole point of the
+			// pointer in events.Probe is that "cannot embed" must reach the wire
+			// as a stated false rather than as a silence.
+			got, ok := probes[0]["embeds_subtitles"]
+			if !ok {
+				t.Fatalf("the probe event has no embeds_subtitles field, so a consumer cannot "+
+					"tell whether %s takes an embedded track without holding its own copy of "+
+					"the rule:\n%s", filepath.Ext(tt.file), stderr.String())
+			}
+			if got != tt.want {
+				t.Errorf("embeds_subtitles = %v, want %v for %s", got, tt.want, tt.file)
+			}
+		})
+	}
+}
+
 // -probe is what a wrapper calls to build a track list before the user has
 // chosen anything, so it must need nothing: no API key, no target language, and
 // it must not write a file or start any work.

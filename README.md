@@ -339,7 +339,7 @@ Every event carries `type` and `t` (an RFC 3339 UTC timestamp). The first line o
 
 ```json
 {"type":"version","t":"2026-09-28T21:48:29Z","events":1,"tool":"1.4.0"}
-{"type":"probe","t":"2026-09-28T21:48:30Z","duration":8348.674,"audio":[{"index":1,"lang":"eng","title":"Original","codec":"ac3"}],"subtitles":[],"fast":{"sources":["audio"],"modes":["srt"],"min_chunk_minutes":1}}
+{"type":"probe","t":"2026-09-28T21:48:30Z","duration":8348.674,"audio":[{"index":1,"lang":"eng","title":"Original","codec":"ac3"}],"subtitles":[],"embeds_subtitles":true,"fast":{"sources":["audio"],"modes":["srt"],"min_chunk_minutes":1}}
 {"type":"stage","t":"2026-09-28T21:48:30Z","name":"extract"}
 {"type":"stage","t":"2026-09-28T21:48:30Z","name":"transcribe","chunk":1,"of":14,"from":"0:00:00","to":"0:10:00"}
 {"type":"progress","t":"2026-09-28T21:48:30Z","pct":100}
@@ -359,6 +359,8 @@ Simplified for readability, in three ways worth knowing about: the paths and the
 `language` is emitted once, when whisper reports a source language that differs from the one that was asked for (including when none was asked for). Everything downstream — the transcript sidecar's filename, the translation — uses the language in that event from then on.
 
 `probe.fast` states the `-fast` rule as data — the `-source` values and `-mode` values it accepts, and the minimum `-chunk`, in minutes — so a caller can disable a "fast mode" control with a reason instead of holding its own copy of the rule. It is the same object on the ordinary run's `probe` event and on `-probe`'s.
+
+`probe.embeds_subtitles` is there for the same reason, and answers the other question a caller offering an output-mode control has to ask: whether this container accepts an embedded subtitle track. It is `false` for AVI, where `-mode mux` and `-mode both` downgrade to a sidecar `.srt`, and `true` otherwise. A caller can disable "embed in a new container" with a reason instead of keeping its own list of containers, and it is built from the same function `-mode`'s own fallback consults, so the two cannot drift apart.
 
 The `stage` names are the five phases a run can go through:
 
@@ -383,7 +385,7 @@ A field that does not apply to the current run is left out of the JSON rather th
 - `done.covers` — only `-fast` knows what span of the film's own runtime is covered; the ordinary run translates whatever it parsed in one pass and has no honest value to put here.
 - `warning.first` — omitted when there is nothing to list.
 
-`probe.fast` is never omitted — every `probe` event states the `-fast` rule.
+`probe.fast` and `probe.embeds_subtitles` are never omitted — every `probe` event states the `-fast` rule and answers the embedding question. `embeds_subtitles` carries `omitempty` in the source all the same, so that a build which ever stopped setting it would say nothing rather than say `false`: "cannot embed" is a fact, and it must not be spelled the same way as "nobody asked".
 
 `-probe` prints the `version` and `probe` events (or, without `-events json`, the same human-readable track listing the tool already prints) and exits without doing any work. It needs no API key and no target language:
 

@@ -59,6 +59,7 @@ Every event has `type` and `t` (RFC 3339 timestamp). The first line of any run i
 {"type":"probe","t":"…","duration":8348.674,
  "audio":[{"index":3,"lang":"eng","title":"Original (Eng)","codec":"ac3"}],
  "subtitles":[],
+ "embeds_subtitles":true,
  "fast":{"sources":["audio"],"modes":["srt"],"min_chunk_minutes":1}}
 {"type":"stage","t":"…","name":"extract"}
 {"type":"stage","t":"…","name":"transcribe","chunk":1,"of":14,"from":"0:00:00","to":"0:10:00"}
@@ -101,6 +102,8 @@ Prints the `version` and `probe` events and exits without doing any work. The GU
 With `-events json` it emits JSON; without it, the human-readable track listing the tool already prints. It requires only the input path — no `-to`, no key.
 
 `probe.fast` states the `-fast` rule as data — the `-source` and `-mode` values it accepts, and the minimum `-chunk` in minutes — so the window can disable its "fast mode" checkbox with a reason instead of holding a second copy of the rule. It is on every `probe` event, `-probe`'s and the ordinary run's alike, since both build it through the same `probeEvent` function.
+
+`probe.embeds_subtitles` is beside it for the same reason, and answers what the File screen's output-mode control needs to know: whether this container accepts an embedded subtitle track. `false` for AVI, where `-mode mux` and `-mode both` fall back to a sidecar `.srt`; `true` otherwise. Without it the window would have to hold the AVI rule itself, which is what "the GUI holds no copy of the configuration rules" forbids, or offer a control that silently does something else. It is built from the same function `resolveMode`'s own fallback consults, and like `fast` it is on every `probe` event and never omitted.
 
 **`-probe`, `-version`, `-h` and the subcommands carry no terminal event.** None of them is a run: each emits `version` (and `-probe` its `probe`), exits 0, and emits no `done` and no `error`. A decoder shared between the probe call, a settings read and the run call must not wait for one.
 

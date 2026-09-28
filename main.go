@@ -914,10 +914,15 @@ func probeEvent(input string, streams, subs []media.Stream) *events.Probe {
 		}
 		return out
 	}
+	// The same function resolveMode consults before it downgrades -mode mux or
+	// both to a sidecar, so the rule is stated on the wire by the code that
+	// enforces it rather than copied into a consumer.
+	canEmbed := media.ContainerSupportsEmbeddedSubs(input)
 	p := &events.Probe{
-		Audio:     toEvent(media.AudioStreams(streams)),
-		Subtitles: toEvent(subs),
-		Fast:      fastRule(),
+		Audio:           toEvent(media.AudioStreams(streams)),
+		Subtitles:       toEvent(subs),
+		Fast:            fastRule(),
+		EmbedsSubtitles: &canEmbed,
 	}
 	// A duration we cannot read — missing, or ffprobe's own "N/A" — is not
 	// worth failing over: the file is still translatable, and the field is
