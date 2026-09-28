@@ -16,6 +16,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -2389,29 +2391,130 @@ JSON`)
 // guessing at a sleep.
 func waitForEvent(t *testing.T, path, want string) {
 	t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
-	for time.Now().Before(deadline) {
-		if b, err := os.ReadFile(path); err == nil && strings.Contains(string(b), want) {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	b, _ := os.ReadFile(path)
-	t.Fatalf("timed out waiting for %q on the event stream:\n%s", want, b)
+	waitForStream(t, func() string {
+		b, _ := os.ReadFile(path)
+		return string(b)
+	}, want)
 }
 
-// waitForFile polls until path exists, which is how a stub subprocess says it
-// has got far enough for the signal to land where the test wants it.
-func waitForFile(t *testing.T, path string) {
+// waitForStream is the same wait over any growing stream, so a test reading the
+// event stream through a pipe waits the same way one reading it from a file
+// does.
+func waitForStream(t *testing.T, read func() string, want string) {
 	t.Helper()
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
-		if _, err := os.Stat(path); err == nil {
+		if strings.Contains(read(), want) {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("timed out waiting for %s", path)
+	t.Fatalf("timed out waiting for %q on the event stream:\n%s", want, read())
+}
+
+// pipedStderr is a subprocess's stderr read the way a desktop wrapper reads it:
+// through a pipe, drained to EOF on a goroutine of its own. EOF arrives only
+// once every process holding the write end has let go of it, so the drain
+// returning is an assertion in itself — it is what a GUI is waiting for before
+// it can call the run finished.
+type pipedStderr struct {
+	mu      sync.Mutex
+	buf     bytes.Buffer
+	drained chan struct{}
+}
+
+func (p *pipedStderr) Write(b []byte) (int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.buf.Write(b)
+}
+
+// String is safe to call while the drain is still running.
+func (p *pipedStderr) String() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.buf.String()
+}
+
+// startWithPipedStderr starts cmd with its stderr on a pipe and begins draining
+// it. The parent's copy of the write end is closed straight after the start, so
+// the only holders left are the child and anything the child hands it to.
+func startWithPipedStderr(t *testing.T, cmd *exec.Cmd) *pipedStderr {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd.Stderr = w
+	if err := cmd.Start(); err != nil {
+		w.Close()
+		r.Close()
+		t.Fatal(err)
+	}
+	w.Close()
+
+	p := &pipedStderr{drained: make(chan struct{})}
+	go func() {
+		defer close(p.drained)
+		defer r.Close()
+		io.Copy(p, r)
+	}()
+	return p
+}
+
+// waitForDrain fails unless the stderr pipe reaches EOF inside d. A GUI hangs
+// on exactly this: some process still holding the write end after the CLI is
+// gone.
+func (p *pipedStderr) waitForDrain(t *testing.T, d time.Duration) {
+	t.Helper()
+	select {
+	case <-p.drained:
+	case <-time.After(d):
+		t.Fatalf("the event stream did not reach EOF %s after the CLI exited: "+
+			"something still holds its write end", d)
+	}
+}
+
+// waitForProcessGone polls until pid has left the process table. It is how the
+// cancellation test asks the only question that matters about a child it does
+// not own: is it still running?
+func waitForProcessGone(t *testing.T, pid int, within time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for {
+		p, err := os.FindProcess(pid)
+		if err != nil {
+			return
+		}
+		// Signal 0 checks for the process without disturbing it.
+		if err := p.Signal(syscall.Signal(0)); err != nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the stub child (pid %d) was still running %s after the CLI "+
+				"exited on SIGINT: the cancel left an orphan", pid, within)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// waitForPID polls until a stub subprocess has written its own pid to path.
+// That says two things at once: the stub has got far enough for the signal to
+// land where the test wants it, and this is the process the test must later
+// find gone.
+func waitForPID(t *testing.T, path string) int {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if b, err := os.ReadFile(path); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil && pid > 0 {
+				return pid
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for a stub to write its pid to %s", path)
+	return 0
 }
 
 // Cancellation had no test at all: deleting the emit at the SIGINT handler left
@@ -2421,9 +2524,10 @@ func waitForFile(t *testing.T, path string) {
 // assertion here is deliberately made the way a consumer would make it: parse
 // every line, and the cancelled event must be one of them.
 //
-// stderr goes to a file rather than a pipe on purpose. SIGINT does not kill the
-// ffmpeg child (a separate, deferred finding), and a pipe would keep this test
-// waiting on the orphan the way it would keep a GUI waiting.
+// stderr is read through a pipe, as a desktop wrapper reads it, and the blocking
+// stub is asked for afterwards by pid: a cancelled run must leave no child of
+// this program still running, and the stub sleeps far longer than the test
+// waits, so an orphan cannot pass by finishing on its own.
 func TestCancellationExits130WithExactlyOneCancelledEvent(t *testing.T) {
 	bin := buildCLI(t)
 
@@ -2433,16 +2537,21 @@ func TestCancellationExits130WithExactlyOneCancelledEvent(t *testing.T) {
 	const sleepyFfmpeg = `#!/bin/sh
 out=""
 for a in "$@"; do out="$a"; done
-printf 'size=       0KiB time=00:00:00.00 bitrate=1024.0kbits/s speed=57x    \r' >&2
-# Only now: the signal must arrive with a line that has no newline at its end
-# already in flight, which is the window the cancelled event was lost in.
-: > "$FFMPEG_STARTED"
+# A run of carriage-return progress first, so the last thing the run saw from
+# this child is a line with no newline at its end: the window the cancelled
+# event was once lost in.
 i=0
-while [ $i -lt 40 ]; do
+while [ $i -lt 5 ]; do
   printf 'size=%8dKiB time=00:00:00.00 bitrate=1024.0kbits/s speed=57x    \r' "$i" >&2
-  sleep 0.1
+  sleep 0.02
   i=$((i+1))
 done
+# Then silence, and only then the pid, so the signal lands inside the silence.
+# A child that never writes again is never reached by EPIPE — it is exactly the
+# child the group kill exists for, and the chatty one would have died on its
+# own.
+echo $$ > "$STUB_PID"
+sleep 20
 printf 'RIFFWAVE' > "$out"
 exit 0
 `
@@ -2459,11 +2568,10 @@ while [ $# -gt 0 ]; do
   shift
 done
 echo "whisper_print_progress_callback: progress =  10%" >&2
-i=0
-while [ $i -lt 40 ]; do
-  sleep 0.1
-  i=$((i+1))
-done
+# Silent from here, like a transcription that has read its model and is now
+# only working: nothing will make this child notice the CLI is gone.
+echo $$ > "$STUB_PID"
+sleep 20
 : > "$outbase.srt"
 exit 0
 `
@@ -2476,17 +2584,12 @@ exit 0
 		// waitFor is the line on the event stream that says the run has reached
 		// the blocking step.
 		waitFor string
-		// waitForFfmpeg additionally waits until the ffmpeg stub has written a
-		// carriage-return fragment, so the signal cannot win the race against
-		// the child starting up.
-		waitForFfmpeg bool
 	}{
 		{
-			name:          "during audio extraction, mid ffmpeg progress line",
-			ffmpeg:        sleepyFfmpeg,
-			whisper:       quickFfmpeg, // never reached
-			waitFor:       `"name":"extract"`,
-			waitForFfmpeg: true,
+			name:    "during audio extraction, mid ffmpeg progress line",
+			ffmpeg:  sleepyFfmpeg,
+			whisper: quickFfmpeg, // never reached
+			waitFor: `"name":"extract"`,
 		},
 		{
 			name:    "during transcription",
@@ -2517,32 +2620,22 @@ JSON`)
 				t.Fatal(err)
 			}
 
-			errPath := filepath.Join(dir, "stderr.log")
-			errFile, err := os.Create(errPath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer errFile.Close()
-
 			cmd := exec.Command(bin, "-events", "json", "-to", "es", "-source", "audio",
 				"-whisper-bin", whisperBin, "-whisper-model", model, film)
-			started := filepath.Join(dir, "ffmpeg-started")
+			pidPath := filepath.Join(dir, "stub.pid")
 			cmd.Env = append(os.Environ(),
 				"OPENAI_API_KEY=sk-test",
 				"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
 				"XDG_CONFIG_HOME="+filepath.Join(dir, "cfg"),
-				"FFMPEG_STARTED="+started,
+				"STUB_PID="+pidPath,
 			)
 			cmd.Stdout = io.Discard
-			cmd.Stderr = errFile
-			if err := cmd.Start(); err != nil {
-				t.Fatal(err)
-			}
+			stream := startWithPipedStderr(t, cmd)
 
-			waitForEvent(t, errPath, tt.waitFor)
-			if tt.waitForFfmpeg {
-				waitForFile(t, started)
-			}
+			waitForStream(t, stream.String, tt.waitFor)
+			// The stub's pid also says it is past its first write, so the
+			// signal cannot win the race against the child starting up.
+			stubPID := waitForPID(t, pidPath)
 			if err := cmd.Process.Signal(os.Interrupt); err != nil {
 				t.Fatal(err)
 			}
@@ -2557,20 +2650,22 @@ JSON`)
 			if code := exit.ExitCode(); code != 130 {
 				t.Errorf("exit status %d, want 130", code)
 			}
+			// The whole point of the cancel: the child goes too. The stub has
+			// twenty seconds of sleeping left, so surviving this wait is not
+			// something it can do by finishing.
+			waitForProcessGone(t, stubPID, 5*time.Second)
+			stream.waitForDrain(t, 5*time.Second)
 
-			stream, err := os.ReadFile(errPath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			errs := eventsOfKind(string(stream), "error")
+			emitted := stream.String()
+			errs := eventsOfKind(emitted, "error")
 			if len(errs) != 1 {
 				t.Fatalf("%d error events, want exactly one parseable cancelled event:\n%s",
-					len(errs), stream)
+					len(errs), emitted)
 			}
 			if kind, _ := errs[0]["kind"].(string); kind != string(errCancelled) {
 				t.Errorf("error kind = %q, want %q", kind, errCancelled)
 			}
-			if got := eventsOfKind(string(stream), "done"); len(got) != 0 {
+			if got := eventsOfKind(emitted, "done"); len(got) != 0 {
 				t.Errorf("%d done events on a cancelled run, want none", len(got))
 			}
 		})

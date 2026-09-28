@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/artschekoff/sub-translator/internal/proc"
 )
 
 type Stream struct {
@@ -148,6 +150,10 @@ func runFFmpeg(cmd *exec.Cmd, report func(time.Duration)) error {
 	if err != nil {
 		return fmt.Errorf("ffmpeg: %w", err)
 	}
+	// Every ffmpeg this package runs comes through here — the subtitle
+	// extraction, the audio extraction, the mux and each -fast slice — so this
+	// one call is what makes all four killable when a run is cancelled.
+	proc.Detach(cmd)
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("ffmpeg: %w", err)
 	}

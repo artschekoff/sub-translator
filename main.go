@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/artschekoff/sub-translator/internal/events"
 	"github.com/artschekoff/sub-translator/internal/media"
 	"github.com/artschekoff/sub-translator/internal/models"
+	"github.com/artschekoff/sub-translator/internal/proc"
 	"github.com/artschekoff/sub-translator/internal/srt"
 	"github.com/artschekoff/sub-translator/internal/translate"
 	"github.com/artschekoff/sub-translator/internal/whisper"
@@ -30,6 +32,15 @@ var version = "dev"
 // exitWith's os.Exit and a SIGINT — both have to be able to remove it, and a
 // feature film's 16 kHz WAV is well over a gigabyte to leave behind.
 var runTmpDir string
+
+// cancelling is raised by the signal handler once the cancelled event is on the
+// stream and before the children are killed. Killing them unblocks whatever the
+// main goroutine was waiting on — ffmpeg, whisper — as an ordinary failure, and
+// that failure would otherwise race the handler to the exit: two error events
+// on a stream that promises exactly one, and exit 1 or 130 depending on which
+// goroutine got there first. Raised before the kill and read in exitWith, it
+// makes the cancel the only ending a cancelled run can have.
+var cancelling atomic.Bool
 
 // ev carries the machine-readable event stream. It is disabled unless
 // -events json is passed, and Emit is a no-op when disabled, so the call sites
@@ -64,6 +75,15 @@ func setupRunTmpDir() {
 		// shell convention below is what has to survive, unchanged, whether or
 		// not a caller is reading the event stream.
 		ev.Emit(&events.Error{Kind: string(errCancelled), Message: "interrupted"})
+		// Raised only now: everything downstream of it is entitled to assume
+		// the cancelled event is already on the stream.
+		cancelling.Store(true)
+		// Before the scratch directory goes, not after: a surviving ffmpeg
+		// would go on writing into a directory being deleted underneath it,
+		// and on a feature film that pass runs for minutes after the user
+		// pressed Cancel. The signal reaches this process alone — the children
+		// are reparented to PID 1 — so nothing but this kills them.
+		proc.KillAllGroups()
 		cleanupRunTmpDir()
 		// 128 + SIGINT: the shell convention for "terminated by a signal".
 		os.Exit(130)

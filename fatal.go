@@ -58,6 +58,17 @@ func kindOf(err error) errKind {
 // string, so a message that happens to contain a percent sign (an ffmpeg
 // progress line, a model name) cannot be re-interpreted as a verb.
 func exitWith(err error) {
+	if cancelling.Load() {
+		// This is not a failure of its own: it is the child the signal handler
+		// has just killed, surfacing here as "signal: killed" while the handler
+		// is still on its way to exit 130. The cancelled event is already on the
+		// stream, so reporting this one would break the single-error-event
+		// promise, and exiting 1 would tell a wrapper the run failed rather
+		// than that the user cancelled it. End the run the way the handler is
+		// about to, and say nothing.
+		cleanupRunTmpDir()
+		os.Exit(130)
+	}
 	ev.Emit(&events.Error{Kind: string(kindOf(err)), Message: err.Error()})
 	fmt.Fprintf(proseErr, "error: %s\n", err.Error())
 	// os.Exit skips deferred calls, so the scratch directory has to be removed
