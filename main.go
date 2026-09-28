@@ -34,12 +34,17 @@ var version = "dev"
 var runTmpDir string
 
 // cancelling is raised by the signal handler once the cancelled event is on the
-// stream and before the children are killed. Killing them unblocks whatever the
-// main goroutine was waiting on — ffmpeg, whisper — as an ordinary failure, and
-// that failure would otherwise race the handler to the exit: two error events
-// on a stream that promises exactly one, and exit 1 or 130 depending on which
-// goroutine got there first. Raised before the kill and read in exitWith, it
-// makes the cancel the only ending a cancelled run can have.
+// stream — and only when that event was the run's ending — and before the
+// children are killed. Killing them unblocks whatever the main goroutine was
+// waiting on — ffmpeg, whisper — as an ordinary failure, and that failure would
+// otherwise race the handler to the exit: two error events on a stream that
+// promises exactly one, and exit 1 or 130 depending on which goroutine got there
+// first. Raised before the kill and read in yieldIfCancelling, it makes the
+// cancel the only ending a cancelled run can have.
+//
+// It is the cheap, one-directional half of the mechanism. The half that actually
+// guarantees exactly one terminal event, in both directions, is claimEnding in
+// fatal.go.
 var cancelling atomic.Bool
 
 // cancelHandoffTimeout is how long the main goroutine waits for the signal
@@ -80,13 +85,31 @@ func setupRunTmpDir() {
 		// Not fatalKindf: that exits 1 and this is a signal, not a failure — the
 		// shell convention below is what has to survive, unchanged, whether or
 		// not a caller is reading the event stream.
-		ev.Emit(&events.Error{Kind: string(errCancelled), Message: "interrupted"})
-		// Raised only now: everything downstream of it is entitled to assume
-		// the cancelled event is already on the stream.
-		cancelling.Store(true)
+		//
+		// claimEnding rather than a bare Emit, because a cancel can also arrive
+		// *second*. A run that has already written its done then spends real
+		// time before the process ends — notifyDone's osascript takes about
+		// 0.18s, and the scratch directory holding a feature film's WAV takes
+		// as long as it takes to remove — and a cancelled event appended in
+		// there would leave a complete, correct subtitle file reported as an
+		// abandoned run.
+		code, won := claimEnding(&events.Error{Kind: string(errCancelled), Message: "interrupted"}, 130)
+		if won {
+			// Raised only now, and only when the cancel is the run's ending:
+			// everything downstream of it is entitled to assume the cancelled
+			// event is already on the stream, and after a lost claim it is not.
+			cancelling.Store(true)
+		}
+		// Either way the children have to die and the scratch directory has to
+		// go: a lost claim still means a user asked for this to stop, and the
+		// run may still have something running.
 		shutdownAfterCancel()
-		// 128 + SIGINT: the shell convention for "terminated by a signal".
-		os.Exit(130)
+		// 130 is 128 + SIGINT, the shell convention for "terminated by a
+		// signal", and it is what a cancel that became the run's ending earns.
+		// A cancel that arrived after the ending exits with the status that
+		// ending earned instead, so the exit code can never contradict the one
+		// terminal event on the stream.
+		os.Exit(code)
 	}()
 }
 

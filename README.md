@@ -434,6 +434,8 @@ Exit codes, and the event that pairs with each:
 | 2 | a usage error: an unknown flag or a bad flag value | one `error`, kind `other`, after the `version` event |
 | 130 | cancelled by SIGINT or SIGTERM | one `error`, kind `cancelled` |
 
+The exit code is always the one the single terminal event pairs with, so the two cannot disagree and the stream alone says what happened. That settles the case a Cancel button hits most often — Ctrl-C in the second the run finishes. The cancel arrives after the `done` event is already on the wire, adds no second terminal event, and the run **exits 0**: the work completed, the file `done` names is complete on disk, and there was nothing left to cancel. A cancel arriving after an `error` exits 1 for the same reason. 130 is for a cancel that is genuinely the run's ending, which is the only case that emits `error` with kind `cancelled` at all.
+
 This is the same idea as `git status --porcelain` or `ffmpeg -progress`: a stable contract for programs, separate from the output meant for people.
 
 ## Languages

@@ -1612,6 +1612,9 @@ func TestAFullRunLeavesStdoutUnchangedUnderEvents(t *testing.T) {
 
 	run := func(scratch string, enableEvents bool) string {
 		t.Helper()
+		// Two runs in one process, so the ending is reset per run rather than
+		// per test: the second run's done event is its own.
+		freshEnding(t)
 		tmpDir := filepath.Join(dir, scratch)
 		if err := os.MkdirAll(tmpDir, 0o755); err != nil {
 			t.Fatal(err)
@@ -2807,40 +2810,126 @@ func TestACancelInFlightWinsOverAnyOtherEnding(t *testing.T) {
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			cmd := exec.Command(os.Args[0], "-test.run=^TestCancelHandoffChild$")
-			// The child ends in os.Exit, which skips t.Cleanup, so it is given a
-			// scratch root this test owns and removes.
-			cmd.Env = append(os.Environ(),
-				"SUB_TRANSLATOR_CANCEL_HANDOFF="+tt.mode,
-				"TMPDIR="+t.TempDir(),
-			)
-			var stderr bytes.Buffer
-			cmd.Stdout = io.Discard
-			cmd.Stderr = &stderr
-
-			code := 0
-			if err := cmd.Run(); err != nil {
-				var exit *exec.ExitError
-				if !errors.As(err, &exit) {
-					t.Fatalf("running the child half: %v", err)
-				}
-				code = exit.ExitCode()
-			}
-
-			if code != tt.wantCode {
-				t.Errorf("exit status %d, want %d\n%s", code, tt.wantCode, stderr.String())
-			}
-			if got := eventsOfKind(stderr.String(), "error"); len(got) != tt.wantErrors {
-				t.Errorf("%d error events, want %d\n%s", len(got), tt.wantErrors, stderr.String())
-			}
-			if got := eventsOfKind(stderr.String(), "done"); len(got) != tt.wantDones {
-				t.Errorf("%d done events, want %d\n%s", len(got), tt.wantDones, stderr.String())
-			}
+			assertCancelHandoffEnding(t, tt.mode, tt.wantCode, tt.wantErrors, tt.wantDones)
 		})
 	}
 }
 
-// TestCancelHandoffChild is the child half of the test above: it runs in a
+// The mirror direction, and the one nothing on this branch asked about: a cancel
+// that arrives *after* the run has already written its terminal event. Every row
+// of the table above raises the flag before the run, so eleven rows could not
+// reach this case — and the reviewer reproduced it on the compiled binary as a
+// done line followed by an error{cancelled} line, exit 130, with a complete and
+// correct .srt on disk.
+//
+// What must hold is the same promise from the other side: one terminal event, and
+// an exit status that agrees with it. The cancel changed nothing, so the status
+// stays the one the run had already earned — 0 after a done, 1 after an error —
+// rather than 130 telling a wrapper a finished run was abandoned.
+//
+// The child half makes the ordering deterministic rather than likely: for the two
+// bare-ender rows the cancel is raised from inside the write of the terminal event
+// itself (see signalOnFirstWrite), so the handler is provably awake and inside its
+// own claim while the ender is still holding the ending. A flag raised after the
+// emit, or checked without the lock, fails these rows; so does no guard at all.
+func TestACancelArrivingAfterTheEndingAddsNoSecondTerminalEvent(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		mode       string
+		wantCode   int
+		wantErrors int
+		wantDones  int
+	}{
+		{
+			name: "a cancel landing inside the done event's own write",
+			mode: "done-then-cancel", wantCode: 0, wantErrors: 0, wantDones: 1,
+		},
+		{
+			name: "a cancel landing inside the error event's own write",
+			mode: "error-then-cancel", wantCode: 1, wantErrors: 1, wantDones: 0,
+		},
+		{
+			// The case as reproduced: a whole -fast run finishes, its done event
+			// is on the wire, and the cancel arrives during the work that follows
+			// it — the desktop notification and the scratch-directory removal.
+			name: "a cancel landing after a -fast run has finished",
+			mode: "progressive-run-then-cancel", wantCode: 0, wantErrors: 0, wantDones: 1,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			assertCancelHandoffEnding(t, tt.mode, tt.wantCode, tt.wantErrors, tt.wantDones)
+		})
+	}
+}
+
+// assertCancelHandoffEnding runs one mode of TestCancelHandoffChild in a
+// subprocess and checks what a wrapper would see: the exit status, and how many
+// of each terminal event reached the stream.
+func assertCancelHandoffEnding(t *testing.T, mode string, wantCode, wantErrors, wantDones int) {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestCancelHandoffChild$")
+	// The child ends in os.Exit, which skips t.Cleanup, so it is given a
+	// scratch root this test owns and removes.
+	cmd.Env = append(os.Environ(),
+		"SUB_TRANSLATOR_CANCEL_HANDOFF="+mode,
+		"TMPDIR="+t.TempDir(),
+	)
+	var stderr bytes.Buffer
+	cmd.Stdout = io.Discard
+	cmd.Stderr = &stderr
+
+	code := 0
+	if err := cmd.Run(); err != nil {
+		var exit *exec.ExitError
+		if !errors.As(err, &exit) {
+			t.Fatalf("running the child half: %v", err)
+		}
+		code = exit.ExitCode()
+	}
+
+	if code != wantCode {
+		t.Errorf("exit status %d, want %d\n%s", code, wantCode, stderr.String())
+	}
+	if got := eventsOfKind(stderr.String(), "error"); len(got) != wantErrors {
+		t.Errorf("%d error events, want %d\n%s", len(got), wantErrors, stderr.String())
+	}
+	if got := eventsOfKind(stderr.String(), "done"); len(got) != wantDones {
+		t.Errorf("%d done events, want %d\n%s", len(got), wantDones, stderr.String())
+	}
+}
+
+// signalOnFirstWrite raises this process's own SIGINT as the run's first event is
+// being written, and then holds the write open for a moment.
+//
+// It is how "the cancel arrives second" stops being a scheduling coin toss. The
+// signal is raised while the ender is inside its claim, so the handler is awake
+// and asking the same question before the ender has finished answering it; the
+// pause afterwards gives a handler that was never made to defer every chance to
+// emit, so a missing guard shows up as a failure on every run rather than on one
+// in thirty-three.
+type signalOnFirstWrite struct {
+	w    io.Writer
+	once sync.Once
+}
+
+func (s *signalOnFirstWrite) Write(p []byte) (int, error) {
+	first := false
+	s.once.Do(func() {
+		first = true
+		// os.Process.Signal rather than syscall.Kill, so this file still
+		// type-checks under GOOS=windows.
+		if p, err := os.FindProcess(os.Getpid()); err == nil {
+			_ = p.Signal(os.Interrupt)
+		}
+	})
+	n, err := s.w.Write(p)
+	if first {
+		time.Sleep(200 * time.Millisecond)
+	}
+	return n, err
+}
+
+// TestCancelHandoffChild is the child half of the two tests above: it runs in a
 // subprocess of this test binary, because the branch under test ends in os.Exit
 // and nothing in-process survives that.
 func TestCancelHandoffChild(t *testing.T) {
@@ -2848,7 +2937,23 @@ func TestCancelHandoffChild(t *testing.T) {
 	if mode == "" {
 		t.Skip("the child half of TestACancelInFlightWinsOverAnyOtherEnding")
 	}
-	ev = events.New(proseErr)
+	switch mode {
+	case "done-then-cancel", "error-then-cancel":
+		// These two need the cancel raised from inside the terminal event's own
+		// write. proseErr is replaced rather than bypassed so the events and the
+		// prose still share one writer, which is the production wiring the
+		// ordering under test depends on.
+		proseErr = events.NewSyncWriter(&signalOnFirstWrite{w: os.Stderr})
+		ev = events.New(proseErr)
+	default:
+		ev = events.New(proseErr)
+	}
+	if strings.HasSuffix(mode, "-then-cancel") {
+		// The cancel-arrives-second modes need a real armed handler: the whole
+		// question is what the handler does when it finds the ending already
+		// written.
+		setupRunTmpDir()
+	}
 	// There is no signal handler in this process, so the handoff wait is what
 	// elapses rather than the handler's own exit arriving first. Shortened so
 	// each case costs milliseconds instead of five seconds.
@@ -2893,6 +2998,27 @@ func TestCancelHandoffChild(t *testing.T) {
 		cancelling.Store(true)
 		runProgressiveWithStubs(t, srv)
 		os.Exit(0)
+
+	case "done-then-cancel":
+		emitDone(&events.Done{Path: "/tmp/subtitles.srt"})
+		// The handler is already awake and inside its own claim. Give it the
+		// process rather than racing it to an identical status, so that a handler
+		// which never fires at all shows up as the 97 below.
+		time.Sleep(5 * time.Second)
+	case "error-then-cancel":
+		// exitWith ends the process itself, with the same status the handler
+		// would; which of the two gets there first does not matter, and neither
+		// may add a second terminal event.
+		exitWith(kindErrf(errProbeFailed, "ffmpeg: signal: killed"))
+	case "progressive-run-then-cancel":
+		// The reproduced case, with no writer tricks: the run finishes, its done
+		// event is on the wire, and only then is the cancel raised — the instant
+		// the reviewer's osascript stub occupied.
+		runProgressiveWithStubs(t, nil)
+		if p, err := os.FindProcess(os.Getpid()); err == nil {
+			_ = p.Signal(os.Interrupt)
+		}
+		time.Sleep(5 * time.Second)
 
 	default:
 		t.Fatalf("unknown mode %q", mode)

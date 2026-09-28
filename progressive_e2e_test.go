@@ -109,6 +109,8 @@ const silentSRT = `: > "$outbase.srt"`
 // "$outbase.srt".
 func progressiveStubs(t *testing.T, whisperBody string) (dir, binDir, tmpDir, langLog string) {
 	t.Helper()
+	// A run's ending is package state; a test binary hosts many runs.
+	freshEnding(t)
 	if runtime.GOOS == "windows" {
 		t.Skip("the stubs are POSIX shell scripts")
 	}
@@ -181,6 +183,8 @@ exit 0
 // media.ExtractSubtitle would otherwise pull out of the container.
 func subtitleSourceStubs(t *testing.T, dir, srtBody string) (binDir string) {
 	t.Helper()
+	// A run's ending is package state; a test binary hosts many runs.
+	freshEnding(t)
 	if runtime.GOOS == "windows" {
 		t.Skip("the stubs are POSIX shell scripts")
 	}
