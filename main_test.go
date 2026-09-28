@@ -16,7 +16,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -489,14 +488,51 @@ const subtitleTrackSRT = "1\n00:00:01,000 --> 00:00:03,000\nHello there\n\n" +
 // through a real -source sub run and asserts the translation request reached
 // the env var's endpoint rather than the real one.
 func TestTheCompiledBinaryHonoursOPENAI_BASE_URL(t *testing.T) {
-	var hits int32
+	srv := stubTranslateEndpoint(t)
+
+	bin := buildCLI(t)
+	dir := t.TempDir()
+	binDir := subtitleSourceStubs(t, dir, subtitleTrackSRT)
+
+	film := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(film, []byte("not really a film"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(bin, "-to", "es", "-source", "sub", "-from", "en", "-track", "0", film)
+	cmd.Env = append(os.Environ(),
+		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"OPENAI_API_KEY=sk-test",
+		"OPENAI_BASE_URL="+srv.URL,
+		"XDG_CONFIG_HOME="+filepath.Join(dir, "cfg"),
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run failed: %v\n%s", err, out)
+	}
+
+	// The stub echoes every line back prefixed "ES:". The real endpoint would
+	// have rejected "sk-test" or been unreachable from this sandbox, either of
+	// which fails the run above — so finding the prefix in the file the run
+	// wrote is direct proof OPENAI_BASE_URL routed the request here, not there.
+	got, err := os.ReadFile(media.DefaultSRTPath(film, "es"))
+	if err != nil {
+		t.Fatalf("reading the translated SRT: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(got), "ES:") {
+		t.Fatalf("translated SRT carries no ES: prefix, so the stub endpoint was never reached:\n%s\n%s", got, out)
+	}
+}
+
+// stubTranslateEndpoint answers every batch with the source text it was sent,
+// each prefixed "ES:" and keyed exactly as asked. A fixed reply cannot be used
+// here: batch()'s keys are 0-indexed per batch, and mapReply requires the
+// reply's key set to match the request's exactly, so a canned
+// {"1":"hola"}-style reply fails every block and exits the run non-zero before
+// any assertion about the event stream gets to run.
+func stubTranslateEndpoint(t *testing.T) *httptest.Server {
+	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&hits, 1)
-		// Echo every requested line back unchanged, keyed exactly as asked: the
-		// point of this server is that it was reached, not what it says back, and
-		// answering every key it is actually sent — rather than a fixed key that
-		// may not match the batch's numbering — keeps the run from failing for an
-		// unrelated reason (a malformed-reply retry exhausting into a fatal error).
 		var req struct {
 			Messages []struct {
 				Role    string `json:"role"`
@@ -525,8 +561,142 @@ func TestTheCompiledBinaryHonoursOPENAI_BASE_URL(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"choices":[{"message":{"content":%q}}]}`, content)
 	}))
-	defer srv.Close()
+	t.Cleanup(srv.Close)
+	return srv
+}
 
+// untranslatableBlockSRT is a two-block subtitle body where the second block's
+// text carries refusedBlockMarker, the substring
+// stubTranslateEndpointRefusingSomeBlocks refuses to translate.
+const untranslatableBlockSRT = "1\n00:00:01,000 --> 00:00:03,000\nHello there\n\n" +
+	"2\n00:00:05,000 --> 00:00:07,000\nUNTRANSLATABLE block\n\n"
+
+const refusedBlockMarker = "UNTRANSLATABLE"
+
+// stubTranslateEndpointRefusingSomeBlocks behaves like stubTranslateEndpoint,
+// except any block whose source text contains marker is answered with a
+// mismatched key instead of a translation. mapReply requires the reply's key
+// set to equal the request's exactly, so that block's batch attempt fails,
+// which is what drives openai.go's per-block fallback (one()) — where the same
+// content-based check refuses it again, permanently. The refusal is decided
+// from each request's own content, never from a shared call counter, so it
+// stays deterministic across the batch's own retry and across concurrent
+// workers, neither of which promises a stable call order.
+func stubTranslateEndpointRefusingSomeBlocks(t *testing.T, marker string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Messages []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var user string
+		for _, m := range req.Messages {
+			if m.Role == "user" {
+				user = m.Content
+			}
+		}
+		var payload struct {
+			Translate map[string]string `json:"translate"`
+		}
+		json.Unmarshal([]byte(user), &payload)
+
+		out := make(map[string]string, len(payload.Translate))
+		for k, v := range payload.Translate {
+			if strings.Contains(v, marker) {
+				// A key the request never asked for, so mapReply's key-set check
+				// fails this key specifically — unique per source key, so several
+				// refused blocks in the same batch don't collide into one entry
+				// and understate how many keys are actually missing.
+				out["__refused_"+k+"__"] = "x"
+				continue
+			}
+			out[k] = "ES:" + v
+		}
+		content, _ := json.Marshal(out)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"choices":[{"message":{"content":%q}}]}`, content)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// parseEventStream returns one map per JSON event line on stderr, skipping the
+// prose lines the protocol's own skip rule says a consumer may ignore (any line
+// that does not start with '{'). Unlike eventsOf/eventsOfKind above, it fails
+// the test outright on a line that starts with '{' and does not parse as JSON,
+// rather than silently skipping it: that shape — a line beginning like an event
+// but broken — is exactly the stream corruption (an event split across two
+// writes) the previous branch spent a Critical and a Major fixing, and a helper
+// that skips it could never catch a regression of it.
+func parseEventStream(t *testing.T, stderr []byte) []map[string]any {
+	t.Helper()
+	var out []map[string]any
+	for _, line := range strings.Split(string(stderr), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if !strings.HasPrefix(line, "{") {
+			continue // a prose line, which the protocol says to skip
+		}
+		var m map[string]any
+		if err := json.Unmarshal([]byte(line), &m); err != nil {
+			t.Fatalf("stderr line starts with '{' but does not parse as JSON: %v\nline: %q", err, line)
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// kindsOf returns the "type" field of every event, in order.
+func kindsOf(events []map[string]any) []string {
+	out := make([]string, 0, len(events))
+	for _, e := range events {
+		k, _ := e["type"].(string)
+		out = append(out, k)
+	}
+	return out
+}
+
+// countOf returns how many events carry the given "type".
+func countOf(events []map[string]any, kind string) int {
+	n := 0
+	for _, e := range events {
+		if e["type"] == kind {
+			n++
+		}
+	}
+	return n
+}
+
+// containsSubsequence reports whether want appears in got in order, though not
+// necessarily contiguously — want is a subsequence of got.
+func containsSubsequence(got, want []string) bool {
+	i := 0
+	for _, g := range got {
+		if i == len(want) {
+			break
+		}
+		if g == want[i] {
+			i++
+		}
+	}
+	return i == len(want)
+}
+
+// TestTheOrdinaryRunEmitsItsWholeStream pins the default (non -fast) path's
+// events end to end. It is a real, compiled process, so it also pins that exit
+// 0 and exactly one done event agree — the pair no in-process test can assert,
+// because only a real process both carries its own exit code and cannot be
+// handed a fake events.Emitter to inspect afterwards.
+func TestTheOrdinaryRunEmitsItsWholeStream(t *testing.T) {
+	srv := stubTranslateEndpoint(t)
 	bin := buildCLI(t)
 	dir := t.TempDir()
 	binDir := subtitleSourceStubs(t, dir, subtitleTrackSRT)
@@ -536,19 +706,139 @@ func TestTheCompiledBinaryHonoursOPENAI_BASE_URL(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cmd := exec.Command(bin, "-to", "es", "-source", "sub", "-from", "en", "-track", "0", film)
+	var stderr bytes.Buffer
+	cmd := exec.Command(bin, "-events", "json", "-to", "es", "-source", "sub", "-from", "en", "-track", "0", film)
 	cmd.Env = append(os.Environ(),
 		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"OPENAI_API_KEY=sk-test",
 		"OPENAI_BASE_URL="+srv.URL,
 		"XDG_CONFIG_HOME="+filepath.Join(dir, "cfg"),
 	)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("run failed: %v\n%s", err, out)
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("want exit 0, got %v\nstderr:\n%s", err, stderr.String())
 	}
-	if got := atomic.LoadInt32(&hits); got == 0 {
-		t.Fatalf("the stub endpoint was never called, so OPENAI_BASE_URL was ignored\n%s", out)
+
+	events := parseEventStream(t, stderr.Bytes())
+	wantInOrder := []string{"version", "probe", "stage", "stage", "progress", "done"}
+	if got := kindsOf(events); !containsSubsequence(got, wantInOrder) {
+		t.Errorf("event kinds = %v, want %v as a subsequence", got, wantInOrder)
+	}
+	if n := countOf(events, "done"); n != 1 {
+		t.Errorf("%d done events, want exactly one", n)
+	}
+	if n := countOf(events, "error"); n != 0 {
+		t.Errorf("%d error events on a successful run, want none", n)
+	}
+	for _, e := range events {
+		if e["type"] == "done" && e["path"] == "" {
+			t.Error("the done event carries no path, so a consumer cannot open the result")
+		}
+	}
+}
+
+// TestTheOrdinaryRunReportsUntranslatedBlocks pins the warning event on the
+// default path: a run where a block could not be translated must say so
+// through the event stream — kind, count and total — and must not look
+// identical to a run where nothing failed.
+func TestTheOrdinaryRunReportsUntranslatedBlocks(t *testing.T) {
+	srv := stubTranslateEndpointRefusingSomeBlocks(t, refusedBlockMarker)
+	bin := buildCLI(t)
+	dir := t.TempDir()
+	binDir := subtitleSourceStubs(t, dir, untranslatableBlockSRT)
+
+	film := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(film, []byte("not really a film"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stderr bytes.Buffer
+	cmd := exec.Command(bin, "-events", "json", "-to", "es", "-source", "sub", "-from", "en", "-track", "0", film)
+	cmd.Env = append(os.Environ(),
+		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"OPENAI_API_KEY=sk-test",
+		"OPENAI_BASE_URL="+srv.URL,
+		"XDG_CONFIG_HOME="+filepath.Join(dir, "cfg"),
+	)
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("want exit 0 — a partial translation failure is a warning, not a fatal error — got %v\nstderr:\n%s", err, stderr.String())
+	}
+
+	events := parseEventStream(t, stderr.Bytes())
+	if got := kindsOf(events); !containsSubsequence(got, []string{"warning", "done"}) {
+		t.Errorf("event kinds = %v, want a warning before the done event", got)
+	}
+	if n := countOf(events, "warning"); n != 1 {
+		t.Fatalf("%d warning events, want exactly one:\n%s", n, stderr.String())
+	}
+	if n := countOf(events, "done"); n != 1 {
+		t.Errorf("%d done events, want exactly one", n)
+	}
+
+	var w map[string]any
+	for _, e := range events {
+		if e["type"] == "warning" {
+			w = e
+		}
+	}
+	if kind, _ := w["kind"].(string); kind != "blocks_untranslated" {
+		t.Errorf("warning kind = %q, want blocks_untranslated", kind)
+	}
+	if count, _ := w["count"].(float64); count <= 0 {
+		t.Errorf("warning count = %v, want > 0", w["count"])
+	}
+	// untranslatableBlockSRT parses to exactly two blocks.
+	if total, _ := w["total"].(float64); total != 2 {
+		t.Errorf("warning total = %v, want 2 (the number of blocks in the source)", w["total"])
+	}
+}
+
+// TestTheOrdinaryRunEmitsTheContainerDoneEvent pins the other done event on
+// the default path. The sidecar test above only ever exercises the mode-srt
+// branch (the tool's own default), which never reaches the mux branch's
+// separate, later events.Done call — so -mode mux is what drives that one.
+func TestTheOrdinaryRunEmitsTheContainerDoneEvent(t *testing.T) {
+	srv := stubTranslateEndpoint(t)
+	bin := buildCLI(t)
+	dir := t.TempDir()
+	binDir := subtitleSourceStubs(t, dir, subtitleTrackSRT)
+
+	film := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(film, []byte("not really a film"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stderr bytes.Buffer
+	cmd := exec.Command(bin, "-events", "json", "-to", "es", "-source", "sub",
+		"-from", "en", "-track", "0", "-mode", "mux", film)
+	cmd.Env = append(os.Environ(),
+		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"OPENAI_API_KEY=sk-test",
+		"OPENAI_BASE_URL="+srv.URL,
+		"XDG_CONFIG_HOME="+filepath.Join(dir, "cfg"),
+	)
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("want exit 0, got %v\nstderr:\n%s", err, stderr.String())
+	}
+
+	events := parseEventStream(t, stderr.Bytes())
+	if got := kindsOf(events); !containsSubsequence(got, []string{"stage", "done"}) {
+		t.Errorf("event kinds = %v, want a mux stage before the done event", got)
+	}
+	if n := countOf(events, "done"); n != 1 {
+		t.Fatalf("%d done events, want exactly one:\n%s", n, stderr.String())
+	}
+	var done map[string]any
+	for _, e := range events {
+		if e["type"] == "done" {
+			done = e
+		}
+	}
+	wantPath := media.DefaultOutputPath(film, "es")
+	if got, _ := done["path"].(string); got != wantPath {
+		t.Errorf("done path = %q, want %q (the muxed container, not a sidecar)", got, wantPath)
 	}
 }
 
