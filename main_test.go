@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -472,6 +473,83 @@ func envWithout(env []string, name string) []string {
 		}
 	}
 	return out
+}
+
+// subtitleTrackSRT is the body subtitleSourceStubs' ffmpeg stub writes out for
+// -source sub to extract and parse: two ordinary blocks, enough to prove a real
+// translation request went out, with nothing about their content that matters.
+const subtitleTrackSRT = "1\n00:00:01,000 --> 00:00:03,000\nHello there\n\n" +
+	"2\n00:00:05,000 --> 00:00:07,000\nGeneral Kenobi\n\n"
+
+// TestTheCompiledBinaryHonoursOPENAI_BASE_URL is the test that the ordinary
+// run's whole event stream depends on: without it no test can drive a real
+// process through a successful translation, because the only other way to
+// reach a stub endpoint is a package variable (newTranslateClient, swapped by
+// stubTranslator) a subprocess cannot see. It drives the compiled binary
+// through a real -source sub run and asserts the translation request reached
+// the env var's endpoint rather than the real one.
+func TestTheCompiledBinaryHonoursOPENAI_BASE_URL(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		// Echo every requested line back unchanged, keyed exactly as asked: the
+		// point of this server is that it was reached, not what it says back, and
+		// answering every key it is actually sent — rather than a fixed key that
+		// may not match the batch's numbering — keeps the run from failing for an
+		// unrelated reason (a malformed-reply retry exhausting into a fatal error).
+		var req struct {
+			Messages []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var user string
+		for _, m := range req.Messages {
+			if m.Role == "user" {
+				user = m.Content
+			}
+		}
+		var payload struct {
+			Translate map[string]string `json:"translate"`
+		}
+		json.Unmarshal([]byte(user), &payload)
+		out := make(map[string]string, len(payload.Translate))
+		for k, v := range payload.Translate {
+			out[k] = "ES:" + v
+		}
+		content, _ := json.Marshal(out)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"choices":[{"message":{"content":%q}}]}`, content)
+	}))
+	defer srv.Close()
+
+	bin := buildCLI(t)
+	dir := t.TempDir()
+	binDir := subtitleSourceStubs(t, dir, subtitleTrackSRT)
+
+	film := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(film, []byte("not really a film"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(bin, "-to", "es", "-source", "sub", "-from", "en", "-track", "0", film)
+	cmd.Env = append(os.Environ(),
+		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"OPENAI_API_KEY=sk-test",
+		"OPENAI_BASE_URL="+srv.URL,
+		"XDG_CONFIG_HOME="+filepath.Join(dir, "cfg"),
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run failed: %v\n%s", err, out)
+	}
+	if got := atomic.LoadInt32(&hits); got == 0 {
+		t.Fatalf("the stub endpoint was never called, so OPENAI_BASE_URL was ignored\n%s", out)
+	}
 }
 
 // The event stream is an addition, not a replacement: a person running the tool

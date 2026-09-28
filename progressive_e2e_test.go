@@ -165,6 +165,52 @@ exit 0
 	return dir, binDir, tmpDir, langLog
 }
 
+// subtitleSourceStubs plants the ffprobe and ffmpeg stubs a compiled-binary run
+// under -source sub needs, in dir/bin, and returns that directory.
+//
+// It is a sibling of progressiveStubs, not a replacement for it in this role:
+// progressiveStubs' ffprobe answers every call with a bare duration number,
+// which is what runProgressive's direct ContainerDuration calls want but is not
+// valid JSON — and every compiled-binary run reaches media.Probe (-show_streams,
+// JSON) before it reaches anything else, on every -source. Changing
+// progressiveStubs to speak JSON would ripple into the several tests above that
+// already depend on its current shape, so this is a separate stub set instead:
+// one subtitle stream (no confirmation prompt, no whisper needed at all), and an
+// ffmpeg extraction stub that writes srtBody — a real, parseable SRT body — to
+// whatever output path it is given, standing in for the real subtitle track
+// media.ExtractSubtitle would otherwise pull out of the container.
+func subtitleSourceStubs(t *testing.T, dir, srtBody string) (binDir string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("the stubs are POSIX shell scripts")
+	}
+
+	binDir = filepath.Join(dir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	writeStub(t, filepath.Join(binDir, "ffprobe"), "#!/bin/sh\n"+`cat <<JSON
+{"streams":[
+ {"index":0,"codec_type":"subtitle","codec_name":"srt","tags":{"language":"eng"}}
+],"format":{"duration":"120.5"}}
+JSON
+`)
+	// ExtractSubtitle's last argument is always the output path, exactly like the
+	// audio-extraction stub above; here the bytes matter, so a real SRT body goes
+	// in rather than a placeholder.
+	writeStub(t, filepath.Join(binDir, "ffmpeg"), `#!/bin/sh
+out=""
+for a in "$@"; do out="$a"; done
+cat > "$out" <<'SRTBODY'
+`+srtBody+`
+SRTBODY
+exit 0
+`)
+
+	return binDir
+}
+
 // TestRunProgressiveEndToEnd is the run the spec asks for: three chunks against
 // a stub whisper binary, asserting the output file exists and grows after each,
 // that timestamps in later chunks are offset correctly, and that the final file

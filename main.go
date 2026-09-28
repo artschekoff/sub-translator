@@ -801,7 +801,12 @@ var newTranslateClient = func(o translate.Options) (translate.Translator, error)
 // writing it to disk.
 func resolveTranslateOptions(c *config.Config, workersFlag int) translate.Options {
 	return translate.Options{
-		APIKey:  firstNonEmpty(os.Getenv("OPENAI_API_KEY"), c.Translate.APIKey),
+		APIKey: firstNonEmpty(os.Getenv("OPENAI_API_KEY"), c.Translate.APIKey),
+		// Environment only, deliberately not config: this redirects every request
+		// the run makes, so it belongs to one invocation rather than to a file a
+		// user forgets they wrote. A persisted wrong endpoint fails in a way that
+		// looks like the network rather than like a setting.
+		BaseURL: os.Getenv("OPENAI_BASE_URL"),
 		Model:   firstNonEmpty(c.Translate.Model, translate.DefaultModel),
 		Workers: resolveWorkers(workersFlag, c.Translate.Workers),
 	}

@@ -274,6 +274,12 @@ sub-translator config set translate.api-key sk-...
 
 The key is read from `OPENAI_API_KEY` first, then from `translate.api-key`. With neither set, a run refuses to start and says so before the video is even probed — it does not get discovered an hour into a transcription. `config list` shows the key masked (`sk-…a4f2`); `config get translate.api-key` prints it in full, because that is how a script reads it back.
 
+Set `OPENAI_BASE_URL` to redirect every translation request the run makes, for the same three reasons anyone points a chat client at a different URL: an OpenAI-compatible local server, a corporate proxy, or an Azure OpenAI endpoint. It is environment-only — there is no config equivalent — because it redirects a whole invocation rather than persisting a setting a user could forget they wrote and then spend an hour debugging a network problem that is really a wrong endpoint.
+
+```bash
+OPENAI_BASE_URL=https://your-proxy.example.com/v1/chat/completions sub-translator -to es movie.mkv
+```
+
 Each request carries 40 subtitle blocks plus the three source lines before them as context, so names, who is addressing whom and formality survive from line to line. Timing lines are never sent.
 
 The model is `translate.model`, default **`gpt-6-luna`**. Of the current line — Astra for complex reasoning, Sol for a balance of intelligence and cost, Luna for cost-sensitive high-volume work — subtitles are the high-volume case and not a reasoning problem, so Luna is the right default. Set another id if you disagree:
