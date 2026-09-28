@@ -93,6 +93,17 @@ func TestKillGroupOnAnAlreadyExitedChildIsNotAnError(t *testing.T) {
 		t.Fatal(err)
 	}
 	pid := cmd.Process.Pid
+	// cmd.Wait directly, not proc.Wait, so the registry is not told this pid
+	// was reaped — deliberately, since the whole point of this test is to call
+	// KillGroup on a pid the registry still believes is live. That leaves a
+	// stale entry behind, and this package's tests share one process-lifetime
+	// registry with no reset between cases: left alone, a later
+	// KillAllGroups — in this test binary, KillAllGroups is exercised by
+	// several others — would send an unguarded kill(-pid) at a pid the kernel
+	// is free to have handed to somebody else by then. So this test cleans up
+	// its own deliberately-stale entry rather than leaving it for the next one
+	// to trip over.
+	t.Cleanup(func() { forget(pid) })
 	if err := cmd.Wait(); err != nil {
 		t.Fatal(err)
 	}

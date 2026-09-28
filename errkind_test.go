@@ -110,10 +110,13 @@ func TestEveryErrKindIsDocumented(t *testing.T) {
 // stageNameInSource finds the stage names the code actually emits, by scanning
 // the source rather than requiring a bespoke runtime test for each one. That
 // used to be the only way to reach two of the five — extract-subs and mux —
-// but is not any more: stubTranslateEndpoint lets a compiled-binary test point
-// translation at a local server instead of the real endpoint, and both are now
-// driven to completion that way (TestTheSubtitlePathEmitsTheExtractSubsStage,
-// TestTheOrdinaryRunEmitsTheContainerDoneEvent, TestTheMuxWriteIsClassified).
+// but is not any more, though the two reach the compiled binary by different
+// routes. TestTheSubtitlePathEmitsTheExtractSubsStage drives extract-subs on
+// its own: the run fails before translation is ever attempted, so it needs no
+// translate stub at all. mux is reached only past a successful translation, so
+// TestTheOrdinaryRunEmitsTheContainerDoneEvent and TestTheMuxWriteIsClassified
+// depend on stubTranslateEndpoint, which lets a compiled-binary test point
+// translation at a local server instead of the real endpoint.
 // This scan still earns its place regardless: it is what stands between any of
 // the five and being deleted with the suite green, because the emitted set,
 // the README's table and the spec's list have to agree, and removing an emit

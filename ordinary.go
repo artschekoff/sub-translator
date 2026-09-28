@@ -253,12 +253,11 @@ func runOrdinary(o ordinaryOptions) error {
 		// stream goes probe → stage translate and a window has nothing to show
 		// for the extraction and the SRT parse.
 		ev.Emit(&events.Stage{Name: "extract-subs"})
-		// No progress callback here: pulling one subtitle track out of a
-		// container is a text demux, not the minutes-long decode ExtractAudio
-		// and MuxSubtitle can be, and TestOrdinaryRunSpawnsFfprobeOnlyWhenEventsAreOn
-		// pins that an off feature (nothing listening for progress here) must
-		// not cost a ContainerDuration probe it has no use for.
-		if err := media.ExtractSubtitle(input, srcStream.Index, tmpSRT, nil); err != nil {
+		// ExtractSubtitle takes no progress callback at all — see its doc
+		// comment in internal/media/media.go for why — so there is nothing to
+		// wire here the way extractionProgress() and muxProgress() are wired
+		// below.
+		if err := media.ExtractSubtitle(input, srcStream.Index, tmpSRT); err != nil {
 			return errf("extract: %v", err)
 		}
 

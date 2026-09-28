@@ -333,29 +333,28 @@ The corresponding flags — `-whisper-model`, `-whisper-bin`, `-vad-model`, `-ch
 sub-translator -events json -to es -source audio -fast movie.mkv 2> events.jsonl
 ```
 
-**Skip the lines that are not JSON.** stderr carries this tool's own prose as well as the events, by design: the `warning:` lines, the one `error:` line, the usage text, and the interactive prompts. A consumer must therefore treat a line that does not parse as JSON as human output and ignore it, rather than treating it as a protocol error. Every line this tool writes is whole — the events and the prose share one lock, so neither can land inside the other, and an event emitted while a line is unfinished (an interactive prompt, which ends without a newline because the answer is typed on the same line) breaks that line first rather than continuing it — and the ffmpeg children's output no longer reaches stderr at all: it is captured and surfaced only in the error message of a step that failed. (The visible consequence for a person is that a run no longer prints ffmpeg's progress chatter.)
+**Skip the lines that are not JSON.** stderr carries this tool's own prose as well as the events, by design: the `warning:` lines, the one `error:` line, the usage text, and the interactive prompts. A consumer must therefore treat a line that does not parse as JSON as human output and ignore it, rather than treating it as a protocol error. Every line this tool writes is whole — the events and the prose share one lock, so neither can land inside the other, and an event emitted while a line is unfinished (an interactive prompt, which ends without a newline because the answer is typed on the same line) breaks that line first rather than continuing it — and the ffmpeg children's own output no longer reaches stderr at all: it is captured and surfaced only in the error message of a step that failed. (The visible consequence for a person is that a run no longer prints ffmpeg's *raw* progress chatter — extraction, muxing and slicing still show a `\r`-rewritten `name: N%` line, in the tool's own voice and on the `progress` event alike, computed from the same percentage so the two cannot disagree.)
 
 Every event carries `type` and `t` (an RFC 3339 UTC timestamp). The first line of any run is always a `version` event, so a consumer can refuse a stream it does not understand rather than guess. The shape below — every event, field and omission — was verified by running a `-fast` transcription against this code:
 
 ```json
-{"type":"version","t":"2026-09-27T16:49:08Z","events":1,"tool":"1.4.0"}
-{"type":"probe","t":"2026-09-27T16:49:08Z","duration":8348.674,"audio":[{"index":1,"lang":"eng","title":"Original","codec":"ac3"}],"subtitles":[],"fast":{"sources":["audio"],"modes":["srt"],"min_chunk_minutes":1}}
-{"type":"stage","t":"2026-09-27T16:49:08Z","name":"extract"}
-{"type":"stage","t":"2026-09-27T16:49:08Z","name":"transcribe","chunk":1,"of":14,"from":"0:00:00","to":"0:10:00"}
-{"type":"progress","t":"2026-09-27T16:49:09Z","pct":100}
-{"type":"language","t":"2026-09-27T16:49:09Z","detected":"en"}
-{"type":"stage","t":"2026-09-27T16:49:09Z","name":"translate","chunk":1,"of":14}
-{"type":"progress","t":"2026-09-27T16:49:09Z","pct":100}
-{"type":"saved","t":"2026-09-27T16:49:09Z","path":"/…/movie.es.srt","covers":"0:10:00","watchable":true}
-{"type":"stage","t":"2026-09-27T16:49:09Z","name":"transcribe","chunk":2,"of":14,"from":"0:10:00","to":"0:20:00"}
-{"type":"progress","t":"2026-09-27T16:49:09Z","pct":100}
-{"type":"stage","t":"2026-09-27T16:49:09Z","name":"translate","chunk":2,"of":14}
-{"type":"progress","t":"2026-09-27T16:49:09Z","pct":100}
-{"type":"saved","t":"2026-09-27T16:49:09Z","path":"/…/movie.es.srt","covers":"0:20:00","watchable":true}
-{"type":"done","t":"2026-09-27T16:49:10Z","path":"/…/movie.es.srt","covers":"2:19:08"}
+{"type":"version","t":"2026-09-28T21:48:29Z","events":1,"tool":"1.4.0"}
+{"type":"probe","t":"2026-09-28T21:48:30Z","duration":8348.674,"audio":[{"index":1,"lang":"eng","title":"Original","codec":"ac3"}],"subtitles":[],"fast":{"sources":["audio"],"modes":["srt"],"min_chunk_minutes":1}}
+{"type":"stage","t":"2026-09-28T21:48:30Z","name":"extract"}
+{"type":"stage","t":"2026-09-28T21:48:30Z","name":"transcribe","chunk":1,"of":14,"from":"0:00:00","to":"0:10:00"}
+{"type":"progress","t":"2026-09-28T21:48:30Z","pct":100}
+{"type":"stage","t":"2026-09-28T21:48:30Z","name":"translate","chunk":1,"of":14}
+{"type":"progress","t":"2026-09-28T21:48:30Z","pct":100}
+{"type":"saved","t":"2026-09-28T21:48:31Z","path":"/…/movie.es.srt","covers":"0:10:00","watchable":true}
+{"type":"stage","t":"2026-09-28T21:48:31Z","name":"transcribe","chunk":2,"of":14,"from":"0:10:00","to":"0:20:00"}
+{"type":"progress","t":"2026-09-28T21:48:31Z","pct":100}
+{"type":"stage","t":"2026-09-28T21:48:31Z","name":"translate","chunk":2,"of":14}
+{"type":"progress","t":"2026-09-28T21:48:31Z","pct":100}
+{"type":"saved","t":"2026-09-28T21:48:31Z","path":"/…/movie.es.srt","covers":"0:20:00","watchable":true}
+{"type":"done","t":"2026-09-28T21:48:35Z","path":"/…/movie.es.srt","covers":"2:19:08"}
 ```
 
-Simplified for readability, in four ways worth knowing about: the paths and the track metadata are shortened; the run's fourteen chunks are trimmed to two; each `progress` burst is shown as the single event that ends it, where a real run emits one per batch of blocks translated and one per percentage whisper reports, so a fourteen-chunk film produces hundreds of them; and the `language` line is shown where a run that was not told `-from` emits it (the verified run named its source language, so it had nothing to report).
+Simplified for readability, in three ways worth knowing about: the paths and the track metadata are shortened; the run's fourteen chunks are trimmed to two; and each `progress` burst is shown as the single event that ends it, where a real run emits one per percentage whisper reports and one per batch of blocks translated, so a fourteen-chunk film produces hundreds of them. No `language` event appears here because the verified run was told `-from en` and whisper agreed; omitting `-from` (or a transcript in a language other than the one asked for) is what makes that event fire — see below.
 
 `language` is emitted once, when whisper reports a source language that differs from the one that was asked for (including when none was asked for). Everything downstream — the transcript sidecar's filename, the translation — uses the language in that event from then on.
 
@@ -371,7 +370,7 @@ The `stage` names are the five phases a run can go through:
 | `translate` | the OpenAI round trips; carries `chunk`/`of` under `-fast` |
 | `mux` | writing the new container (`-mode mux`/`both`) |
 
-`progress` carries no stage of its own: a consumer reads it against the most recent `stage` event, which is always the one immediately before the burst.
+`progress` carries no stage of its own: a consumer reads it against the most recent `stage` event, which is always the one immediately before the burst — with one exception. `extract`, `transcribe`, `translate` and `mux` can all produce a burst: whisper reports percentages during `transcribe`, the translation batches do during `translate`, and ffmpeg's own `time=` field drives one during `extract` and `mux`. The exception is a `-fast` chunk's slice off the full WAV, which ffmpeg also cuts and could in principle report on: it runs *before* that chunk's own `transcribe` stage is emitted, so a burst from it (rare in practice — `-c copy` finishes too fast to have much to say) would read against whatever stage came before — the previous chunk's `translate`, or `extract` for the first chunk — not the chunk it actually belongs to. `extract-subs` never produces one: a text demux is fast enough that nothing is worth reporting on it.
 
 `warning` reports blocks that could not be translated and kept their original text. Its `kind` is currently always `"blocks_untranslated"` — it is there so a second kind of warning can be added without breaking a consumer — `count` is how many blocks kept their source text, and `total` is how many blocks the run produced in all (for `-fast`, the whole film's merged blocks, not one chunk's). A warning always precedes `done`, never follows it.
 

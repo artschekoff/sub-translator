@@ -809,18 +809,22 @@ func pctOfDuration(done, total time.Duration) int {
 }
 
 // mediaProgress builds the onProgress callback every ffmpeg-backed media
-// function takes: extraction and muxing used to be silent on both stdout and
-// the event stream, once ffmpeg's own stderr was captured instead of
-// inherited (see docs/superpowers/specs/2026-09-26-desktop-gui-design.md).
-// All four call sites — the ordinary run's subtitle extraction and mux, and
-// the -fast and ordinary audio extractions — share this one function rather
-// than each writing its own closure, so the printed line and the emitted
-// event can only ever agree by construction: pct is computed once and handed
-// to both.
+// function that reports progress takes: extraction, muxing and slicing used to
+// be silent on both stdout and the event stream, once ffmpeg's own stderr was
+// captured instead of inherited (see docs/superpowers/specs/2026-09-26-desktop-gui-design.md).
+// Its three real callers — the ordinary and -fast audio extractions (both
+// through extractionProgress), the mux (muxProgress), and each -fast chunk's
+// slice (sliceProgress) — share this one function rather than each writing its
+// own closure, so the printed line and the emitted event can only ever agree
+// by construction: pct is computed once and handed to both. ExtractSubtitle is
+// not among them: it takes no progress callback at all (see its doc comment in
+// internal/media/media.go).
 //
-// total<=0 means the ContainerDuration probe behind it did not learn a
-// length — an input ffprobe can't read, for instance — and nothing is
-// printed or emitted rather than a meaningless 0% or a divide-by-zero.
+// total<=0 means the length behind it was never learned: the ContainerDuration
+// probe an extraction or a mux runs against failed to read one — an input
+// ffprobe can't read, for instance — or, for a slice, its chunk was zero-length.
+// Either way nothing is printed or emitted rather than a meaningless 0% or a
+// divide-by-zero.
 func mediaProgress(label string) media.Progress {
 	return func(done, total time.Duration) {
 		if total <= 0 {
@@ -832,8 +836,10 @@ func mediaProgress(label string) media.Progress {
 	}
 }
 
-// extractionProgress is mediaProgress for pulling an audio or subtitle track
-// out of the container.
+// extractionProgress is mediaProgress for pulling the audio track out of the
+// container — shared by the ordinary run's own transcription path (main.go)
+// and the -fast path (progressive.go). It is never used for a subtitle track:
+// ExtractSubtitle takes no progress callback at all.
 func extractionProgress() media.Progress {
 	return mediaProgress("extracting")
 }

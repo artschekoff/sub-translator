@@ -241,12 +241,18 @@ func isProgressLine(line string) bool {
 	return strings.HasPrefix(s, "size=") || strings.HasPrefix(s, "frame=")
 }
 
-func ExtractSubtitle(input string, streamIndex int, outSRT string, onProgress Progress) error {
+// ExtractSubtitle takes no progress callback, unlike its three siblings below:
+// pulling one subtitle track out of a container is a text demux, not a
+// minutes-long decode, and there is nothing worth a ContainerDuration probe to
+// report on. Its one call site (ordinary.go) confirmed that live — wiring one
+// in triggered an extra ffprobe on every ordinary run and broke
+// TestOrdinaryRunSpawnsFfprobeOnlyWhenEventsAreOn.
+func ExtractSubtitle(input string, streamIndex int, outSRT string) error {
 	return runFFmpeg(exec.Command("ffmpeg", "-y",
 		"-i", input,
 		"-map", fmt.Sprintf("0:%d", streamIndex),
 		outSRT,
-	), progressReporter(input, onProgress))
+	), nil)
 }
 
 func AudioStreams(streams []Stream) []Stream {
