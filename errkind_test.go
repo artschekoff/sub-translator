@@ -13,18 +13,19 @@ import (
 // rather than left to whatever the constant happens to say.
 func TestErrKindsAreTheDocumentedStrings(t *testing.T) {
 	want := map[errKind]string{
-		errMissingKey:      "missing_key",
-		errInvalidKey:      "invalid_key",
-		errWhisperNotFound: "whisper_not_found",
-		errNoModel:         "no_model",
-		errAmbiguousModel:  "ambiguous_model",
-		errNoAudioTrack:    "no_audio_track",
-		errNoSubtitleTrack: "no_subtitle_track",
-		errProbeFailed:     "probe_failed",
-		errRateLimited:     "rate_limited",
-		errTranscriptEmpty: "transcript_empty",
-		errCancelled:       "cancelled",
-		errOther:           "other",
+		errMissingKey:       "missing_key",
+		errInvalidKey:       "invalid_key",
+		errWhisperNotFound:  "whisper_not_found",
+		errNoModel:          "no_model",
+		errAmbiguousModel:   "ambiguous_model",
+		errNoAudioTrack:     "no_audio_track",
+		errNoSubtitleTrack:  "no_subtitle_track",
+		errProbeFailed:      "probe_failed",
+		errOutputUnwritable: "output_unwritable",
+		errRateLimited:      "rate_limited",
+		errTranscriptEmpty:  "transcript_empty",
+		errCancelled:        "cancelled",
+		errOther:            "other",
 	}
 	for k, s := range want {
 		if string(k) != s {
@@ -106,12 +107,20 @@ func TestEveryErrKindIsDocumented(t *testing.T) {
 	}
 }
 
-// stageNameInSource finds the stage names the code actually emits. Two of the
-// five — extract-subs and mux — sit on paths no test can drive to completion
-// (the mux runs after a translation no compiled binary can be pointed at a test
-// endpoint for), so this is what stands between them and being deleted with the
-// suite green: the emitted set, the README's table and the spec's list have to
-// agree, and removing an emit breaks that agreement.
+// stageNameInSource finds the stage names the code actually emits, by scanning
+// the source rather than requiring a bespoke runtime test for each one. That
+// used to be the only way to reach two of the five — extract-subs and mux —
+// but is not any more, though the two reach the compiled binary by different
+// routes. TestTheSubtitlePathEmitsTheExtractSubsStage drives extract-subs on
+// its own: the run fails before translation is ever attempted, so it needs no
+// translate stub at all. mux is reached only past a successful translation, so
+// TestTheOrdinaryRunEmitsTheContainerDoneEvent and TestTheMuxWriteIsClassified
+// depend on stubTranslateEndpoint, which lets a compiled-binary test point
+// translation at a local server instead of the real endpoint.
+// This scan still earns its place regardless: it is what stands between any of
+// the five and being deleted with the suite green, because the emitted set,
+// the README's table and the spec's list have to agree, and removing an emit
+// breaks that agreement whether or not a runtime test happens to cover it.
 var stageNameInSource = regexp.MustCompile(`(?s)events\.Stage\{[^}]*Name:\s*"([a-z-]+)"`)
 
 // stageRowInREADME matches a row of the README's stage table.
@@ -119,7 +128,12 @@ var stageRowInREADME = regexp.MustCompile("(?m)^\\| `([a-z-]+)` \\|")
 
 func TestEveryStageNameIsEmittedAndDocumented(t *testing.T) {
 	emitted := map[string]bool{}
-	for _, file := range []string{"main.go", "progressive.go"} {
+	// Every source file, not a hand-written list of the two that happened to
+	// hold the emits: lifting main()'s pipeline into ordinary.go moved
+	// extract-subs and mux out of a hard-coded {main.go, progressive.go} and
+	// failed this test for a reason that had nothing to do with what it checks.
+	// goFiles is the same list the stderr test reads, and it cannot go stale.
+	for _, file := range goFiles(t) {
 		for _, m := range stageNameInSource.FindAllStringSubmatch(readRepoFile(t, file), -1) {
 			emitted[m[1]] = true
 		}

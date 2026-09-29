@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"time"
 
 	"github.com/artschekoff/sub-translator/internal/events"
@@ -42,6 +43,31 @@ func planChunks(total, chunkLen time.Duration) []chunkPlan {
 	return out
 }
 
+// fastSourceModes, fastOutputModes and fastMinChunkMins are the fast-mode rule.
+// The validators below read them, and so does the probe event, so a caller can
+// be told the rule instead of reimplementing it — and the rule cannot be
+// changed in one place only. TestTheStatedRuleIsTheEnforcedRule holds all three
+// together, the chunk floor included.
+var (
+	fastSourceModes  = []sourceMode{sourceAudio}
+	fastOutputModes  = []outputMode{modeSRT}
+	fastMinChunkMins = 1
+)
+
+// fastRule states the rule as data, for the probe event. The names come from
+// each mode's String method, not from a conversion: both types are ints backed
+// by iota, so string(m) would yield a control character rather than "srt".
+func fastRule() *events.FastRule {
+	r := &events.FastRule{MinChunkMinutes: fastMinChunkMins}
+	for _, s := range fastSourceModes {
+		r.Sources = append(r.Sources, s.String())
+	}
+	for _, m := range fastOutputModes {
+		r.Modes = append(r.Modes, m.String())
+	}
+	return r
+}
+
 // validateFastFlags rejects the -fast combinations that depend on nothing but
 // the flags. They are split out from the source check so they can be raised
 // before any work: -fast -mode mux used to probe the container, resolve whisper,
@@ -52,11 +78,11 @@ func validateFastFlags(fast bool, mode outputMode, chunkMinutes int) error {
 	if !fast {
 		return nil
 	}
-	if mode != modeSRT {
+	if !slices.Contains(fastOutputModes, mode) {
 		return fmt.Errorf("-fast cannot be combined with -mode %s: a video container "+
 			"cannot be rewritten piece by piece — use the default -mode srt", mode)
 	}
-	if chunkMinutes < 1 {
+	if chunkMinutes < fastMinChunkMins {
 		return fmt.Errorf("-chunk must be at least 1 minute, got %d", chunkMinutes)
 	}
 	return nil
@@ -68,7 +94,7 @@ func validateFastSource(fast bool, source sourceMode) error {
 	if !fast {
 		return nil
 	}
-	if source != sourceAudio {
+	if !slices.Contains(fastSourceModes, source) {
 		return fmt.Errorf("-fast only applies to transcription; there is nothing to wait for " +
 			"when reading an existing subtitle track — use -source audio")
 	}
@@ -166,7 +192,7 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 	fullWAV := filepath.Join(tmpDir, "audio.wav")
 	fmt.Printf("Extracting audio track #%d...\n", src.Index)
 	ev.Emit(&events.Stage{Name: "extract"})
-	if err := media.ExtractAudio(input, src.Index, fullWAV); err != nil {
+	if err := media.ExtractAudio(input, src.Index, fullWAV, extractionProgress()); err != nil {
 		return fmt.Errorf("extract audio: %w", err)
 	}
 
@@ -221,12 +247,17 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 
 	for _, c := range plan {
 		chunkWAV := filepath.Join(tmpDir, fmt.Sprintf("chunk-%03d.wav", c.Index))
-		if err := media.SliceWAV(fullWAV, c.Start, c.Dur, chunkWAV); err != nil {
-			return fail("chunk %d: slice audio: %w", c.Index+1, err)
-		}
-
-		fmt.Printf("Chunk %d/%d (%s–%s):\n", c.Index+1, len(plan),
-			formatClock(c.Start), formatClock(c.Start+c.Dur))
+		// Before the slice, not after it. A progress event carries no stage tag
+		// of its own — a consumer reads it against the most recent stage — so a
+		// slice that reported while this chunk's stage was still unannounced
+		// attributed its burst to whatever came before: extract for chunk 1, and
+		// the *previous* chunk's translate for the rest. A window showing "the
+		// current stage in words, a progress bar" then resets the bar to 0 and
+		// climbs it again under a stale label, with nothing on the wire to say
+		// the burst does not belong there.
+		//
+		// The printed "Chunk n/N" line deliberately stays below the slice, where
+		// it has always been, so stdout is byte-for-byte what it was.
 		ev.Emit(&events.Stage{
 			Name:  "transcribe",
 			Chunk: c.Index + 1,
@@ -234,6 +265,12 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 			From:  formatClock(c.Start),
 			To:    formatClock(c.Start + c.Dur),
 		})
+		if err := media.SliceWAV(fullWAV, c.Start, c.Dur, chunkWAV, sliceProgress()); err != nil {
+			return fail("chunk %d: slice audio: %w", c.Index+1, err)
+		}
+
+		fmt.Printf("Chunk %d/%d (%s–%s):\n", c.Index+1, len(plan),
+			formatClock(c.Start), formatClock(c.Start+c.Dur))
 		// The language is settled by the first chunk and then forced, so whisper
 		// cannot change its mind halfway and hand back a two-language file.
 		parsed, detected, err := transcribeInto(opts, chunkWAV,
@@ -342,7 +379,12 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 		}
 
 		if err := srt.Write(outPath, srt.Renumber(outBlocks)); err != nil {
-			return fail("chunk %d: write %s: %w", c.Index+1, outPath, err)
+			// outPath is srtOutputPath's answer — the user's own -out, or the
+			// default sidecar path next to their film — never a scratch file, so
+			// a failure writing it is one they can fix by choosing somewhere
+			// else. kindErrf's message is %v-formatted, so wrapping it here with
+			// %w leaves this error's text exactly what it was.
+			return fail("chunk %d: write %s: %w", c.Index+1, outPath, kindErrf(errOutputUnwritable, "%v", err))
 		}
 
 		// Whether this is the first watchable file, rather than whether this is
@@ -380,7 +422,7 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 			Total: len(outBlocks),
 			First: first,
 		})
-		ev.Emit(&events.Done{Path: outPath, Covers: formatClock(total)})
+		emitDone(&events.Done{Path: outPath, Covers: formatClock(total)})
 		notifyDone("Subtitles ready, with gaps",
 			fmt.Sprintf("%s — %d blocks untranslated", filepath.Base(outPath), len(failedAll)))
 		return nil
@@ -388,7 +430,7 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 
 	fmt.Printf("Done: %s covers the full %s — reload subtitles in your player\n",
 		outPath, formatClock(total))
-	ev.Emit(&events.Done{Path: outPath, Covers: formatClock(total)})
+	emitDone(&events.Done{Path: outPath, Covers: formatClock(total)})
 	notifyDone("Subtitles ready", filepath.Base(outPath))
 	return nil
 }

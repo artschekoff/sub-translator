@@ -1,11 +1,5 @@
 package main
 
-import (
-	"fmt"
-
-	"github.com/artschekoff/sub-translator/internal/events"
-)
-
 // errKind classifies a fatal error so a program driving this tool can act on the
 // reason instead of matching on the wording. The strings are a contract: a
 // wrapper switches on them, so they are pinned by a test and must not be
@@ -26,6 +20,13 @@ const (
 	errNoAudioTrack    errKind = "no_audio_track"
 	errNoSubtitleTrack errKind = "no_subtitle_track"
 	errProbeFailed     errKind = "probe_failed"
+
+	// errOutputUnwritable is a path the user chose that cannot be written: a
+	// read-only directory, a full disk, a name the filesystem refuses. Separate
+	// from errOther because the GUI picks the save path, so this is the one
+	// write failure a user can fix by choosing somewhere else.
+	errOutputUnwritable errKind = "output_unwritable"
+
 	errRateLimited     errKind = "rate_limited"
 	errTranscriptEmpty errKind = "transcript_empty"
 	errCancelled       errKind = "cancelled"
@@ -49,6 +50,7 @@ func allErrKinds() []errKind {
 		errNoAudioTrack,
 		errNoSubtitleTrack,
 		errProbeFailed,
+		errOutputUnwritable,
 		errRateLimited,
 		errTranscriptEmpty,
 		errCancelled,
@@ -61,11 +63,11 @@ func allErrKinds() []errKind {
 // reports no kind because there is nothing useful to say about it — but still
 // emits, with kind "other".
 //
-// This goes straight to fatalTail rather than through fatalf: fatalf emits its
-// own error event (kind "other"), and calling it here would double-emit —
-// once with this kind, once with "other" — for every classified failure.
+// This builds its own classified error and hands it to exitWith rather than
+// going through fatalf: fatalf's error is kind "other", so routing through it
+// would relabel every classified failure. exitWith reads the kind back off the
+// error it is given, which is how one emit serves both helpers without either
+// of them emitting a second time.
 func fatalKindf(kind errKind, format string, args ...any) {
-	msg := fmt.Sprintf(format, args...)
-	ev.Emit(&events.Error{Kind: string(kind), Message: msg})
-	fatalTail("%s", msg)
+	exitWith(kindErrf(kind, format, args...))
 }

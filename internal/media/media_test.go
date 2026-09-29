@@ -259,7 +259,7 @@ func TestASuccessfulFfmpegWritesNothingToOurStderr(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "audio.wav")
 	var err error
 	leaked := captureProcessStderr(t, func() {
-		err = ExtractAudio("movie.mkv", 1, out)
+		err = ExtractAudio("movie.mkv", 1, out, nil)
 	})
 	if err != nil {
 		t.Fatalf("ExtractAudio() = %v, want success", err)
@@ -280,7 +280,7 @@ func TestAFailingFfmpegsDiagnosticsTravelInTheError(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "audio.wav")
 	var err error
 	leaked := captureProcessStderr(t, func() {
-		err = ExtractAudio("movie.mkv", 1, out)
+		err = ExtractAudio("movie.mkv", 1, out, nil)
 	})
 	if err == nil {
 		t.Fatal("ExtractAudio() = nil, want the stub's failure")
@@ -313,7 +313,7 @@ func TestFfmpegDiagnosticsKeepsTheDiagnosticBehindTheProgressChatter(t *testing.
 	}
 	raw.WriteString("Conversion failed!\n")
 
-	got := ffmpegDiagnostics(strings.NewReader(raw.String()))
+	got := ffmpegDiagnostics(strings.NewReader(raw.String()), nil)
 	if !strings.Contains(got, "Conversion failed!") {
 		t.Errorf("diagnostics lost the failure line:\n%q", got)
 	}

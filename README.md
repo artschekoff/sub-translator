@@ -274,6 +274,12 @@ sub-translator config set translate.api-key sk-...
 
 The key is read from `OPENAI_API_KEY` first, then from `translate.api-key`. With neither set, a run refuses to start and says so before the video is even probed — it does not get discovered an hour into a transcription. `config list` shows the key masked (`sk-…a4f2`); `config get translate.api-key` prints it in full, because that is how a script reads it back.
 
+Set `OPENAI_BASE_URL` to redirect every translation request the run makes, for the same three reasons anyone points a chat client at a different URL: an OpenAI-compatible local server, a corporate proxy, or an Azure OpenAI endpoint. It is environment-only — there is no config equivalent — because it redirects a whole invocation rather than persisting a setting a user could forget they wrote and then spend an hour debugging a network problem that is really a wrong endpoint.
+
+```bash
+OPENAI_BASE_URL=https://your-proxy.example.com/v1/chat/completions sub-translator -to es movie.mkv
+```
+
 Each request carries 40 subtitle blocks plus the three source lines before them as context, so names, who is addressing whom and formality survive from line to line. Timing lines are never sent.
 
 The model is `translate.model`, default **`gpt-6-luna`**. Of the current line — Astra for complex reasoning, Sol for a balance of intelligence and cost, Luna for cost-sensitive high-volume work — subtitles are the high-volume case and not a reasoning problem, so Luna is the right default. Set another id if you disagree:
@@ -327,31 +333,34 @@ The corresponding flags — `-whisper-model`, `-whisper-bin`, `-vad-model`, `-ch
 sub-translator -events json -to es -source audio -fast movie.mkv 2> events.jsonl
 ```
 
-**Skip the lines that are not JSON.** stderr carries this tool's own prose as well as the events, by design: the `warning:` lines, the one `error:` line, the usage text, and the interactive prompts. A consumer must therefore treat a line that does not parse as JSON as human output and ignore it, rather than treating it as a protocol error. Every line this tool writes is whole — the events and the prose share one lock, so neither can land inside the other, and an event emitted while a line is unfinished (an interactive prompt, which ends without a newline because the answer is typed on the same line) breaks that line first rather than continuing it — and the ffmpeg children's output no longer reaches stderr at all: it is captured and surfaced only in the error message of a step that failed. (The visible consequence for a person is that a run no longer prints ffmpeg's progress chatter.)
+**Skip the lines that are not JSON.** stderr carries this tool's own prose as well as the events, by design: the `warning:` lines, the one `error:` line, the usage text, and the interactive prompts. A consumer must therefore treat a line that does not parse as JSON as human output and ignore it, rather than treating it as a protocol error. Every line this tool writes is whole — the events and the prose share one lock, so neither can land inside the other, and an event emitted while a line is unfinished (an interactive prompt, which ends without a newline because the answer is typed on the same line) breaks that line first rather than continuing it — and the ffmpeg children's own output no longer reaches stderr at all: it is captured and surfaced only in the error message of a step that failed. (The visible consequence for a person is that a run no longer prints ffmpeg's *raw* progress chatter — extraction, muxing and slicing still show a `\r`-rewritten `name: N%` line, in the tool's own voice and on the `progress` event alike, computed from the same percentage so the two cannot disagree.)
 
 Every event carries `type` and `t` (an RFC 3339 UTC timestamp). The first line of any run is always a `version` event, so a consumer can refuse a stream it does not understand rather than guess. The shape below — every event, field and omission — was verified by running a `-fast` transcription against this code:
 
 ```json
-{"type":"version","t":"2026-09-27T16:49:08Z","events":1,"tool":"1.4.0"}
-{"type":"probe","t":"2026-09-27T16:49:08Z","duration":8348.674,"audio":[{"index":1,"lang":"eng","title":"Original","codec":"ac3"}],"subtitles":[]}
-{"type":"stage","t":"2026-09-27T16:49:08Z","name":"extract"}
-{"type":"stage","t":"2026-09-27T16:49:08Z","name":"transcribe","chunk":1,"of":14,"from":"0:00:00","to":"0:10:00"}
-{"type":"progress","t":"2026-09-27T16:49:09Z","pct":100}
-{"type":"language","t":"2026-09-27T16:49:09Z","detected":"en"}
-{"type":"stage","t":"2026-09-27T16:49:09Z","name":"translate","chunk":1,"of":14}
-{"type":"progress","t":"2026-09-27T16:49:09Z","pct":100}
-{"type":"saved","t":"2026-09-27T16:49:09Z","path":"/…/movie.es.srt","covers":"0:10:00","watchable":true}
-{"type":"stage","t":"2026-09-27T16:49:09Z","name":"transcribe","chunk":2,"of":14,"from":"0:10:00","to":"0:20:00"}
-{"type":"progress","t":"2026-09-27T16:49:09Z","pct":100}
-{"type":"stage","t":"2026-09-27T16:49:09Z","name":"translate","chunk":2,"of":14}
-{"type":"progress","t":"2026-09-27T16:49:09Z","pct":100}
-{"type":"saved","t":"2026-09-27T16:49:09Z","path":"/…/movie.es.srt","covers":"0:20:00","watchable":true}
-{"type":"done","t":"2026-09-27T16:49:10Z","path":"/…/movie.es.srt","covers":"2:19:08"}
+{"type":"version","t":"2026-09-28T21:48:29Z","events":1,"tool":"1.4.0"}
+{"type":"probe","t":"2026-09-28T21:48:30Z","duration":8348.674,"audio":[{"index":1,"lang":"eng","title":"Original","codec":"ac3"}],"subtitles":[],"fast":{"sources":["audio"],"modes":["srt"],"min_chunk_minutes":1},"embeds_subtitles":true}
+{"type":"stage","t":"2026-09-28T21:48:30Z","name":"extract"}
+{"type":"stage","t":"2026-09-28T21:48:30Z","name":"transcribe","chunk":1,"of":14,"from":"0:00:00","to":"0:10:00"}
+{"type":"progress","t":"2026-09-28T21:48:30Z","pct":100}
+{"type":"stage","t":"2026-09-28T21:48:30Z","name":"translate","chunk":1,"of":14}
+{"type":"progress","t":"2026-09-28T21:48:30Z","pct":100}
+{"type":"saved","t":"2026-09-28T21:48:31Z","path":"/…/movie.es.srt","covers":"0:10:00","watchable":true}
+{"type":"stage","t":"2026-09-28T21:48:31Z","name":"transcribe","chunk":2,"of":14,"from":"0:10:00","to":"0:20:00"}
+{"type":"progress","t":"2026-09-28T21:48:31Z","pct":100}
+{"type":"stage","t":"2026-09-28T21:48:31Z","name":"translate","chunk":2,"of":14}
+{"type":"progress","t":"2026-09-28T21:48:31Z","pct":100}
+{"type":"saved","t":"2026-09-28T21:48:31Z","path":"/…/movie.es.srt","covers":"0:20:00","watchable":true}
+{"type":"done","t":"2026-09-28T21:48:35Z","path":"/…/movie.es.srt","covers":"2:19:08"}
 ```
 
-Simplified for readability, in four ways worth knowing about: the paths and the track metadata are shortened; the run's fourteen chunks are trimmed to two; each `progress` burst is shown as the single event that ends it, where a real run emits one per batch of blocks translated and one per percentage whisper reports, so a fourteen-chunk film produces hundreds of them; and the `language` line is shown where a run that was not told `-from` emits it (the verified run named its source language, so it had nothing to report).
+Simplified for readability, in three ways worth knowing about: the paths and the track metadata are shortened; the run's fourteen chunks are trimmed to two; and each `progress` burst is shown as the single event that ends it, where a real run emits one per percentage whisper reports and one per batch of blocks translated, so a fourteen-chunk film produces hundreds of them. No `language` event appears here because the verified run was told `-from en` and whisper agreed; omitting `-from` (or a transcript in a language other than the one asked for) is what makes that event fire — see below.
 
 `language` is emitted once, when whisper reports a source language that differs from the one that was asked for (including when none was asked for). Everything downstream — the transcript sidecar's filename, the translation — uses the language in that event from then on.
+
+`probe.fast` states the `-fast` rule as data — the `-source` values and `-mode` values it accepts, and the minimum `-chunk`, in minutes — so a caller can disable a "fast mode" control with a reason instead of holding its own copy of the rule. It is the same object on the ordinary run's `probe` event and on `-probe`'s.
+
+`probe.embeds_subtitles` is there for the same reason, and answers the other question a caller offering an output-mode control has to ask: whether this container accepts an embedded subtitle track. It is `false` for AVI, where `-mode mux` and `-mode both` downgrade to a sidecar `.srt`, and `true` otherwise. A caller can disable "embed in a new container" with a reason instead of keeping its own list of containers, and it is built from the same function `-mode`'s own fallback consults, so the two cannot drift apart.
 
 The `stage` names are the five phases a run can go through:
 
@@ -363,18 +372,22 @@ The `stage` names are the five phases a run can go through:
 | `translate` | the OpenAI round trips; carries `chunk`/`of` under `-fast` |
 | `mux` | writing the new container (`-mode mux`/`both`) |
 
-`progress` carries no stage of its own: a consumer reads it against the most recent `stage` event, which is always the one immediately before the burst.
+`progress` carries no stage of its own: a consumer reads it against the most recent `stage` event, which is always the one immediately before the burst. There is no exception. `extract`, `transcribe`, `translate` and `mux` can all produce a burst: whisper reports percentages during `transcribe`, the translation batches do during `translate`, and ffmpeg's own `time=` field drives one during `extract` and `mux`. A `-fast` chunk's slice off the full WAV, which ffmpeg also cuts and can report on, belongs to that chunk's transcription and is reported under it: the `transcribe` stage is emitted before the slice runs, so the burst reads against the chunk it is part of. `extract-subs` never produces one: a text demux is fast enough that nothing is worth reporting on it.
 
 `warning` reports blocks that could not be translated and kept their original text. Its `kind` is currently always `"blocks_untranslated"` — it is there so a second kind of warning can be added without breaking a consumer — `count` is how many blocks kept their source text, and `total` is how many blocks the run produced in all (for `-fast`, the whole film's merged blocks, not one chunk's). A warning always precedes `done`, never follows it.
 
-The ordinary run (no `-fast`) emits a different, shorter sequence: `probe`, then — only when transcribing audio — a bare `stage` `extract` and a bare `stage` `transcribe` with no `chunk`/`of`/`from`/`to` at all, then `progress`, then a single bare `stage` `translate`, then `progress`, then `done` with no `covers`. Reading an existing subtitle track emits `stage` `extract-subs` instead of the two transcription stages. `-mode mux` or `both` adds a `stage` `mux` after translation. Either run may also emit a `warning` before `done`, or end in a single `error` instead of `done`.
+The ordinary run (no `-fast`) emits a different, shorter sequence: `probe`, then — only when transcribing audio — a bare `stage` `extract` and a bare `stage` `transcribe` with no `chunk`/`of`/`from`/`to` at all, then `progress`, then a single bare `stage` `translate`, then `progress`, then a `saved` for each file it writes, then `done` with no `covers`. Reading an existing subtitle track emits `stage` `extract-subs` instead of the two transcription stages. `-mode mux` or `both` adds a `stage` `mux` after translation. Either run may also emit a `warning` before `done`, or end in a single `error` instead of `done`.
+
+`saved` names one file the run has written, and **every** file a run writes gets one: the `-fast` path emits one per chunk as the file grows, and the ordinary path one per file as it lands. Its `watchable` is the `-fast` path's one distinguishing claim — *this file is incomplete and already worth opening*, which is what makes starting the film a minute in possible — so it is `true` only there. The ordinary path writes complete files, and writes them at the end, so its `saved` events carry `watchable: false`: there is no early moment for a consumer to act on, and claiming one would offer a "you can start watching" that the run never earned. That matters for `-mode both`, which produces a sidecar `.srt` *and* a container while `done` names only the container — so a caller collects paths from `saved` rather than from `done` if it wants all of them. The sidecar's `saved` arrives before the mux starts, which on a multi-gigabyte container is minutes earlier. `done` is unchanged: one event, naming the run's principal output.
 
 A field that does not apply to the current run is left out of the JSON rather than sent as a zero or empty string — `omitempty` in the Go source means "unknown here", not "the default":
 
 - `probe.duration` — omitted when ffprobe's own duration could not be read; never sent as `0`.
 - `stage.chunk`, `stage.of`, `stage.from`, `stage.to` — only `-fast` sets these, on the `transcribe` stage (all four) and the `translate` stage (`chunk`/`of` only); the ordinary run's stage events never carry them.
-- `done.covers` — only `-fast` knows what span of the film's own runtime is covered; the ordinary run translates whatever it parsed in one pass and has no honest value to put here.
+- `done.covers` and `saved.covers` — only `-fast` knows what span of the film's own runtime is covered; the ordinary run translates whatever it parsed in one pass and has no honest value to put here.
 - `warning.first` — omitted when there is nothing to list.
+
+`probe.fast` and `probe.embeds_subtitles` are never omitted — every `probe` event states the `-fast` rule and answers the embedding question. `embeds_subtitles` carries `omitempty` in the source all the same, so that a build which ever stopped setting it would say nothing rather than say `false`: "cannot embed" is a fact, and it must not be spelled the same way as "nobody asked".
 
 `-probe` prints the `version` and `probe` events (or, without `-events json`, the same human-readable track listing the tool already prints) and exits without doing any work. It needs no API key and no target language:
 
@@ -382,7 +395,7 @@ A field that does not apply to the current run is left out of the JSON rather th
 sub-translator -events json -probe movie.mkv
 ```
 
-**`-probe`, `-version`, `-h` and the subcommands carry no terminal event.** None of them is a run: each emits `version` (and `-probe` its `probe`), exits 0, and emits no `done` and no `error`. A decoder shared between a probe call, a settings read and a run must not wait for a terminal event on those.
+**`-probe`, `-version`, `-h` and the subcommands carry no terminal event when they succeed.** None of them is a run: each emits `version` (and `-probe` its `probe`), exits 0, and emits no `done` and no `error`. A decoder shared between a probe call, a settings read and a run must not wait for a terminal event on those. Two things do end them with an `error`, and both are failures rather than endings: `-probe` on a file ffprobe cannot read emits `error` with kind `probe_failed` and exits 1, and a cancel reaching `-probe`, `-version` or `-h` emits `error` with kind `cancelled` and exits 130, the same as any other cancel — the handler is armed above all three. The subcommands are dispatched before it is armed and are unaffected.
 
 **`-events json` composes with the `config` and `model` subcommands.** They print plain text on stdout and have no run to report, so the flag is taken out of the arguments the subcommand counts — `config get translate.model -events json` is still a one-key `get` — the stdout is identical to the same command without the flag, and the stream carries the `version` event alone:
 
@@ -406,7 +419,8 @@ Every fatal error carries a `kind` so a program can act on the reason instead of
 | `no_audio_track` | `-source audio` (or `-fast`) on a file with no audio track, or `-atrack` pointing at one that doesn't exist |
 | `no_subtitle_track` | `-source sub` on a file with none, `-track` pointing at a stream that isn't a subtitle track, or `-from` matching no subtitle track's language |
 | `probe_failed` | the input file doesn't exist, or ffprobe could not read it |
-| `rate_limited` | the translation endpoint returned HTTP 429 for every block in the run |
+| `output_unwritable` | a path the user chose — the sidecar `.srt`, or the muxed container — could not be written: a read-only directory, a full disk, a name the filesystem refuses |
+| `rate_limited` | every block in the run failed to translate, and the last failure the run recorded was the endpoint throttling it — HTTP 429 |
 | `transcript_empty` | the audio produced no speech at all |
 | `cancelled` | SIGINT or SIGTERM |
 | `other` | anything not yet classified — including a usage error, an unreachable endpoint, and a reply the model mangled |
@@ -423,6 +437,10 @@ Exit codes, and the event that pairs with each:
 | 1 | a fatal error | one `error`, with the `kind` from the table above (none for an unsupported `-events` value) |
 | 2 | a usage error: an unknown flag or a bad flag value | one `error`, kind `other`, after the `version` event |
 | 130 | cancelled by SIGINT or SIGTERM | one `error`, kind `cancelled` |
+
+The handler that reports a cancel is armed as soon as `-events` has been read off argv — before the mode and source checks, `config.Load`, the input's `os.Stat`, `-probe`'s own ffprobe and the translation-settings check — so a cancel during any of them is reported the same way as any other: one `error` with kind `cancelled`, and exit 130. All of that used to run under Go's default SIGINT disposition, which terminates the process by the signal: no terminal event, and a wait status whose `ExitCode()` is `-1`, matching no row above. What is left is the window before `main` reaches that line, and it is wider than "the argv scan" suggests: it is dominated by process startup — the loader and the Go runtime coming up — and the scan is a few string comparisons at the end of it. A SIGINT inside that window produces no event at all, not even `version`, and the process terminates by the signal, so `ExitCode()` is `-1` and no row above applies. It is machine-dependent and it is measured, not assumed: sweeping a single SIGINT by delay from the moment the process is spawned, the last delay with no event was **4 ms** and every run from **8 ms** on produced one, on a warm Apple-silicon laptop; the same measurement on a slower machine put the boundary at **34–36 ms**. So a Cancel pressed in the first few — to few tens of — milliseconds of a launch is a real case, and the honest reading for a consumer is that a signalled exit with an empty stream means "cancelled before the tool could answer".
+
+The exit code is always the one the single terminal event pairs with, so the two cannot disagree and the stream alone says what happened. That settles the case a Cancel button hits most often — Ctrl-C in the second the run finishes. The cancel arrives after the `done` event is already on the wire, adds no second terminal event, and the run **exits 0**: the work completed, the file `done` names is complete on disk, and there was nothing left to cancel. A cancel arriving after an `error` exits 1 for the same reason. 130 is for a cancel that is genuinely the run's ending, which is the only case that emits `error` with kind `cancelled` at all.
 
 This is the same idea as `git status --porcelain` or `ffmpeg -progress`: a stable contract for programs, separate from the output meant for people.
 

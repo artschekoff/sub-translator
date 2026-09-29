@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/artschekoff/sub-translator/internal/proc"
 )
 
 type Stream struct {
@@ -30,6 +32,14 @@ type ProbeResult struct {
 	} `json:"format"`
 }
 
+// The three ffprobe calls in this file — here, in ContainerDuration and in
+// WAVDuration — deliberately do not go through proc.Start, although every ffmpeg
+// here does. They are bounded metadata reads: they write nothing, they hold no
+// handle on the run's scratch directory, and .Output() waits for them before it
+// returns, so the worst an orphaned one can cost is a metadata read's worth of
+// CPU. Staying in the CLI's own process group also means a terminal Ctrl-C
+// reaches them directly, by kernel delivery, rather than by way of our handler.
+// The children worth the machinery are the ones that run for minutes.
 func Probe(path string) ([]Stream, error) {
 	out, err := exec.Command("ffprobe",
 		"-v", "quiet",
@@ -138,18 +148,29 @@ const ffmpegTailLines = 20
 // travels in the error instead, which is where the explanation of a failure
 // belongs — and it now reaches an -events json consumer too, inside the error
 // event's message, where inherited stderr never put it.
-func runFFmpeg(cmd *exec.Cmd) error {
+//
+// report, when non-nil, is called with the elapsed media time parsed out of
+// each progress line as it is scanned — while the diagnostics are still being
+// drained, not after — so a caller watching a long extraction sees it move
+// rather than jump once at the end.
+func runFFmpeg(cmd *exec.Cmd, report func(time.Duration)) error {
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		return fmt.Errorf("ffmpeg: %w", err)
 	}
-	if err := cmd.Start(); err != nil {
+	// proc.Start, not cmd.Start: the child gets a process group of its own so a
+	// cancelled run can kill it. Every ffmpeg this package runs comes through
+	// here — the subtitle extraction, the audio extraction, the mux and each
+	// -fast slice — so this one call covers all four.
+	if err := proc.Start(cmd); err != nil {
 		return fmt.Errorf("ffmpeg: %w", err)
 	}
 	// Drained to EOF before Wait: StderrPipe's contract, and the pipe filling up
 	// would otherwise stall ffmpeg itself.
-	tail := ffmpegDiagnostics(stderr)
-	if err := cmd.Wait(); err != nil {
+	tail := ffmpegDiagnostics(stderr, report)
+	// proc.Wait, not cmd.Wait: it drops the reaped child from the set of process
+	// groups a cancel kills, and every path out of here goes through it.
+	if err := proc.Wait(cmd); err != nil {
 		if tail != "" {
 			return fmt.Errorf("ffmpeg: %w\n%s", err, tail)
 		}
@@ -159,15 +180,26 @@ func runFFmpeg(cmd *exec.Cmd) error {
 }
 
 // ffmpegDiagnostics drains r and returns the tail of what ffmpeg had to say,
-// with the progress chatter dropped.
-func ffmpegDiagnostics(r io.Reader) string {
+// with the progress chatter dropped from the tail — but not thrown away
+// outright: report, when non-nil, gets the elapsed time parsed out of each
+// progress line, which is the only trace of ffmpeg's progress left once its
+// stderr stopped being passed straight through.
+func ffmpegDiagnostics(r io.Reader, report func(time.Duration)) string {
 	var tail []string
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	sc.Split(scanLinesOrCR)
 	for sc.Scan() {
 		line := strings.TrimRight(sc.Text(), " \t")
-		if strings.TrimSpace(line) == "" || isProgressLine(line) {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		if isProgressLine(line) {
+			if report != nil {
+				if d, ok := parseFFmpegTime(line); ok {
+					report(d)
+				}
+			}
 			continue
 		}
 		tail = append(tail, line)
@@ -209,12 +241,18 @@ func isProgressLine(line string) bool {
 	return strings.HasPrefix(s, "size=") || strings.HasPrefix(s, "frame=")
 }
 
+// ExtractSubtitle takes no progress callback, unlike its three siblings below:
+// pulling one subtitle track out of a container is a text demux, not a
+// minutes-long decode, and there is nothing worth a ContainerDuration probe to
+// report on. Its one call site (ordinary.go) confirmed that live — wiring one
+// in triggered an extra ffprobe on every ordinary run and broke
+// TestOrdinaryRunSpawnsFfprobeOnlyWhenEventsAreOn.
 func ExtractSubtitle(input string, streamIndex int, outSRT string) error {
 	return runFFmpeg(exec.Command("ffmpeg", "-y",
 		"-i", input,
 		"-map", fmt.Sprintf("0:%d", streamIndex),
 		outSRT,
-	))
+	), nil)
 }
 
 func AudioStreams(streams []Stream) []Stream {
@@ -234,8 +272,9 @@ func FindAudioByLang(streams []Stream, lang string) (Stream, bool) {
 // ExtractAudio decodes one audio stream to the only format whisper.cpp's
 // bundled WAV reader accepts: 16 kHz mono signed 16-bit PCM. Whisper resamples
 // to exactly this internally, so nothing is lost by doing it here.
-func ExtractAudio(input string, streamIndex int, outWAV string) error {
-	return runFFmpeg(exec.Command("ffmpeg", extractAudioArgs(input, streamIndex, outWAV)...))
+func ExtractAudio(input string, streamIndex int, outWAV string, onProgress Progress) error {
+	return runFFmpeg(exec.Command("ffmpeg", extractAudioArgs(input, streamIndex, outWAV)...),
+		progressReporter(input, onProgress))
 }
 
 func extractAudioArgs(input string, streamIndex int, outWAV string) []string {
@@ -261,7 +300,7 @@ func ContainerSupportsEmbeddedSubs(path string) bool {
 	}
 }
 
-func MuxSubtitle(input, srtPath, lang, title, output string) error {
+func MuxSubtitle(input, srtPath, lang, title, output string, onProgress Progress) error {
 	streams, err := Probe(input)
 	if err != nil {
 		return err
@@ -281,7 +320,7 @@ func MuxSubtitle(input, srtPath, lang, title, output string) error {
 	}
 
 	args := muxArgs(input, srtPath, lang, title, output, subCodec, subCount)
-	return runFFmpeg(exec.Command("ffmpeg", args...))
+	return runFFmpeg(exec.Command("ffmpeg", args...), progressReporter(input, onProgress))
 }
 
 // muxArgs builds the ffmpeg argument list that copies every stream from input
@@ -328,8 +367,14 @@ func DefaultSRTPath(input, lang string) string {
 // SliceWAV cuts [start, start+dur) out of a WAV without re-encoding. The seek is
 // an input option so ffmpeg skips bytes rather than decoding and discarding them,
 // which matters when this runs once per chunk over a feature film.
-func SliceWAV(inWAV string, start, dur time.Duration, outWAV string) error {
-	return runFFmpeg(exec.Command("ffmpeg", sliceWAVArgs(inWAV, start, dur, outWAV)...))
+func SliceWAV(inWAV string, start, dur time.Duration, outWAV string, onProgress Progress) error {
+	// dur is the total already — the chunk's own length — so unlike the other
+	// three callers this needs no ContainerDuration probe to know it.
+	var report func(time.Duration)
+	if onProgress != nil {
+		report = func(done time.Duration) { onProgress(done, dur) }
+	}
+	return runFFmpeg(exec.Command("ffmpeg", sliceWAVArgs(inWAV, start, dur, outWAV)...), report)
 }
 
 func sliceWAVArgs(inWAV string, start, dur time.Duration, outWAV string) []string {

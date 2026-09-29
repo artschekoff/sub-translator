@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/artschekoff/sub-translator/internal/events"
 	"github.com/artschekoff/sub-translator/internal/media"
 	"github.com/artschekoff/sub-translator/internal/models"
+	"github.com/artschekoff/sub-translator/internal/proc"
 	"github.com/artschekoff/sub-translator/internal/srt"
 	"github.com/artschekoff/sub-translator/internal/translate"
 	"github.com/artschekoff/sub-translator/internal/whisper"
@@ -27,9 +29,29 @@ var version = "dev"
 // runTmpDir is the one scratch directory a run owns: the extracted WAV, the
 // whisper output and the intermediate SRTs all live inside it. It is a package
 // variable because the two ways this program ends without unwinding the stack —
-// fatalf's os.Exit and a SIGINT — both have to be able to remove it, and a
+// exitWith's os.Exit and a SIGINT — both have to be able to remove it, and a
 // feature film's 16 kHz WAV is well over a gigabyte to leave behind.
 var runTmpDir string
+
+// cancelling is raised by the signal handler once the cancelled event is on the
+// stream — and only when that event was the run's ending — and before the
+// children are killed. Killing them unblocks whatever the main goroutine was
+// waiting on — ffmpeg, whisper — as an ordinary failure, and that failure would
+// otherwise race the handler to the exit: two error events on a stream that
+// promises exactly one, and exit 1 or 130 depending on which goroutine got there
+// first. Raised before the kill and read in yieldIfCancelling, it makes the
+// cancel the only ending a cancelled run can have.
+//
+// It is the cheap, one-directional half of the mechanism. The half that actually
+// guarantees exactly one terminal event, in both directions, is claimEnding in
+// fatal.go.
+var cancelling atomic.Bool
+
+// cancelHandoffTimeout is how long the main goroutine waits for the signal
+// handler to finish a cancel before ending the run itself. The handler's own
+// exit normally lands first and this never elapses; it exists so a handler
+// wedged in os.RemoveAll cannot hang the process forever. A test shortens it.
+var cancelHandoffTimeout = 5 * time.Second
 
 // ev carries the machine-readable event stream. It is disabled unless
 // -events json is passed, and Emit is a no-op when disabled, so the call sites
@@ -45,17 +67,36 @@ var ev *events.Emitter
 // each one is whole.
 var proseErr = events.NewSyncWriter(os.Stderr)
 
-// setupRunTmpDir creates the run-scoped scratch directory and arms the signal
-// handler that removes it. Go's default SIGINT disposition terminates the
-// process outright, so a deferred cleanup never runs when a user aborts a
-// twenty-minute transcription with Ctrl-C.
+// setupRunTmpDir creates the run-scoped scratch directory. The handler that
+// removes it is armed separately and earlier, by armCancelHandler, and it
+// tolerates an empty runTmpDir for exactly that reason.
 func setupRunTmpDir() {
 	dir, err := os.MkdirTemp("", "sub-translator-*")
 	if err != nil {
 		fatalf("create temp dir: %v", err)
 	}
 	runTmpDir = dir
+}
 
+// armCancelHandler takes SIGINT and SIGTERM off Go's default disposition, which
+// terminates the process outright: a deferred cleanup never runs when a user
+// aborts a twenty-minute transcription with Ctrl-C, and a consumer sees no
+// terminal event and a wait status of "signalled" rather than exit 130 — which
+// appears nowhere in the documented exit-code table.
+//
+// It is called as early as there is anything honest to say, which is as soon as
+// -events has been read off argv and the emitter exists: everything after that
+// point — parsing the mode and the source, loading the config, stat-ing the
+// input, -probe's own ffprobe, validating the translation settings — used to run
+// under the default disposition, and -probe on a damaged file can sit in ffprobe
+// for a while. Arming it any earlier would buy exit 130 with nothing on the
+// stream, which is a different contract violation rather than a fix.
+//
+// What is left is the argv scan itself: a few string comparisons with no syscall
+// in them, before the emitter could exist at all. The handler is armed before the
+// scratch directory is created, so cleanupRunTmpDir has to tolerate an empty
+// runTmpDir — it does, and that is the only coupling between the two.
+func armCancelHandler() {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -63,11 +104,53 @@ func setupRunTmpDir() {
 		// Not fatalKindf: that exits 1 and this is a signal, not a failure — the
 		// shell convention below is what has to survive, unchanged, whether or
 		// not a caller is reading the event stream.
-		ev.Emit(&events.Error{Kind: string(errCancelled), Message: "interrupted"})
-		cleanupRunTmpDir()
-		// 128 + SIGINT: the shell convention for "terminated by a signal".
-		os.Exit(130)
+		//
+		// claimEnding rather than a bare Emit, because a cancel can also arrive
+		// *second*. A run that has already written its done then spends real
+		// time before the process ends — notifyDone's osascript takes about
+		// 0.18s, and the scratch directory holding a feature film's WAV takes
+		// as long as it takes to remove — and a cancelled event appended in
+		// there would leave a complete, correct subtitle file reported as an
+		// abandoned run.
+		code, won := claimEnding(&events.Error{Kind: string(errCancelled), Message: "interrupted"}, 130)
+		if won {
+			// Raised only now, and only when the cancel is the run's ending:
+			// everything downstream of it is entitled to assume the cancelled
+			// event is already on the stream, and after a lost claim it is not.
+			cancelling.Store(true)
+		}
+		// Either way the children have to die and the scratch directory has to
+		// go: a lost claim still means a user asked for this to stop, and the
+		// run may still have something running.
+		shutdownAfterCancel()
+		// 130 is 128 + SIGINT, the shell convention for "terminated by a
+		// signal", and it is what a cancel that became the run's ending earns.
+		// A cancel that arrived after the ending exits with the status that
+		// ending earned instead, so the exit code can never contradict the one
+		// terminal event on the stream.
+		os.Exit(code)
 	}()
+}
+
+// shutdownAfterCancel is the order a cancelled run turns on: the children die
+// first, and only then does the scratch directory they were writing into go.
+// The signal reaches this process alone — the children are reparented to PID 1 —
+// so nothing but KillAllGroups kills them.
+//
+// Reversed, a still-live ffmpeg goes on writing into a directory being deleted
+// underneath it. On Unix it does not even fail: the unlinked file stays writable
+// through the open fd, so it fills a gigabyte nobody can reach by name, while
+// os.RemoveAll races the child's next open(O_CREAT) and can return with the
+// directory still there. On a feature film the symptom — a leaked scratch
+// directory and disk churn after Cancel — is indistinguishable from the bug this
+// whole change was made to fix.
+//
+// It is a named function rather than two lines inside the handler so that a test
+// can hold it to that order. Swap the two calls and
+// TestACancelKillsTheChildrenBeforeRemovingTheScratchDirectory goes red.
+func shutdownAfterCancel() {
+	proc.KillAllGroups()
+	cleanupRunTmpDir()
 }
 
 func cleanupRunTmpDir() {
@@ -274,6 +357,13 @@ func main() {
 		ev.Emit(&events.Version{Events: events.ProtocolVersion, Tool: version})
 	}
 
+	// Armed here, not with the scratch directory further down: everything between
+	// the two — Parse, the mode and source checks, config.Load, the input's stat,
+	// -probe's ffprobe, the translate-options check — otherwise ran under Go's
+	// default SIGINT disposition and ended the process by signal, with no
+	// terminal event and no exit 130.
+	armCancelHandler()
+
 	// ContinueOnError, so a usage error comes back here rather than exiting
 	// inside the flag package: flag has already printed its message and the
 	// usage text by then, which is the prose this keeps unchanged, and the exit
@@ -289,8 +379,10 @@ func main() {
 			// too — and like -version it ends with no terminal event.
 			os.Exit(0)
 		}
-		ev.Emit(&events.Error{Kind: string(errOther), Message: err.Error()})
-		os.Exit(2)
+		// Through exitAfterEmitting, not a bare Emit: the handler is armed above
+		// this line now, so a cancel landing here would otherwise put a second
+		// terminal event on the stream.
+		exitAfterEmitting(&events.Error{Kind: string(errOther), Message: err.Error()}, 2, nil)
 	}
 
 	switch *eventsFlag {
@@ -350,12 +442,19 @@ func main() {
 		// code are exactly what they were; what is new is that a consumer gets
 		// a terminal event instead of 56 lines of flag documentation and
 		// silence on the wire.
-		ev.Emit(&events.Error{
+		//
+		// This is one of the two fatal paths that do not go through exitWith, and
+		// the reason is the line it prints: a person with no input path needs the
+		// usage text, not "error: no input file". exitWith would print the
+		// latter, so this goes through exitAfterEmitting instead — the same
+		// single error event and the same exit 1, claimed the same way every
+		// other ending claims it, with the usage text as its own prose. The
+		// claim matters here more than anywhere: those 56 lines are written
+		// between the event and the exit, and the signal handler is armed above.
+		exitAfterEmitting(&events.Error{
 			Kind:    string(errOther),
 			Message: "no input file: sub-translator needs the path to a video file",
-		})
-		flag.Usage()
-		os.Exit(1)
+		}, 1, flag.Usage)
 	}
 	input := flag.Arg(0)
 	if _, err := os.Stat(input); err != nil {
@@ -389,307 +488,41 @@ func main() {
 	setupRunTmpDir()
 	defer cleanupRunTmpDir()
 
-	// Detect subtitle track
-	fmt.Printf("Probing %s...\n", filepath.Base(input))
-	streams, err := media.Probe(input)
-	if err != nil {
-		fatalKindf(errProbeFailed, "probe failed: %v", err)
+	if err := runOrdinary(ordinaryOptions{
+		input:         input,
+		tmpDir:        runTmpDir,
+		from:          *from,
+		to:            *to,
+		source:        source,
+		track:         *track,
+		atrack:        *atrack,
+		mode:          mode,
+		out:           *out,
+		fast:          *fast,
+		chunkMinutes:  chunkMinutes,
+		whisperModel:  *whisperModel,
+		whisperBin:    *whisperBin,
+		vadModel:      *vadModel,
+		translateOpts: translateOpts,
+	}); err != nil {
+		exitWith(err)
 	}
-	subs := media.SubtitleStreams(streams)
-	// probeEvent's own work — a second ffprobe call for the duration — must
-	// not happen at all when nothing is listening: Go evaluates the argument
-	// before Emit's nil check runs, so calling this unconditionally would
-	// spawn that subprocess on every ordinary run, -events json or not.
-	if ev != nil {
-		ev.Emit(probeEvent(input, streams, subs))
-	}
-
-	if len(subs) > 0 {
-		// Many releases ship untagged tracks, and the listing is what tells you
-		// which -track to pass.
-		fmt.Print(formatTracks(subs))
-	}
-
-	source, needsConfirm, err := resolveSource(source, len(subs) > 0, stdinIsTerminal())
-	if err != nil {
-		fatalf("%v", err)
-	}
-
-	// The one -fast check that genuinely needs resolveSource to have run: only
-	// now is it known whether "auto" found a subtitle track.
-	if err := validateFastSource(*fast, source); err != nil {
-		fatalf("%v", err)
-	}
-
-	// Whisper is resolved before anything is asked of the user: a missing
-	// binary or model is a prerequisite failure, and making someone answer a
-	// scary confirmation and type a language code first only to be told
-	// whisper-cli is not installed wastes their time.
-	var whisperOpts whisper.Options
-	if source == sourceAudio {
-		cfg, err := config.Load()
-		if err != nil {
-			fatalf("%v", err)
-		}
-		whisperOpts, err = resolveWhisper(cfg, *whisperModel, *whisperBin, *vadModel)
-		if err != nil {
-			if kind, ok := classifyWhisperErr(err); ok {
-				fatalKindf(kind, "%v", err)
-			} else {
-				fatalf("%v", err)
-			}
-		}
-	}
-
-	if needsConfirm {
-		fmt.Printf("No subtitle tracks in %s.\n", filepath.Base(input))
-		// stdinIsTerminal cannot tell a real terminal from /dev/null, because
-		// /dev/null is itself a character device, so the terminal check can
-		// report interactive when nobody is there to answer. The actionable
-		// message here must not depend on that guess being right.
-		ok, err := readConfirm(stdin, proseErr, fmt.Sprintf(
-			"Transcribe the audio track with %s? This can take a while",
-			filepath.Base(whisperOpts.Model)))
-		if err != nil {
-			fatalf("no subtitle tracks, and the transcription prompt got no answer; " +
-				"pass -source audio to transcribe the audio track")
-		}
-		if !ok {
-			fatalf("nothing to do")
-		}
-	}
-
-	if source == sourceSub && len(subs) == 0 {
-		fatalKindf(errNoSubtitleTrack, "no subtitle tracks in %s — nothing to translate", filepath.Base(input))
-	}
-
-	*from = strings.TrimSpace(*from)
-	*to = strings.TrimSpace(*to)
-
-	// In audio mode whisper detects the source language, so only the target is
-	// genuinely required.
-	if *from == "" && source == sourceSub {
-		*from = promptLang("Source")
-	}
-	if *to == "" {
-		*to = promptLang("Target")
-	}
-
-	var blocks []srt.Block
-
-	if source == sourceAudio {
-		if *fast {
-			if err := runProgressive(input, runTmpDir, streams, *atrack, *from, *to,
-				time.Duration(chunkMinutes)*time.Minute, whisperOpts, translateOpts, *out); err != nil {
-				if kind, ok := classifyTranscribeErr(err); ok {
-					fatalKindf(kind, "%v", err)
-				} else {
-					fatalf("%v", err)
-				}
-			}
-			return
-		}
-
-		var lang string
-		blocks, lang, err = transcribe(input, runTmpDir, streams, *atrack, *from, whisperOpts)
-		if err != nil {
-			if kind, ok := classifyTranscribeErr(err); ok {
-				fatalKindf(kind, "%v", err)
-			} else {
-				fatalf("%v", err)
-			}
-		}
-		// The language whisper actually worked in wins over the one that was
-		// asked for: transcribe drops -from when no track carries that tag, and
-		// translating from a language the transcript is not in would be worse
-		// than useless.
-		*from = reportDetectedLanguage(*from, lang)
-
-		// Transcription is by far the most expensive step here; keeping its
-		// output costs one small file. A media library on a NAS share or a
-		// read-only mount makes this write fail routinely, and throwing away an
-		// hour of CPU over a sidecar file would be indefensible — so it warns
-		// and carries on to the translation the user actually asked for.
-		transcriptPath := media.DefaultSRTPath(input, *from)
-		if transcriptPath == srtOutputPath(input, *to, *out, mode) {
-			// Source and target are the same language — reachable by mis-guessing
-			// a film's language, or by -to en on an English film — so the sidecar
-			// and the translation want the same file. The sidecar is written
-			// first, so a fatal translate error below would leave untranslated
-			// source text under the translated filename: precisely the artifact
-			// this branch exists to make impossible.
-			fmt.Fprintf(proseErr, "warning: not saving the %s transcript to %s: "+
-				"that is where the translated subtitles go\n", *from, transcriptPath)
-		} else if err := srt.Write(transcriptPath, blocks); err != nil {
-			fmt.Fprintf(proseErr, "warning: could not save transcript to %s: %v\n", transcriptPath, err)
-		} else {
-			fmt.Printf("Saved transcript: %s\n", transcriptPath)
-		}
-	} else {
-		var srcStream media.Stream
-		if *track >= 0 {
-			found := false
-			for _, s := range subs {
-				if s.Index == *track {
-					srcStream = s
-					found = true
-					break
-				}
-			}
-			if !found {
-				fatalKindf(errNoSubtitleTrack, "no subtitle stream at index %d", *track)
-			}
-		} else {
-			var ok bool
-			srcStream, ok = media.FindSubtitleByLang(subs, *from)
-			if !ok {
-				fatalKindf(errNoSubtitleTrack, "no subtitle track tagged lang=%s — pick one from the list above with -track", *from)
-			}
-		}
-		fmt.Printf("Source: #%d  lang=%s  %q\n", srcStream.Index, srcStream.Tags.Language, srcStream.Tags.Title)
-
-		tmpSRT := filepath.Join(runTmpDir, "source.srt")
-		fmt.Printf("Extracting subtitle track #%d...\n", srcStream.Index)
-		// The whole pre-translate phase of a -source sub run. Without this the
-		// stream goes probe → stage translate and a window has nothing to show
-		// for the extraction and the SRT parse.
-		ev.Emit(&events.Stage{Name: "extract-subs"})
-		if err := media.ExtractSubtitle(input, srcStream.Index, tmpSRT); err != nil {
-			fatalf("extract: %v", err)
-		}
-
-		blocks, err = srt.Parse(tmpSRT)
-		if err != nil {
-			fatalf("parse SRT: %v", err)
-		}
-		if len(blocks) == 0 {
-			fatalf("subtitle track #%d is empty — nothing to translate", srcStream.Index)
-		}
-	}
-	fmt.Printf("Parsed %d subtitle blocks\n", len(blocks))
-
-	// Translate
-	client, err := newTranslateClient(withLangs(translateOpts, *from, *to))
-	if err != nil {
-		fatalf("%v", err)
-	}
-	fmt.Printf("Translating %s → %s via %s...\n", *from, *to, describeProvider(translateOpts))
-	ev.Emit(&events.Stage{Name: "translate"})
-	texts := srt.Texts(blocks)
-	translated, failedBlocks, err := client.TranslateAll(texts, func(done, total int) {
-		fmt.Print(progressLine(done, total))
-		ev.Emit(&events.Progress{Pct: pctOf(done, total)})
-	})
-	fmt.Println()
-	if err != nil {
-		// translateAll returns an error only when every block failed: the
-		// endpoint refused the whole run rather than a few blocks. Which refusal
-		// it was is the error's to say, not this call site's — hard-coding
-		// errRateLimited here is what reported a mistyped key as a rate limit.
-		fatalKindf(classifyTranslateErr(err), "translate: %v", err)
-	}
-	if len(failedBlocks) > 0 {
-		first := firstN(failedBlocks, 3)
-		firstStr := fmt.Sprint(first)
-		if len(failedBlocks) > len(first) {
-			firstStr += "…"
-		}
-		fmt.Fprintf(proseErr,
-			"warning: %d of %d blocks could not be translated and kept their original text (first: %s)\n",
-			len(failedBlocks), len(texts), firstStr)
-		ev.Emit(&events.Warning{
-			Kind:  "blocks_untranslated",
-			Count: len(failedBlocks),
-			Total: len(texts),
-			First: first,
-		})
-	}
-
-	// Rebuild blocks
-	outBlocks, err := srt.WithTexts(blocks, translated)
-	if err != nil {
-		fatalf("rebuild: %v", err)
-	}
-
-	// AVI and friends can't embed subtitle tracks — fall back to a sidecar.
-	mode, note := resolveMode(mode, media.ContainerSupportsEmbeddedSubs(input))
-	if note != "" {
-		fmt.Println(note)
-	}
-
-	// Inside the run-scoped directory, not a fixed name in $TMPDIR: two runs on
-	// two different films would otherwise share the file, and a mux could pick
-	// up the other run's subtitles.
-	tmpTranslated := filepath.Join(runTmpDir, "translated.srt")
-
-	var srtOut string
-	if mode.writesSRT() {
-		srtOut = srtOutputPath(input, *to, *out, mode)
-		if err := srt.Write(srtOut, outBlocks); err != nil {
-			fatalf("write SRT: %v", err)
-		}
-		fmt.Printf("Saved SRT: %s\n", srtOut)
-	}
-
-	if !mode.writesContainer() {
-		fmt.Println("Done.")
-		// !writesContainer() implies writesSRT() (mode.go), so srtOut was set
-		// just above — the file the "Done." line refers to.
-		ev.Emit(&events.Done{Path: srtOut})
-		return
-	}
-
-	if err := srt.Write(tmpTranslated, outBlocks); err != nil {
-		fatalf("write temp SRT: %v", err)
-	}
-
-	// Mux
-	outMKV := *out
-	if outMKV == "" {
-		outMKV = media.DefaultOutputPath(input, *to)
-	}
-	langTitle := map[string]string{
-		"es": "Spanish", "fr": "French", "de": "German",
-		"it": "Italian", "pt": "Portuguese", "ru": "Russian",
-		"zh": "Chinese", "ja": "Japanese", "ko": "Korean",
-		"ar": "Arabic", "pl": "Polish", "nl": "Dutch",
-	}
-	title := langTitle[*to]
-	if title == "" {
-		title = *to
-	}
-
-	fmt.Printf("Muxing → %s...\n", filepath.Base(outMKV))
-	// Rewriting a multi-gigabyte container takes minutes, during which the last
-	// thing a consumer heard was translate at 100%.
-	ev.Emit(&events.Stage{Name: "mux"})
-	if err := media.MuxSubtitle(input, tmpTranslated, *to, title, outMKV); err != nil {
-		fatalf("mux: %v", err)
-	}
-	fmt.Printf("Done: %s\n", outMKV)
-	ev.Emit(&events.Done{Path: outMKV})
 }
 
 // fatalf reports a fatal error with no kind a caller can act on. It still
 // emits exactly one error event — kind "other" — so a consumer never gets
 // silence and a bare exit code; fatalKindf is the one other path to the same
-// tail, and it emits its own kind instead, never this one, so a fatal run
+// ending, and it emits its own kind instead, never this one, so a fatal run
 // always emits exactly one error event, never two.
+//
+// It is errf plus exitWith, and nothing else: the emit, the prose line, the
+// cleanup and the exit all live in exitWith, so the shape of a fatal run is
+// described in one place — with one deliberate exception. The missing-input
+// path above hand-rolls its own emit and exit because it must print the usage
+// text where exitWith would print the "error: ..." line; it is the only other
+// code that describes that shape, and it is annotated there.
 func fatalf(format string, args ...any) {
-	msg := fmt.Sprintf(format, args...)
-	ev.Emit(&events.Error{Kind: string(errOther), Message: msg})
-	fatalTail("%s", msg)
-}
-
-// fatalTail is the ending every fatal path shares: the human-readable prose
-// line, cleanup, exit. It never touches the event stream itself — the two
-// callers above have already emitted, each exactly once, before reaching it.
-func fatalTail(format string, args ...any) {
-	fmt.Fprintf(proseErr, "error: "+format+"\n", args...)
-	// os.Exit skips deferred calls, so the scratch directory has to be removed
-	// here or every error path leaks it.
-	cleanupRunTmpDir()
-	os.Exit(1)
+	exitWith(errf(format, args...))
 }
 
 // classifyWhisperErr says which kind a resolveWhisper failure is. Its errors
@@ -801,7 +634,12 @@ var newTranslateClient = func(o translate.Options) (translate.Translator, error)
 // writing it to disk.
 func resolveTranslateOptions(c *config.Config, workersFlag int) translate.Options {
 	return translate.Options{
-		APIKey:  firstNonEmpty(os.Getenv("OPENAI_API_KEY"), c.Translate.APIKey),
+		APIKey: firstNonEmpty(os.Getenv("OPENAI_API_KEY"), c.Translate.APIKey),
+		// Environment only, deliberately not config: this redirects every request
+		// the run makes, so it belongs to one invocation rather than to a file a
+		// user forgets they wrote. A persisted wrong endpoint fails in a way that
+		// looks like the network rather than like a setting.
+		BaseURL: os.Getenv("OPENAI_BASE_URL"),
 		Model:   firstNonEmpty(c.Translate.Model, translate.DefaultModel),
 		Workers: resolveWorkers(workersFlag, c.Translate.Workers),
 	}
@@ -866,10 +704,20 @@ var errEmptyTranscript = errors.New("transcript is empty — the audio track may
 // away in a fmt.Errorf, where no prefix matcher could recover it — which is
 // why the wrapped sentinels are the thing being matched now.
 //
+// The kindOf check above the switch is the same recovery for a site that
+// already built a classified error with kindErrf — the per-chunk output write
+// in progressive.go — rather than one more sentinel to add to it: fail wraps
+// with %w, so the kind survives the trip through here, and this must run
+// before the switch below or classifyTranscribeErr would relabel it "other"
+// exactly as its own doc paragraph describes.
+//
 // Everything else that can reach these paths — an extract, parse or whisper
 // failure — is not one of the kinds a caller can act on, hence the false
 // return: those stay a plain, unclassified fatalf.
 func classifyTranscribeErr(err error) (errKind, bool) {
+	if kind := kindOf(err); kind != errOther {
+		return kind, true
+	}
 	switch {
 	case errors.Is(err, errEmptyTranscript):
 		return errTranscriptEmpty, true
@@ -964,7 +812,7 @@ func transcribe(input, tmpDir string, streams []media.Stream, atrack int, from s
 	wav := filepath.Join(tmpDir, "audio.wav")
 	fmt.Printf("Extracting audio track #%d...\n", src.Index)
 	ev.Emit(&events.Stage{Name: "extract"})
-	if err := media.ExtractAudio(input, src.Index, wav); err != nil {
+	if err := media.ExtractAudio(input, src.Index, wav, extractionProgress()); err != nil {
 		return nil, "", fmt.Errorf("extract audio: %w", err)
 	}
 
@@ -1001,6 +849,68 @@ func pctOf(done, total int) int {
 	return p
 }
 
+// pctOfDuration is pctOf for the extraction and mux progress callbacks, which
+// track a position in time rather than a count of blocks. It goes through the
+// same %.0f-then-Atoi rounding as pctOf — via Seconds(), so it agrees with
+// pctOf on every ratio a shared test could compare rather than merely on the
+// ones by-hand testing happened to try — so a printed extraction percentage
+// and the one carried on the event stream can never diverge the way pctOf's
+// own fix round exists to describe.
+func pctOfDuration(done, total time.Duration) int {
+	return pctOf(int(done.Milliseconds()), int(total.Milliseconds()))
+}
+
+// mediaProgress builds the onProgress callback every ffmpeg-backed media
+// function that reports progress takes: extraction, muxing and slicing used to
+// be silent on both stdout and the event stream, once ffmpeg's own stderr was
+// captured instead of inherited (see docs/superpowers/specs/2026-09-26-desktop-gui-design.md).
+// Its three real callers — the ordinary and -fast audio extractions (both
+// through extractionProgress), the mux (muxProgress), and each -fast chunk's
+// slice (sliceProgress) — share this one function rather than each writing its
+// own closure, so the printed line and the emitted event can only ever agree
+// by construction: pct is computed once and handed to both. ExtractSubtitle is
+// not among them: it takes no progress callback at all (see its doc comment in
+// internal/media/media.go).
+//
+// total<=0 means the length behind it was never learned: the ContainerDuration
+// probe an extraction or a mux runs against failed to read one — an input
+// ffprobe can't read, for instance — or, for a slice, its chunk was zero-length.
+// Either way nothing is printed or emitted rather than a meaningless 0% or a
+// divide-by-zero.
+func mediaProgress(label string) media.Progress {
+	return func(done, total time.Duration) {
+		if total <= 0 {
+			return
+		}
+		pct := pctOfDuration(done, total)
+		fmt.Printf("\r  %s: %d%%   ", label, pct)
+		ev.Emit(&events.Progress{Pct: pct})
+	}
+}
+
+// extractionProgress is mediaProgress for pulling the audio track out of the
+// container — shared by the ordinary run's own transcription path (main.go)
+// and the -fast path (progressive.go). It is never used for a subtitle track:
+// ExtractSubtitle takes no progress callback at all.
+func extractionProgress() media.Progress {
+	return mediaProgress("extracting")
+}
+
+// muxProgress is mediaProgress for writing the translated subtitles back into
+// a new container — a multi-gigabyte rewrite that used to leave the terminal
+// reading "translate, 100%" for minutes.
+func muxProgress() media.Progress {
+	return mediaProgress("muxing")
+}
+
+// sliceProgress is mediaProgress for cutting one -fast chunk out of the
+// extracted WAV. -c copy makes this fast enough that it will rarely have
+// anything to report, but it shares the mechanism rather than being a
+// silent exception to it.
+func sliceProgress() media.Progress {
+	return mediaProgress("slicing")
+}
+
 // firstN is the first n values of v, unformatted: the actual indices, for a
 // Warning event's First field. It is the one place this slicing happens, so
 // the prose line a caller renders alongside a Warning event (with its own
@@ -1033,9 +943,15 @@ func probeEvent(input string, streams, subs []media.Stream) *events.Probe {
 		}
 		return out
 	}
+	// The same function resolveMode consults before it downgrades -mode mux or
+	// both to a sidecar, so the rule is stated on the wire by the code that
+	// enforces it rather than copied into a consumer.
+	canEmbed := media.ContainerSupportsEmbeddedSubs(input)
 	p := &events.Probe{
-		Audio:     toEvent(media.AudioStreams(streams)),
-		Subtitles: toEvent(subs),
+		Audio:           toEvent(media.AudioStreams(streams)),
+		Subtitles:       toEvent(subs),
+		Fast:            fastRule(),
+		EmbedsSubtitles: &canEmbed,
 	}
 	// A duration we cannot read — missing, or ffprobe's own "N/A" — is not
 	// worth failing over: the file is still translatable, and the field is

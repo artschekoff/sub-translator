@@ -14,6 +14,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/artschekoff/sub-translator/internal/proc"
 )
 
 type Options struct {
@@ -136,7 +138,11 @@ func Run(o Options, progress func(pct int)) (Result, error) {
 	}
 	cmd.Stdout = io.Discard
 
-	if err := cmd.Start(); err != nil {
+	// A transcription is the longest thing this program starts, so it is the
+	// child most worth being able to kill: proc.Start gives it a process group
+	// of its own, so it goes when the run is cancelled instead of transcribing
+	// on alone.
+	if err := proc.Start(cmd); err != nil {
 		return Result{}, fmt.Errorf("whisper: %w", err)
 	}
 
@@ -169,7 +175,10 @@ func Run(o Options, progress func(pct int)) (Result, error) {
 		io.Copy(io.Discard, stderr)
 	}
 
-	if err := cmd.Wait(); err != nil {
+	// proc.Wait, not cmd.Wait: it drops the reaped child from the set of process
+	// groups a cancel kills. Every path below this point has already been through
+	// it, and there is no path from proc.Start to here that skips it.
+	if err := proc.Wait(cmd); err != nil {
 		if scanErr != nil {
 			// Include both the command error and the stderr read error
 			err = fmt.Errorf("%w (stderr read: %v)", err, scanErr)

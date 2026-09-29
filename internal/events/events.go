@@ -69,12 +69,35 @@ func (*Version) kind() Kind { return KindVersion }
 
 type Probe struct {
 	base
-	Duration  float64  `json:"duration,omitempty"`
-	Audio     []Stream `json:"audio"`
-	Subtitles []Stream `json:"subtitles"`
+	Duration  float64   `json:"duration,omitempty"`
+	Audio     []Stream  `json:"audio"`
+	Subtitles []Stream  `json:"subtitles"`
+	Fast      *FastRule `json:"fast,omitempty"`
+	// EmbedsSubtitles says whether this container accepts an embedded subtitle
+	// track. It is here for the reason Fast is: a caller offering a choice
+	// between a sidecar, an embedded track and both would otherwise need its own
+	// copy of the rule, and the CLI silently downgrades mux and both to a
+	// sidecar for a container that cannot take one.
+	//
+	// A pointer, not a plain bool, and the omitempty is the reason. false is the
+	// answer that matters here — it is the AVI case — and on a plain bool
+	// omitempty would drop precisely that answer, leaving "cannot embed"
+	// indistinguishable from "nobody asked". Every probe event sets it, exactly
+	// as every probe event sets Fast, so it is never in fact omitted; the
+	// pointer is what makes a future call site that forgets say "unknown"
+	// instead of "no".
+	EmbedsSubtitles *bool `json:"embeds_subtitles,omitempty"`
 }
 
 func (*Probe) kind() Kind { return KindProbe }
+
+// FastRule is the condition under which -fast is accepted, stated so a caller
+// can disable a control with a reason rather than copying the rule.
+type FastRule struct {
+	Sources         []string `json:"sources"`
+	Modes           []string `json:"modes"`
+	MinChunkMinutes int      `json:"min_chunk_minutes"`
+}
 
 type Stage struct {
 	base
@@ -101,11 +124,27 @@ type Language struct {
 
 func (*Language) kind() Kind { return KindLanguage }
 
+// Saved names one file a run has written and says whether it is usable yet. The
+// -fast path emits one per chunk, as the file grows; the ordinary path emits one
+// per file it writes, which is how -mode both — a sidecar and a container — names
+// both of them rather than only the one done carries.
 type Saved struct {
 	base
-	Path      string `json:"path"`
-	Covers    string `json:"covers"`
-	Watchable bool   `json:"watchable"`
+	Path string `json:"path"`
+	// Covers is the span of the film the file holds, which only -fast knows: the
+	// ordinary run writes whatever it parsed in one pass and has no span of the
+	// container's own runtime to report. omitempty for the reason Done.Covers has
+	// it — an absent field is "unknown", never a coverage claim of "".
+	Covers string `json:"covers,omitempty"`
+	// Watchable is the -fast path's one distinguishing claim: this file is
+	// incomplete and already worth opening. It is what a window turns into "you
+	// can start watching", so it is true only where a partial file is the point.
+	// The ordinary path writes complete files and writes them at the end, so its
+	// saved events carry false: there is no early moment for a consumer to act
+	// on, and saying otherwise would offer one that does not exist. Not
+	// omitempty — false here is a stated fact about a file that exists, not an
+	// absence.
+	Watchable bool `json:"watchable"`
 }
 
 func (*Saved) kind() Kind { return KindSaved }

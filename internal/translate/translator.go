@@ -64,7 +64,7 @@ type Options struct {
 	APIKey   string
 	Model    string
 	Workers  int
-	BaseURL  string // test seam; empty means the real endpoint
+	BaseURL  string // OPENAI_BASE_URL, or empty for the real endpoint
 }
 
 // Validate reports the option errors worth raising before any work happens. It

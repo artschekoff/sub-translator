@@ -16,12 +16,15 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/artschekoff/sub-translator/internal/config"
 	"github.com/artschekoff/sub-translator/internal/events"
 	"github.com/artschekoff/sub-translator/internal/media"
+	"github.com/artschekoff/sub-translator/internal/proc"
 	"github.com/artschekoff/sub-translator/internal/translate"
 	"github.com/artschekoff/sub-translator/internal/whisper"
 )
@@ -376,6 +379,35 @@ func TestPctOfAgreesWithThePrintedPercentage(t *testing.T) {
 	}
 }
 
+// pctOfDuration is pctOf's sibling for the extraction and mux progress
+// callbacks, which track a time.Duration pair rather than a block count. This
+// is the same invariant TestPctOfAgreesWithThePrintedPercentage pins for
+// pctOf, asserted independently of pctOfDuration's own implementation (which
+// goes through pctOf via Milliseconds()) — this test computes its "want"
+// straight from Seconds(), so a change that quietly loses sub-second
+// precision (say, truncating to whole seconds before dividing) fails here
+// even though it might still satisfy pctOf's own test.
+func TestPctOfDurationAgreesWithThePrintedPercentage(t *testing.T) {
+	for _, tt := range []struct{ done, total time.Duration }{
+		{1 * time.Second, 8 * time.Second},        // 12.5% — exact half
+		{830 * time.Millisecond, 1 * time.Second}, // sub-second precision
+		{83*time.Second + 450*time.Millisecond, 200 * time.Second},
+		{0, time.Minute},
+		{time.Minute, time.Minute},
+		{90 * time.Second, 4 * time.Minute},
+	} {
+		want := fmt.Sprintf("%.0f", tt.done.Seconds()/tt.total.Seconds()*100)
+		wantInt, err := strconv.Atoi(want)
+		if err != nil {
+			t.Fatalf("test setup: %q (from done=%v total=%v) is not an integer string", want, tt.done, tt.total)
+		}
+		if got := pctOfDuration(tt.done, tt.total); got != wantInt {
+			t.Errorf("pctOfDuration(%v, %v) = %d, want %d (the printed line's %%.0f gives %q)",
+				tt.done, tt.total, got, wantInt, want)
+		}
+	}
+}
+
 // buildCLI compiles the real binary, so a test can assert on the order main does
 // things in. Nothing else can: the ordering lives in main(), which ends in
 // os.Exit, and calling the pieces in the right order from a test only proves the
@@ -472,6 +504,575 @@ func envWithout(env []string, name string) []string {
 		}
 	}
 	return out
+}
+
+// subtitleTrackSRT is the body subtitleSourceStubs' ffmpeg stub writes out for
+// -source sub to extract and parse: two ordinary blocks, enough to prove a real
+// translation request went out, with nothing about their content that matters.
+const subtitleTrackSRT = "1\n00:00:01,000 --> 00:00:03,000\nHello there\n\n" +
+	"2\n00:00:05,000 --> 00:00:07,000\nGeneral Kenobi\n\n"
+
+// TestTheCompiledBinaryHonoursOPENAI_BASE_URL is the test that the ordinary
+// run's whole event stream depends on: without it no test can drive a real
+// process through a successful translation, because the only other way to
+// reach a stub endpoint is a package variable (newTranslateClient, swapped by
+// stubTranslator) a subprocess cannot see. It drives the compiled binary
+// through a real -source sub run and asserts the translation request reached
+// the env var's endpoint rather than the real one.
+func TestTheCompiledBinaryHonoursOPENAI_BASE_URL(t *testing.T) {
+	srv := stubTranslateEndpoint(t)
+
+	bin := buildCLI(t)
+	dir := t.TempDir()
+	binDir := subtitleSourceStubs(t, dir, subtitleTrackSRT)
+
+	film := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(film, []byte("not really a film"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(bin, "-to", "es", "-source", "sub", "-from", "en", "-track", "0", film)
+	cmd.Env = append(os.Environ(),
+		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"OPENAI_API_KEY=sk-test",
+		"OPENAI_BASE_URL="+srv.URL,
+		"XDG_CONFIG_HOME="+filepath.Join(dir, "cfg"),
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run failed: %v\n%s", err, out)
+	}
+
+	// The stub echoes every line back prefixed "ES:". The real endpoint would
+	// have rejected "sk-test" or been unreachable from this sandbox, either of
+	// which fails the run above — so finding the prefix in the file the run
+	// wrote is direct proof OPENAI_BASE_URL routed the request here, not there.
+	got, err := os.ReadFile(media.DefaultSRTPath(film, "es"))
+	if err != nil {
+		t.Fatalf("reading the translated SRT: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(got), "ES:") {
+		t.Fatalf("translated SRT carries no ES: prefix, so the stub endpoint was never reached:\n%s\n%s", got, out)
+	}
+}
+
+// stubTranslateEndpoint answers every batch with the source text it was sent,
+// each prefixed "ES:" and keyed exactly as asked. A fixed reply cannot be used
+// here: batch()'s keys are 0-indexed per batch, and mapReply requires the
+// reply's key set to match the request's exactly, so a canned
+// {"1":"hola"}-style reply fails every block and exits the run non-zero before
+// any assertion about the event stream gets to run.
+func stubTranslateEndpoint(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Messages []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var user string
+		for _, m := range req.Messages {
+			if m.Role == "user" {
+				user = m.Content
+			}
+		}
+		var payload struct {
+			Translate map[string]string `json:"translate"`
+		}
+		json.Unmarshal([]byte(user), &payload)
+		out := make(map[string]string, len(payload.Translate))
+		for k, v := range payload.Translate {
+			out[k] = "ES:" + v
+		}
+		content, _ := json.Marshal(out)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"choices":[{"message":{"content":%q}}]}`, content)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// untranslatableBlockSRT is a two-block subtitle body where the second block's
+// text carries refusedBlockMarker, the substring
+// stubTranslateEndpointRefusingSomeBlocks refuses to translate.
+const untranslatableBlockSRT = "1\n00:00:01,000 --> 00:00:03,000\nHello there\n\n" +
+	"2\n00:00:05,000 --> 00:00:07,000\nUNTRANSLATABLE block\n\n"
+
+const refusedBlockMarker = "UNTRANSLATABLE"
+
+// untranslatableDialogueSRT is dialogueSRT with refusedBlockMarker in the second
+// block, so a run driven through stubTranslateEndpointRefusingSomeBlocks ends at
+// the second of progressive.go's two done emits — the one that follows the
+// blocks_untranslated warning.
+const untranslatableDialogueSRT = `printf '1\n00:00:01,000 --> 00:00:03,000\n%s one\n\n2\n00:00:05,000 --> 00:00:07,000\nUNTRANSLATABLE %s\n\n' "$tag" "$tag" > "$outbase.srt"`
+
+// stubTranslateEndpointRefusingSomeBlocks behaves like stubTranslateEndpoint,
+// except any block whose source text contains marker is answered with a
+// mismatched key instead of a translation. mapReply requires the reply's key
+// set to equal the request's exactly, so that block's batch attempt fails,
+// which is what drives openai.go's per-block fallback (one()) — where the same
+// content-based check refuses it again, permanently. The refusal is decided
+// from each request's own content, never from a shared call counter, so it
+// stays deterministic across the batch's own retry and across concurrent
+// workers, neither of which promises a stable call order.
+func stubTranslateEndpointRefusingSomeBlocks(t *testing.T, marker string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Messages []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var user string
+		for _, m := range req.Messages {
+			if m.Role == "user" {
+				user = m.Content
+			}
+		}
+		var payload struct {
+			Translate map[string]string `json:"translate"`
+		}
+		json.Unmarshal([]byte(user), &payload)
+
+		out := make(map[string]string, len(payload.Translate))
+		for k, v := range payload.Translate {
+			if strings.Contains(v, marker) {
+				// A key the request never asked for, so mapReply's key-set check
+				// fails this key specifically — unique per source key, so several
+				// refused blocks in the same batch don't collide into one entry
+				// and understate how many keys are actually missing.
+				out["__refused_"+k+"__"] = "x"
+				continue
+			}
+			out[k] = "ES:" + v
+		}
+		content, _ := json.Marshal(out)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"choices":[{"message":{"content":%q}}]}`, content)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// parseEventStream returns one map per JSON event line on stderr, skipping the
+// prose lines the protocol's own skip rule says a consumer may ignore (any line
+// that does not start with '{'). Unlike eventsOf/eventsOfKind above, it fails
+// the test outright on a line that starts with '{' and does not parse as JSON,
+// rather than silently skipping it: that shape — a line beginning like an event
+// but broken — is exactly the stream corruption (an event split across two
+// writes) the previous branch spent a Critical and a Major fixing, and a helper
+// that skips it could never catch a regression of it.
+func parseEventStream(t *testing.T, stderr []byte) []map[string]any {
+	t.Helper()
+	var out []map[string]any
+	for _, line := range strings.Split(string(stderr), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if !strings.HasPrefix(line, "{") {
+			continue // a prose line, which the protocol says to skip
+		}
+		var m map[string]any
+		if err := json.Unmarshal([]byte(line), &m); err != nil {
+			t.Fatalf("stderr line starts with '{' but does not parse as JSON: %v\nline: %q", err, line)
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// kindsOf returns the "type" field of every event, in order.
+func kindsOf(events []map[string]any) []string {
+	out := make([]string, 0, len(events))
+	for _, e := range events {
+		k, _ := e["type"].(string)
+		out = append(out, k)
+	}
+	return out
+}
+
+// countOf returns how many events carry the given "type".
+func countOf(events []map[string]any, kind string) int {
+	n := 0
+	for _, e := range events {
+		if e["type"] == kind {
+			n++
+		}
+	}
+	return n
+}
+
+// containsSubsequence reports whether want appears in got in order, though not
+// necessarily contiguously — want is a subsequence of got.
+func containsSubsequence(got, want []string) bool {
+	i := 0
+	for _, g := range got {
+		if i == len(want) {
+			break
+		}
+		if g == want[i] {
+			i++
+		}
+	}
+	return i == len(want)
+}
+
+// TestTheOrdinaryRunEmitsItsWholeStream pins the default (non -fast) path's
+// events end to end. It is a real, compiled process, so it also pins that exit
+// 0 and exactly one done event agree — the pair no in-process test can assert,
+// because only a real process both carries its own exit code and cannot be
+// handed a fake events.Emitter to inspect afterwards.
+func TestTheOrdinaryRunEmitsItsWholeStream(t *testing.T) {
+	srv := stubTranslateEndpoint(t)
+	bin := buildCLI(t)
+	dir := t.TempDir()
+	binDir := subtitleSourceStubs(t, dir, subtitleTrackSRT)
+
+	film := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(film, []byte("not really a film"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stderr bytes.Buffer
+	cmd := exec.Command(bin, "-events", "json", "-to", "es", "-source", "sub", "-from", "en", "-track", "0", film)
+	cmd.Env = append(os.Environ(),
+		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"OPENAI_API_KEY=sk-test",
+		"OPENAI_BASE_URL="+srv.URL,
+		"XDG_CONFIG_HOME="+filepath.Join(dir, "cfg"),
+	)
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("want exit 0, got %v\nstderr:\n%s", err, stderr.String())
+	}
+
+	events := parseEventStream(t, stderr.Bytes())
+	wantInOrder := []string{"version", "probe", "stage", "stage", "progress", "done"}
+	if got := kindsOf(events); !containsSubsequence(got, wantInOrder) {
+		t.Errorf("event kinds = %v, want %v as a subsequence", got, wantInOrder)
+	}
+	if n := countOf(events, "done"); n != 1 {
+		t.Errorf("%d done events, want exactly one", n)
+	}
+	if n := countOf(events, "error"); n != 0 {
+		t.Errorf("%d error events on a successful run, want none", n)
+	}
+	for _, e := range events {
+		if e["type"] == "done" && e["path"] == "" {
+			t.Error("the done event carries no path, so a consumer cannot open the result")
+		}
+	}
+}
+
+// TestTheOrdinaryRunReportsUntranslatedBlocks pins the warning event on the
+// default path: a run where a block could not be translated must say so
+// through the event stream — kind, count and total — and must not look
+// identical to a run where nothing failed.
+func TestTheOrdinaryRunReportsUntranslatedBlocks(t *testing.T) {
+	srv := stubTranslateEndpointRefusingSomeBlocks(t, refusedBlockMarker)
+	bin := buildCLI(t)
+	dir := t.TempDir()
+	binDir := subtitleSourceStubs(t, dir, untranslatableBlockSRT)
+
+	film := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(film, []byte("not really a film"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stderr bytes.Buffer
+	cmd := exec.Command(bin, "-events", "json", "-to", "es", "-source", "sub", "-from", "en", "-track", "0", film)
+	cmd.Env = append(os.Environ(),
+		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"OPENAI_API_KEY=sk-test",
+		"OPENAI_BASE_URL="+srv.URL,
+		"XDG_CONFIG_HOME="+filepath.Join(dir, "cfg"),
+	)
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("want exit 0 — a partial translation failure is a warning, not a fatal error — got %v\nstderr:\n%s", err, stderr.String())
+	}
+
+	events := parseEventStream(t, stderr.Bytes())
+	if got := kindsOf(events); !containsSubsequence(got, []string{"warning", "done"}) {
+		t.Errorf("event kinds = %v, want a warning before the done event", got)
+	}
+	if n := countOf(events, "warning"); n != 1 {
+		t.Fatalf("%d warning events, want exactly one:\n%s", n, stderr.String())
+	}
+	if n := countOf(events, "done"); n != 1 {
+		t.Errorf("%d done events, want exactly one", n)
+	}
+
+	var w map[string]any
+	for _, e := range events {
+		if e["type"] == "warning" {
+			w = e
+		}
+	}
+	if kind, _ := w["kind"].(string); kind != "blocks_untranslated" {
+		t.Errorf("warning kind = %q, want blocks_untranslated", kind)
+	}
+	if count, _ := w["count"].(float64); count <= 0 {
+		t.Errorf("warning count = %v, want > 0", w["count"])
+	}
+	// untranslatableBlockSRT parses to exactly two blocks.
+	if total, _ := w["total"].(float64); total != 2 {
+		t.Errorf("warning total = %v, want 2 (the number of blocks in the source)", w["total"])
+	}
+}
+
+// TestTheOrdinaryRunEmitsTheContainerDoneEvent pins the other done event on
+// the default path. The sidecar test above only ever exercises the mode-srt
+// branch (the tool's own default), which never reaches the mux branch's
+// separate, later events.Done call — so -mode mux is what drives that one.
+func TestTheOrdinaryRunEmitsTheContainerDoneEvent(t *testing.T) {
+	srv := stubTranslateEndpoint(t)
+	bin := buildCLI(t)
+	dir := t.TempDir()
+	binDir := subtitleSourceStubs(t, dir, subtitleTrackSRT)
+
+	film := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(film, []byte("not really a film"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stderr bytes.Buffer
+	cmd := exec.Command(bin, "-events", "json", "-to", "es", "-source", "sub",
+		"-from", "en", "-track", "0", "-mode", "mux", film)
+	cmd.Env = append(os.Environ(),
+		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"OPENAI_API_KEY=sk-test",
+		"OPENAI_BASE_URL="+srv.URL,
+		"XDG_CONFIG_HOME="+filepath.Join(dir, "cfg"),
+	)
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("want exit 0, got %v\nstderr:\n%s", err, stderr.String())
+	}
+
+	events := parseEventStream(t, stderr.Bytes())
+
+	// A loose containsSubsequence(kindsOf(events), []string{"stage", "done"})
+	// check is satisfied by ANY earlier stage (extract-subs or translate both
+	// fire first on this path), so it never actually requires the mux stage —
+	// and pinning only mux's *presence* before done is not much stronger: a
+	// reviewer once moved the mux emit to the very start of the run and this
+	// test still passed. Pin the whole ordered stage sequence instead — it is
+	// both stronger and simpler, and stage order is what the GUI displays.
+	var stageNames []string
+	for _, e := range events {
+		if e["type"] != "stage" {
+			continue
+		}
+		name, _ := e["name"].(string)
+		stageNames = append(stageNames, name)
+	}
+	wantStages := []string{"extract-subs", "translate", "mux"}
+	if !slices.Equal(stageNames, wantStages) {
+		t.Errorf("stage names = %v, want %v in that order", stageNames, wantStages)
+	}
+
+	if n := countOf(events, "done"); n != 1 {
+		t.Fatalf("%d done events, want exactly one:\n%s", n, stderr.String())
+	}
+	var done map[string]any
+	doneIdx := -1
+	muxIdx := -1
+	for i, e := range events {
+		switch e["type"] {
+		case "done":
+			done = e
+			doneIdx = i
+		case "stage":
+			if name, _ := e["name"].(string); name == "mux" {
+				muxIdx = i
+			}
+		}
+	}
+	if muxIdx != -1 && muxIdx > doneIdx {
+		t.Errorf("mux stage at event index %d came after the done event at index %d, want the mux stage before done", muxIdx, doneIdx)
+	}
+	wantPath := media.DefaultOutputPath(film, "es")
+	if got, _ := done["path"].(string); got != wantPath {
+		t.Errorf("done path = %q, want %q (the muxed container, not a sidecar)", got, wantPath)
+	}
+}
+
+// -mode both writes two files, and done names one of them. Nothing on the
+// ordinary path emitted saved, so a consumer's "Show in Finder" could only ever
+// reach the container and had no way to learn the sidecar existed — on a run
+// whose whole point is that it produced both.
+//
+// The shape is a saved event per file, reusing the event the -fast path already
+// emits, rather than a second list on done: it arrives when the file does (the
+// sidecar lands minutes before a multi-gigabyte mux finishes), it keeps done's
+// meaning unchanged, and it leaves a consumer one rule — every file the run wrote
+// has a saved event — instead of two places to look.
+func TestModeBothNamesEveryFileItWrote(t *testing.T) {
+	srv := stubTranslateEndpoint(t)
+	bin := buildCLI(t)
+	dir := t.TempDir()
+	binDir := subtitleSourceStubs(t, dir, subtitleTrackSRT)
+
+	film := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(film, []byte("not really a film"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stderr bytes.Buffer
+	cmd := exec.Command(bin, "-events", "json", "-to", "es", "-source", "sub",
+		"-from", "en", "-track", "0", "-mode", "both", film)
+	cmd.Env = append(os.Environ(),
+		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"OPENAI_API_KEY=sk-test",
+		"OPENAI_BASE_URL="+srv.URL,
+		"XDG_CONFIG_HOME="+filepath.Join(dir, "cfg"),
+	)
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("want exit 0, got %v\nstderr:\n%s", err, stderr.String())
+	}
+
+	wantSidecar := media.DefaultSRTPath(film, "es")
+	wantContainer := media.DefaultOutputPath(film, "es")
+	// Both really are on disk: an event naming a file that was never written
+	// would be worse than no event at all.
+	for _, path := range []string{wantSidecar, wantContainer} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("-mode both did not write %s: %v", path, err)
+		}
+	}
+
+	var named []string
+	for _, e := range eventsOfKind(stderr.String(), "saved") {
+		path, _ := e["path"].(string)
+		named = append(named, path)
+		// covers is the -fast path's span of the film and the ordinary run has no
+		// honest value for it, so it must be absent rather than "".
+		if _, ok := e["covers"]; ok {
+			t.Errorf("saved for %s carries covers = %#v; the ordinary run knows no span "+
+				"of the film's runtime and must omit the field", path, e["covers"])
+		}
+		// And watchable is the -fast path's claim that an incomplete file is
+		// already worth opening. The ordinary run has no such moment to offer: a
+		// true here becomes "you can start watching" in a window, moments before
+		// done, for a file that was never partial.
+		if e["watchable"] != false {
+			t.Errorf("saved for %s has watchable = %#v, want false: the ordinary run writes "+
+				"complete files at the end of the run, so there is no early moment for a "+
+				"consumer to act on", path, e["watchable"])
+		}
+	}
+	if !slices.Equal(named, []string{wantSidecar, wantContainer}) {
+		t.Errorf("saved events named %v, want %v — the sidecar as it is written, then the "+
+			"container:\n%s", named, []string{wantSidecar, wantContainer}, stderr.String())
+	}
+
+	// done is unchanged: one event, still the container.
+	dones := eventsOfKind(stderr.String(), "done")
+	if len(dones) != 1 {
+		t.Fatalf("%d done events, want exactly one:\n%s", len(dones), stderr.String())
+	}
+	if got, _ := dones[0]["path"].(string); got != wantContainer {
+		t.Errorf("done path = %q, want %q", got, wantContainer)
+	}
+}
+
+// TestTheMuxWriteIsClassified drives a real mux failure through the compiled
+// binary and asserts the error event's kind is output_unwritable. It is the
+// sibling of TestTheOrdinaryRunEmitsTheContainerDoneEvent above, which already
+// proves -mode mux is reachable through the compiled binary with nothing more
+// exotic than subtitleSourceStubs and stubTranslateEndpoint — a comment near
+// errkind_test.go once claimed a real mux failure could not be driven to
+// completion in this suite; this test is the proof that it can, by failing
+// only the ffmpeg invocation that performs the mux itself while leaving the
+// (also ffmpeg-driven) subtitle extraction that has to succeed first alone.
+//
+// The two calls are told apart by how many -i flags they carry:
+// ExtractSubtitle passes exactly one (the input file), while MuxSubtitle
+// passes two (the input file and the translated SRT) — internal/media/media.go
+// builds both argument lists, and that shape is the only thing distinguishing
+// them from the stub's side.
+func TestTheMuxWriteIsClassified(t *testing.T) {
+	srv := stubTranslateEndpoint(t)
+	bin := buildCLI(t)
+	dir := t.TempDir()
+	binDir := subtitleSourceStubs(t, dir, subtitleTrackSRT)
+
+	// Overwrite subtitleSourceStubs' ffmpeg stub, which always succeeds: this
+	// one still extracts a real subtitle track (one -i) but refuses the mux
+	// invocation (two -i's, input and the translated SRT) exactly the way a
+	// read-only output directory or a full disk would.
+	writeStub(t, filepath.Join(binDir, "ffmpeg"), `#!/bin/sh
+i_count=0
+prev=""
+out=""
+for a in "$@"; do
+  if [ "$prev" = "-i" ]; then i_count=$((i_count+1)); fi
+  prev="$a"
+  out="$a"
+done
+if [ "$i_count" -ge 2 ]; then
+  echo "ffmpeg: mux stub refuses to write the container" >&2
+  exit 1
+fi
+cat > "$out" <<'SRTBODY'
+`+subtitleTrackSRT+`
+SRTBODY
+exit 0
+`)
+
+	film := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(film, []byte("not really a film"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	cmd := exec.Command(bin, "-events", "json", "-to", "es", "-source", "sub",
+		"-from", "en", "-track", "0", "-mode", "mux", film)
+	cmd.Env = append(os.Environ(),
+		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"OPENAI_API_KEY=sk-test",
+		"OPENAI_BASE_URL="+srv.URL,
+		"XDG_CONFIG_HOME="+filepath.Join(dir, "cfg"),
+	)
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	runErr := cmd.Run()
+	var exit *exec.ExitError
+	if !errors.As(runErr, &exit) {
+		t.Fatalf("the binary did not run: %v\nstdout:\n%s\nstderr:\n%s", runErr, stdout.String(), stderr.String())
+	}
+	if code := exit.ExitCode(); code != 1 {
+		t.Errorf("exit status %d, want 1", code)
+	}
+
+	events := parseEventStream(t, stderr.Bytes())
+	var errs []map[string]any
+	for _, e := range events {
+		if e["type"] == "error" {
+			errs = append(errs, e)
+		}
+	}
+	if len(errs) != 1 {
+		t.Fatalf("%d error events, want exactly 1:\n%s", len(errs), stderr.String())
+	}
+	if kind, _ := errs[0]["kind"].(string); kind != string(errOutputUnwritable) {
+		t.Errorf("error event kind = %q, want %q\nstderr:\n%s", kind, errOutputUnwritable, stderr.String())
+	}
+	if msg, _ := errs[0]["message"].(string); !strings.HasPrefix(msg, "mux: ") {
+		t.Errorf("error event message = %q, want it to start with %q", msg, "mux: ")
+	}
 }
 
 // The event stream is an addition, not a replacement: a person running the tool
@@ -638,6 +1239,141 @@ JSON`)
 	}
 	if !strings.Contains(stderr.String(), "error: subtitle track #0 is empty") {
 		t.Errorf("stderr's human-readable \"error: ...\" line is missing or changed:\n%s", stderr.String())
+	}
+}
+
+// TestTheProbeEventStatesTheFastModeRule is what lets the GUI disable its
+// checkbox without holding a copy of the rule.
+func TestTheProbeEventStatesTheFastModeRule(t *testing.T) {
+	bin := buildCLI(t)
+	dir := t.TempDir()
+
+	binDir := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stub := "#!/bin/sh\n" + `cat <<'JSON'
+{"streams":[
+ {"index":0,"codec_type":"video","codec_name":"h264","tags":{"language":"rus"}},
+ {"index":1,"codec_type":"audio","codec_name":"ac3","tags":{"language":"eng","title":"Original"}}
+],"format":{"duration":"120.5"}}
+JSON`
+	writeStub(t, filepath.Join(binDir, "ffprobe"), stub)
+
+	film := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(film, []byte("not a film"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(bin, "-events", "json", "-probe", film)
+	cmd.Env = append(os.Environ(),
+		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"XDG_CONFIG_HOME="+filepath.Join(dir, "cfg"),
+	)
+	cmd.Env = append(cmd.Env, "OPENAI_API_KEY=")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("probe failed: %v\nstderr: %s", err, stderr.String())
+	}
+
+	var probe map[string]any
+	for _, line := range strings.Split(stderr.String(), "\n") {
+		var m map[string]any
+		if json.Unmarshal([]byte(line), &m) == nil && m["type"] == "probe" {
+			probe = m
+		}
+	}
+	if probe == nil {
+		t.Fatalf("no probe event:\n%s", stderr.String())
+	}
+
+	fast, ok := probe["fast"].(map[string]any)
+	if !ok {
+		t.Fatalf("probe.fast = %#v, want an object", probe["fast"])
+	}
+	sources, _ := fast["sources"].([]any)
+	if len(sources) != 1 || sources[0] != "audio" {
+		t.Errorf("fast.sources = %v, want [\"audio\"]", fast["sources"])
+	}
+	modes, _ := fast["modes"].([]any)
+	if len(modes) != 1 || modes[0] != "srt" {
+		t.Errorf("fast.modes = %v, want [\"srt\"]", fast["modes"])
+	}
+	if fast["min_chunk_minutes"] != float64(1) {
+		t.Errorf("fast.min_chunk_minutes = %v, want 1", fast["min_chunk_minutes"])
+	}
+}
+
+// The File screen offers sidecar, embed, or both — and for a container that
+// cannot carry a subtitle track the CLI silently downgrades mux and both to a
+// sidecar, announcing it on stdout and nowhere on the wire. A consumer then has
+// to hold its own copy of the "AVI cannot embed" rule, which is the exact thing
+// probe.fast exists to prevent.
+//
+// So the probe event states it, and this drives the compiled binary on one
+// container that takes an embedded track and one that does not. Same stubs, same
+// argv, one letter of difference in the filename: nothing but the container's own
+// extension may decide the answer, which is why both cases are one test.
+func TestTheProbeEventSaysWhetherTheContainerTakesAnEmbeddedTrack(t *testing.T) {
+	bin := buildCLI(t)
+	dir := t.TempDir()
+
+	binDir := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeStub(t, filepath.Join(binDir, "ffprobe"), "#!/bin/sh\n"+`cat <<'JSON'
+{"streams":[
+ {"index":0,"codec_type":"video","codec_name":"h264"},
+ {"index":1,"codec_type":"audio","codec_name":"ac3","tags":{"language":"eng"}}
+],"format":{"duration":"120.5"}}
+JSON`)
+
+	for _, tt := range []struct {
+		name string
+		file string
+		want bool
+	}{
+		{"an MKV, which takes an embedded track", "movie.mkv", true},
+		{"an AVI, which does not", "movie.avi", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			film := filepath.Join(dir, tt.file)
+			if err := os.WriteFile(film, []byte("not a film"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			cmd := exec.Command(bin, "-events", "json", "-probe", film)
+			cmd.Env = append(os.Environ(),
+				"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+				"XDG_CONFIG_HOME="+filepath.Join(dir, "cfg"),
+				"OPENAI_API_KEY=",
+			)
+			var stdout, stderr bytes.Buffer
+			cmd.Stdout, cmd.Stderr = &stdout, &stderr
+			if err := cmd.Run(); err != nil {
+				t.Fatalf("probe failed: %v\nstderr: %s", err, stderr.String())
+			}
+
+			probes := eventsOfKind(stderr.String(), "probe")
+			if len(probes) != 1 {
+				t.Fatalf("%d probe events, want exactly one:\n%s", len(probes), stderr.String())
+			}
+			// Read through the raw JSON, not a decoded struct: an absent field and
+			// a false one decode alike into a bool, and the whole point of the
+			// pointer in events.Probe is that "cannot embed" must reach the wire
+			// as a stated false rather than as a silence.
+			got, ok := probes[0]["embeds_subtitles"]
+			if !ok {
+				t.Fatalf("the probe event has no embeds_subtitles field, so a consumer cannot "+
+					"tell whether %s takes an embedded track without holding its own copy of "+
+					"the rule:\n%s", filepath.Ext(tt.file), stderr.String())
+			}
+			if got != tt.want {
+				t.Errorf("embeds_subtitles = %v, want %v for %s", got, tt.want, tt.file)
+			}
+		})
 	}
 }
 
@@ -1028,6 +1764,9 @@ func TestAFullRunLeavesStdoutUnchangedUnderEvents(t *testing.T) {
 
 	run := func(scratch string, enableEvents bool) string {
 		t.Helper()
+		// Two runs in one process, so the ending is reset per run rather than
+		// per test: the second run's done event is its own.
+		freshEnding(t)
 		tmpDir := filepath.Join(dir, scratch)
 		if err := os.MkdirAll(tmpDir, 0o755); err != nil {
 			t.Fatal(err)
@@ -1562,14 +2301,73 @@ func TestBothRunPathsClassifyARefusedTranslation(t *testing.T) {
 	})
 }
 
+// TestTheFastPathClassifiesAnUnwritableOutputPath is the -fast counterpart of
+// TestAnUnwritableOutputPathIsClassified: runProgressive's own per-chunk write
+// now builds a kindErrf(errOutputUnwritable, …) error, but that error still has
+// to survive the trip back through runOrdinary's o.fast branch, which used to
+// flatten every unrecognised failure out of runProgressive to "other" via
+// errf("%v", err) — exactly the same loss classifyTranscribeErr's own doc
+// comment already describes for the sentinels above. classifyTranscribeErr now
+// checks kindOf(err) before falling through to the switch, which is what this
+// asserts directly, the same way the sibling subtests above assert the
+// existing sentinels survive that switch.
+func TestTheFastPathClassifiesAnUnwritableOutputPath(t *testing.T) {
+	dir, binDir, tmpDir, _ := progressiveStubs(t, dialogueSRT)
+	stubTranslator(t, nil)
+
+	input := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(input, []byte("not really a film"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	streams := []media.Stream{{Index: 0, CodecType: "video"}, {Index: 1, CodecType: "audio"}}
+	streams[1].Tags.Language = "eng"
+	opts := whisper.Options{
+		Bin:   filepath.Join(binDir, "stub-whisper"),
+		Model: filepath.Join(dir, "ggml-test.bin"),
+	}
+
+	// runProgressive is handed "" for out, so it writes the same default sidecar
+	// path media.DefaultSRTPath computes. Pre-creating a directory there makes
+	// the first chunk's write fail without needing real filesystem permissions.
+	outPath := media.DefaultSRTPath(input, "es")
+	if err := os.Mkdir(outPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	err := runProgressive(input, tmpDir, streams, -1, "en", "es",
+		10*time.Minute, opts, translate.Options{}, "")
+	if err == nil {
+		t.Fatal("runProgressive() = nil, want an error — the output path is a directory")
+	}
+	kind, ok := classifyTranscribeErr(err)
+	if !ok {
+		t.Fatalf("classifyTranscribeErr(%v) = (%q, false), want a classified kind", err, kind)
+	}
+	if kind != errOutputUnwritable {
+		t.Errorf("classifyTranscribeErr(%v) = %q, want %q", err, kind, errOutputUnwritable)
+	}
+}
+
 // The ordinary run's translate failure is the one classification a real binary
-// can be driven into without a way to point it at a test endpoint: an
-// unreachable proxy makes every request fail at the connection, so translateAll
-// returns "all N blocks failed" with an error that is not a status refusal at
-// all. That is the assertion this wants — the call site hard-coded
-// errRateLimited, so a connection failure, a malformed reply and a mistyped key
-// all arrived as "the endpoint is throttling you". Now the error is asked what
-// it was, and something that is neither refusal reports "other".
+// can be driven into with a genuine connection failure rather than a status
+// refusal: OPENAI_BASE_URL (Task 1) is pointed at 127.0.0.1:1, a port nothing
+// ever listens on, so every request fails to connect and translateAll returns
+// "all N blocks failed" with an error that is not a status refusal at all.
+// That is the assertion this wants — the call site hard-coded errRateLimited,
+// so a connection failure, a malformed reply and a mistyped key all arrived as
+// "the endpoint is throttling you". Now the error is asked what it was, and
+// something that is neither refusal reports "other".
+//
+// An earlier version of this test relied on HTTPS_PROXY/HTTP_PROXY instead,
+// with a comment claiming "the request never leaves the machine: no network,
+// and deterministic". That claim was false: cmd.Env appends to os.Environ(),
+// and most getenv implementations return the *first* match for a duplicated
+// name, so an ambient HTTPS_PROXY/HTTP_PROXY already present in the test
+// runner's environment silently outranked the one this test set, making the
+// failure mode — and sometimes the outcome — depend on where the suite ran.
+// Routing through OPENAI_BASE_URL instead removes the dependency on any
+// environment variable this process does not fully control: the CLI reads
+// OPENAI_BASE_URL itself and there is exactly one way to set it.
 func TestTheOrdinaryRunAsksTheErrorWhichRefusalItWas(t *testing.T) {
 	bin := buildCLI(t)
 	dir := t.TempDir()
@@ -1600,10 +2398,11 @@ exit 0
 		"OPENAI_API_KEY=sk-test",
 		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"XDG_CONFIG_HOME="+filepath.Join(dir, "cfg"),
-		// Port 1 has nothing listening, and Go's http transport reads these, so
-		// the request never leaves the machine: no network, and deterministic.
-		"HTTPS_PROXY=http://127.0.0.1:1",
-		"HTTP_PROXY=http://127.0.0.1:1",
+		// Port 1 has nothing listening, so every request fails at connect —
+		// deterministically, and without depending on any ambient proxy
+		// variable this process does not fully control (see the doc comment
+		// above).
+		"OPENAI_BASE_URL=http://127.0.0.1:1",
 	)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
@@ -1749,34 +2548,208 @@ JSON`)
 	})
 }
 
+// A cancel used to be reportable only once the run's scratch directory existed,
+// because that is where the handler was armed. Everything before it — flag
+// parsing, the mode and source checks, config.Load, the input's stat, -probe's
+// own ffprobe, the translation-settings check — ran under Go's default SIGINT
+// disposition, which terminates the process by the signal: a consumer saw zero
+// terminal events and a wait status of "signalled", whose ExitCode() is -1 and
+// which appears nowhere in the documented exit-code table.
+//
+// -probe is the widest part of that window and the easiest to hold open
+// deterministically: ffprobe can run long on a damaged file, so the stub here
+// announces itself and then sleeps, and the cancel is sent once it has. The run
+// must report that cancel the way any other cancel is reported — one
+// error{cancelled} and exit 130 — rather than dying by signal.
+func TestACancelBeforeTheRunsSetupWorkStillExits130(t *testing.T) {
+	bin := buildCLI(t)
+	dir := t.TempDir()
+
+	binDir := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	started := filepath.Join(dir, "ffprobe-started")
+	writeStub(t, filepath.Join(binDir, "ffprobe"), "#!/bin/sh\ntouch "+started+"\nsleep 10\nexit 1\n")
+
+	film := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(film, []byte("not a film"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(bin, "-events", "json", "-probe", film)
+	cmd.Env = append(os.Environ(),
+		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"XDG_CONFIG_HOME="+filepath.Join(dir, "cfg"),
+		"OPENAI_API_KEY=",
+	)
+	cmd.Stdout = io.Discard
+	stderr := startWithPipedStderr(t, cmd)
+
+	// Inside the probe, so the cancel lands before anything the old arming point
+	// could have covered — there is no scratch directory on this path at all.
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		if _, err := os.Stat(started); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the stub ffprobe never ran:\n%s", stderr.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := cmd.Process.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+
+	runErr := cmd.Wait()
+	var exit *exec.ExitError
+	if !errors.As(runErr, &exit) {
+		t.Fatalf("want a non-zero exit, got %v\n%s", runErr, stderr.String())
+	}
+	if code := exit.ExitCode(); code != 130 {
+		// -1 is what a process terminated by a signal reports, and it is the
+		// original defect: no row of the exit-code table describes it.
+		t.Errorf("exit status %d, want 130 (a signalled process reports -1)\n%s", code, stderr.String())
+	}
+	errs := eventsOfKind(stderr.String(), "error")
+	if len(errs) != 1 {
+		t.Fatalf("%d error events, want exactly one:\n%s", len(errs), stderr.String())
+	}
+	if kind, _ := errs[0]["kind"].(string); kind != string(errCancelled) {
+		t.Errorf("error kind = %q, want %q", kind, errCancelled)
+	}
+}
+
 // waitForEvent polls a stderr file until it carries a line with the given
 // substring, which is how a test knows a subprocess has reached a stage without
 // guessing at a sleep.
 func waitForEvent(t *testing.T, path, want string) {
 	t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
-	for time.Now().Before(deadline) {
-		if b, err := os.ReadFile(path); err == nil && strings.Contains(string(b), want) {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	b, _ := os.ReadFile(path)
-	t.Fatalf("timed out waiting for %q on the event stream:\n%s", want, b)
+	waitForStream(t, func() string {
+		b, _ := os.ReadFile(path)
+		return string(b)
+	}, want)
 }
 
-// waitForFile polls until path exists, which is how a stub subprocess says it
-// has got far enough for the signal to land where the test wants it.
-func waitForFile(t *testing.T, path string) {
+// waitForStream is the same wait over any growing stream, so a test reading the
+// event stream through a pipe waits the same way one reading it from a file
+// does.
+func waitForStream(t *testing.T, read func() string, want string) {
 	t.Helper()
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
-		if _, err := os.Stat(path); err == nil {
+		if strings.Contains(read(), want) {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("timed out waiting for %s", path)
+	t.Fatalf("timed out waiting for %q on the event stream:\n%s", want, read())
+}
+
+// pipedStderr is a subprocess's stderr read the way a desktop wrapper reads it:
+// through a pipe, drained to EOF on a goroutine of its own. EOF arrives only
+// once every process holding the write end has let go of it, so the drain
+// returning is an assertion in itself — it is what a GUI is waiting for before
+// it can call the run finished.
+type pipedStderr struct {
+	mu      sync.Mutex
+	buf     bytes.Buffer
+	drained chan struct{}
+}
+
+func (p *pipedStderr) Write(b []byte) (int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.buf.Write(b)
+}
+
+// String is safe to call while the drain is still running.
+func (p *pipedStderr) String() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.buf.String()
+}
+
+// startWithPipedStderr starts cmd with its stderr on a pipe and begins draining
+// it. The parent's copy of the write end is closed straight after the start, so
+// the only holders left are the child and anything the child hands it to.
+func startWithPipedStderr(t *testing.T, cmd *exec.Cmd) *pipedStderr {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd.Stderr = w
+	if err := cmd.Start(); err != nil {
+		w.Close()
+		r.Close()
+		t.Fatal(err)
+	}
+	w.Close()
+
+	p := &pipedStderr{drained: make(chan struct{})}
+	go func() {
+		defer close(p.drained)
+		defer r.Close()
+		io.Copy(p, r)
+	}()
+	return p
+}
+
+// waitForDrain fails unless the stderr pipe reaches EOF inside d. A GUI hangs
+// on exactly this: some process still holding the write end after the CLI is
+// gone.
+func (p *pipedStderr) waitForDrain(t *testing.T, d time.Duration) {
+	t.Helper()
+	select {
+	case <-p.drained:
+	case <-time.After(d):
+		t.Fatalf("the event stream did not reach EOF %s after the CLI exited: "+
+			"something still holds its write end", d)
+	}
+}
+
+// waitForProcessGone polls until pid has left the process table. It is how the
+// cancellation test asks the only question that matters about a child it does
+// not own: is it still running?
+func waitForProcessGone(t *testing.T, pid int, within time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for {
+		p, err := os.FindProcess(pid)
+		if err != nil {
+			return
+		}
+		// Signal 0 checks for the process without disturbing it.
+		if err := p.Signal(syscall.Signal(0)); err != nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the stub child (pid %d) was still running %s after the CLI "+
+				"exited on SIGINT: the cancel left an orphan", pid, within)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// waitForPID polls until a stub subprocess has written its own pid to path.
+// That says two things at once: the stub has got far enough for the signal to
+// land where the test wants it, and this is the process the test must later
+// find gone.
+func waitForPID(t *testing.T, path string) int {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if b, err := os.ReadFile(path); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil && pid > 0 {
+				return pid
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for a stub to write its pid to %s", path)
+	return 0
 }
 
 // Cancellation had no test at all: deleting the emit at the SIGINT handler left
@@ -1786,9 +2759,10 @@ func waitForFile(t *testing.T, path string) {
 // assertion here is deliberately made the way a consumer would make it: parse
 // every line, and the cancelled event must be one of them.
 //
-// stderr goes to a file rather than a pipe on purpose. SIGINT does not kill the
-// ffmpeg child (a separate, deferred finding), and a pipe would keep this test
-// waiting on the orphan the way it would keep a GUI waiting.
+// stderr is read through a pipe, as a desktop wrapper reads it, and the blocking
+// stub is asked for afterwards by pid: a cancelled run must leave no child of
+// this program still running, and the stub sleeps far longer than the test
+// waits, so an orphan cannot pass by finishing on its own.
 func TestCancellationExits130WithExactlyOneCancelledEvent(t *testing.T) {
 	bin := buildCLI(t)
 
@@ -1798,16 +2772,21 @@ func TestCancellationExits130WithExactlyOneCancelledEvent(t *testing.T) {
 	const sleepyFfmpeg = `#!/bin/sh
 out=""
 for a in "$@"; do out="$a"; done
-printf 'size=       0KiB time=00:00:00.00 bitrate=1024.0kbits/s speed=57x    \r' >&2
-# Only now: the signal must arrive with a line that has no newline at its end
-# already in flight, which is the window the cancelled event was lost in.
-: > "$FFMPEG_STARTED"
+# A run of carriage-return progress first, so the last thing the run saw from
+# this child is a line with no newline at its end: the window the cancelled
+# event was once lost in.
 i=0
-while [ $i -lt 40 ]; do
+while [ $i -lt 5 ]; do
   printf 'size=%8dKiB time=00:00:00.00 bitrate=1024.0kbits/s speed=57x    \r' "$i" >&2
-  sleep 0.1
+  sleep 0.02
   i=$((i+1))
 done
+# Then silence, and only then the pid, so the signal lands inside the silence.
+# A child that never writes again is never reached by EPIPE — it is exactly the
+# child the group kill exists for, and the chatty one would have died on its
+# own.
+echo $$ > "$STUB_PID"
+sleep 20
 printf 'RIFFWAVE' > "$out"
 exit 0
 `
@@ -1824,11 +2803,10 @@ while [ $# -gt 0 ]; do
   shift
 done
 echo "whisper_print_progress_callback: progress =  10%" >&2
-i=0
-while [ $i -lt 40 ]; do
-  sleep 0.1
-  i=$((i+1))
-done
+# Silent from here, like a transcription that has read its model and is now
+# only working: nothing will make this child notice the CLI is gone.
+echo $$ > "$STUB_PID"
+sleep 20
 : > "$outbase.srt"
 exit 0
 `
@@ -1841,17 +2819,12 @@ exit 0
 		// waitFor is the line on the event stream that says the run has reached
 		// the blocking step.
 		waitFor string
-		// waitForFfmpeg additionally waits until the ffmpeg stub has written a
-		// carriage-return fragment, so the signal cannot win the race against
-		// the child starting up.
-		waitForFfmpeg bool
 	}{
 		{
-			name:          "during audio extraction, mid ffmpeg progress line",
-			ffmpeg:        sleepyFfmpeg,
-			whisper:       quickFfmpeg, // never reached
-			waitFor:       `"name":"extract"`,
-			waitForFfmpeg: true,
+			name:    "during audio extraction, mid ffmpeg progress line",
+			ffmpeg:  sleepyFfmpeg,
+			whisper: quickFfmpeg, // never reached
+			waitFor: `"name":"extract"`,
 		},
 		{
 			name:    "during transcription",
@@ -1882,32 +2855,22 @@ JSON`)
 				t.Fatal(err)
 			}
 
-			errPath := filepath.Join(dir, "stderr.log")
-			errFile, err := os.Create(errPath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer errFile.Close()
-
 			cmd := exec.Command(bin, "-events", "json", "-to", "es", "-source", "audio",
 				"-whisper-bin", whisperBin, "-whisper-model", model, film)
-			started := filepath.Join(dir, "ffmpeg-started")
+			pidPath := filepath.Join(dir, "stub.pid")
 			cmd.Env = append(os.Environ(),
 				"OPENAI_API_KEY=sk-test",
 				"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
 				"XDG_CONFIG_HOME="+filepath.Join(dir, "cfg"),
-				"FFMPEG_STARTED="+started,
+				"STUB_PID="+pidPath,
 			)
 			cmd.Stdout = io.Discard
-			cmd.Stderr = errFile
-			if err := cmd.Start(); err != nil {
-				t.Fatal(err)
-			}
+			stream := startWithPipedStderr(t, cmd)
 
-			waitForEvent(t, errPath, tt.waitFor)
-			if tt.waitForFfmpeg {
-				waitForFile(t, started)
-			}
+			waitForStream(t, stream.String, tt.waitFor)
+			// The stub's pid also says it is past its first write, so the
+			// signal cannot win the race against the child starting up.
+			stubPID := waitForPID(t, pidPath)
 			if err := cmd.Process.Signal(os.Interrupt); err != nil {
 				t.Fatal(err)
 			}
@@ -1922,23 +2885,544 @@ JSON`)
 			if code := exit.ExitCode(); code != 130 {
 				t.Errorf("exit status %d, want 130", code)
 			}
+			// The whole point of the cancel: the child goes too. The stub has
+			// twenty seconds of sleeping left, so surviving this wait is not
+			// something it can do by finishing.
+			waitForProcessGone(t, stubPID, 5*time.Second)
+			stream.waitForDrain(t, 5*time.Second)
 
-			stream, err := os.ReadFile(errPath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			errs := eventsOfKind(string(stream), "error")
+			emitted := stream.String()
+			errs := eventsOfKind(emitted, "error")
 			if len(errs) != 1 {
 				t.Fatalf("%d error events, want exactly one parseable cancelled event:\n%s",
-					len(errs), stream)
+					len(errs), emitted)
 			}
 			if kind, _ := errs[0]["kind"].(string); kind != string(errCancelled) {
 				t.Errorf("error kind = %q, want %q", kind, errCancelled)
 			}
-			if got := eventsOfKind(string(stream), "done"); len(got) != 0 {
+			if got := eventsOfKind(emitted, "done"); len(got) != 0 {
 				t.Errorf("%d done events on a cancelled run, want none", len(got))
 			}
 		})
+	}
+}
+
+// The one ordering the brief spelled out, and the one thing a comment cannot
+// enforce: the children die before the scratch directory they are writing into is
+// removed. Swapping the two calls in shutdownAfterCancel left the whole main
+// package green when this was written, which is why the ordering gets a test of
+// its own rather than a sentence.
+//
+// The child creates a file in the scratch directory over and over, which is the
+// observable shape of what ffmpeg does there. If it is still alive when
+// os.RemoveAll walks the directory, it drops another entry in behind the walk and
+// the final rmdir fails with ENOTEMPTY — the leaked scratch directory a real
+// cancel in the wrong order leaves behind, and the error os.RemoveAll returns is
+// discarded by design.
+func TestACancelKillsTheChildrenBeforeRemovingTheScratchDirectory(t *testing.T) {
+	dir, err := os.MkdirTemp("", "sub-translator-ordering-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+
+	restore := runTmpDir
+	runTmpDir = dir
+	t.Cleanup(func() { runTmpDir = restore })
+
+	cmd := exec.Command("sh", "-c",
+		`i=0; while [ $i -lt 200000 ]; do : > "$1/f$i"; i=$((i+1)); done`, "sh", dir)
+	if err := proc.Start(cmd); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait until it is genuinely writing, so the assertion is not made against a
+	// child that has not reached the directory yet.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if names, err := os.ReadDir(dir); err == nil && len(names) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the child never wrote into the scratch directory")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	shutdownAfterCancel()
+
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		names, _ := os.ReadDir(dir)
+		t.Errorf("the scratch directory survived the cancel holding %d entries: "+
+			"the child was still writing into it while it was being removed", len(names))
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Error("the child outlived the cancel by five seconds")
+	}
+}
+
+// The cancel has to beat every other ending a run can have, and the two that can
+// reach the exit after it are a failure (exitWith) and a success (emitDone). The
+// e2e cancellation test covers this only by winning a scheduling race — with the
+// guard disabled it went green 32 times in 33 — so the branch is tested here
+// directly instead, deterministically, one subprocess per ending.
+//
+// Every row below raises the flag *before* the run, so this table covers one
+// direction only, however many rows it grows. The other direction — the cancel
+// arriving second — is
+// TestACancelArrivingAfterTheEndingAddsNoSecondTerminalEvent, and the reason it
+// is a separate test rather than more rows here is that this test's name would
+// stop being true.
+func TestACancelInFlightWinsOverAnyOtherEnding(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		// mode is handed to the child half below.
+		mode string
+		// what a wrapper must see: the exit code, and how many of each terminal
+		// event reached the stream.
+		wantCode   int
+		wantErrors int
+		wantDones  int
+	}{
+		{
+			name: "a killed child surfacing as a failure",
+			mode: "error-while-cancelling", wantCode: 130, wantErrors: 0, wantDones: 0,
+		},
+		{
+			name: "a run that finished in the same instant",
+			mode: "done-while-cancelling", wantCode: 130, wantErrors: 0, wantDones: 0,
+		},
+		{
+			name: "the same failure with no cancel in flight",
+			mode: "error-alone", wantCode: 1, wantErrors: 1, wantDones: 0,
+		},
+		{
+			name: "the same success with no cancel in flight",
+			mode: "done-alone", wantCode: 0, wantErrors: 0, wantDones: 1,
+		},
+		// The two above pin emitDone itself. These pin the pipeline to using
+		// it: reverting any of the done emits to a bare ev.Emit leaves the
+		// helper's own tests green, because nothing else holds a finished run
+		// to asking whether a cancel got there first.
+		{
+			name: "an ordinary run finishing as the cancel lands",
+			mode: "ordinary-run-while-cancelling", wantCode: 130, wantErrors: 0, wantDones: 0,
+		},
+		{
+			name: "an ordinary mux run finishing as the cancel lands",
+			mode: "ordinary-mux-run-while-cancelling", wantCode: 130, wantErrors: 0, wantDones: 0,
+		},
+		{
+			name: "a -fast run finishing as the cancel lands",
+			mode: "progressive-run-while-cancelling", wantCode: 130, wantErrors: 0, wantDones: 0,
+		},
+		{
+			name: "a -fast run with untranslated blocks finishing as the cancel lands",
+			mode: "progressive-partial-while-cancelling", wantCode: 130, wantErrors: 0, wantDones: 0,
+		},
+		// And the same two runs with no cancel, so the absence asserted above is
+		// an absence of something these runs really do emit.
+		{
+			name: "an ordinary run with no cancel in flight",
+			mode: "ordinary-run", wantCode: 0, wantErrors: 0, wantDones: 1,
+		},
+		{
+			name: "an ordinary mux run with no cancel in flight",
+			mode: "ordinary-mux-run", wantCode: 0, wantErrors: 0, wantDones: 1,
+		},
+		{
+			name: "a -fast run with no cancel in flight",
+			mode: "progressive-run", wantCode: 0, wantErrors: 0, wantDones: 1,
+		},
+		// The third ender, which neither of the two above reaches: the usage error
+		// and the missing input path, whose prose is not exitWith's "error: ..."
+		// line. A cancel already in flight owns the kill, the scratch-directory
+		// removal and their order, so neither may race it to the exit — and
+		// neither may add a terminal event to a stream that already has one.
+		{
+			name: "a usage error arriving as the cancel lands",
+			mode: "usage-error-while-cancelling", wantCode: 130, wantErrors: 0, wantDones: 0,
+		},
+		{
+			name: "the missing-input error arriving as the cancel lands",
+			mode: "missing-input-while-cancelling", wantCode: 130, wantErrors: 0, wantDones: 0,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			assertCancelHandoffEnding(t, tt.mode, tt.wantCode, tt.wantErrors, tt.wantDones)
+		})
+	}
+}
+
+// The mirror direction, and the one nothing on this branch asked about: a cancel
+// that arrives *after* the run has already written its terminal event. Every row
+// of the table above raises the flag before the run, so eleven rows could not
+// reach this case — and the reviewer reproduced it on the compiled binary as a
+// done line followed by an error{cancelled} line, exit 130, with a complete and
+// correct .srt on disk.
+//
+// What must hold is the same promise from the other side: one terminal event, and
+// an exit status that agrees with it. The cancel changed nothing, so the status
+// stays the one the run had already earned — 0 after a done, 1 after an error —
+// rather than 130 telling a wrapper a finished run was abandoned.
+//
+// The child half makes the ordering deterministic rather than likely: for the two
+// bare-ender rows the cancel is raised from inside the write of the terminal event
+// itself (see signalOnFirstWrite), so the handler is provably awake and inside its
+// own claim while the ender is still holding the ending. A flag raised after the
+// emit, or checked without the lock, fails these rows; so does no guard at all.
+func TestACancelArrivingAfterTheEndingAddsNoSecondTerminalEvent(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		mode       string
+		wantCode   int
+		wantErrors int
+		wantDones  int
+	}{
+		{
+			name: "a cancel landing inside the done event's own write",
+			mode: "done-then-cancel", wantCode: 0, wantErrors: 0, wantDones: 1,
+		},
+		{
+			name: "a cancel landing inside the error event's own write",
+			mode: "error-then-cancel", wantCode: 1, wantErrors: 1, wantDones: 0,
+		},
+		{
+			// The case as reproduced: a whole -fast run finishes, its done event
+			// is on the wire, and the cancel arrives during the work that follows
+			// it — the desktop notification and the scratch-directory removal.
+			name: "a cancel landing after a -fast run has finished",
+			mode: "progressive-run-then-cancel", wantCode: 0, wantErrors: 0, wantDones: 1,
+		},
+		// The third ender, exitAfterEmitting: the missing-input path, which emits
+		// its event and then writes 56 lines of usage text before exiting. It
+		// emitted with a bare ev.Emit, safe only while the signal handler was
+		// armed below it; arming the handler at the top of the run put it inside
+		// the window, and the fix wave that closed this defect opened this
+		// instance of it.
+		//
+		// Its sibling, the usage error, goes through the same function and is not
+		// a row here on purpose: nothing at all is written between its event and
+		// its exit, so its cancel-second window is genuinely instruction-wide and
+		// cannot be held open deterministically from inside the process. What
+		// covers it instead: the claim is this one function call, pinned by the
+		// row below; the site's use of it is pinned by
+		// TestNoTerminalEventIsEmittedOutsideClaimEnding; and the real binary was
+		// bombarded with SIGINT storms on that argv, which reproduced two double
+		// endings in 200 trials before the fix and none in 400 after it.
+		{
+			name: "a cancel landing inside the missing-input error's own write",
+			mode: "missing-input-then-cancel", wantCode: 1, wantErrors: 1, wantDones: 0,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			assertCancelHandoffEnding(t, tt.mode, tt.wantCode, tt.wantErrors, tt.wantDones)
+		})
+	}
+}
+
+// assertCancelHandoffEnding runs one mode of TestCancelHandoffChild in a
+// subprocess and checks what a wrapper would see: the exit status, and how many
+// of each terminal event reached the stream.
+func assertCancelHandoffEnding(t *testing.T, mode string, wantCode, wantErrors, wantDones int) {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestCancelHandoffChild$")
+	// The child ends in os.Exit, which skips t.Cleanup, so it is given a
+	// scratch root this test owns and removes.
+	cmd.Env = append(os.Environ(),
+		"SUB_TRANSLATOR_CANCEL_HANDOFF="+mode,
+		"TMPDIR="+t.TempDir(),
+	)
+	var stderr bytes.Buffer
+	cmd.Stdout = io.Discard
+	cmd.Stderr = &stderr
+
+	code := 0
+	if err := cmd.Run(); err != nil {
+		var exit *exec.ExitError
+		if !errors.As(err, &exit) {
+			t.Fatalf("running the child half: %v", err)
+		}
+		code = exit.ExitCode()
+	}
+
+	if code != wantCode {
+		t.Errorf("exit status %d, want %d\n%s", code, wantCode, stderr.String())
+	}
+	if got := eventsOfKind(stderr.String(), "error"); len(got) != wantErrors {
+		t.Errorf("%d error events, want %d\n%s", len(got), wantErrors, stderr.String())
+	}
+	if got := eventsOfKind(stderr.String(), "done"); len(got) != wantDones {
+		t.Errorf("%d done events, want %d\n%s", len(got), wantDones, stderr.String())
+	}
+}
+
+// signalOnFirstWrite raises this process's own SIGINT as the run's first event is
+// being written, and then holds the write open for a moment.
+//
+// It is how "the cancel arrives second" stops being a scheduling coin toss. The
+// signal is raised while the ender is inside its claim, so the handler is awake
+// and asking the same question before the ender has finished answering it; the
+// pause afterwards gives a handler that was never made to defer every chance to
+// emit, so a missing guard shows up as a failure on every run rather than on one
+// in thirty-three.
+type signalOnFirstWrite struct {
+	w    io.Writer
+	once sync.Once
+}
+
+func (s *signalOnFirstWrite) Write(p []byte) (int, error) {
+	first := false
+	s.once.Do(func() {
+		first = true
+		// os.Process.Signal rather than syscall.Kill, so this file still
+		// type-checks under GOOS=windows.
+		if p, err := os.FindProcess(os.Getpid()); err == nil {
+			_ = p.Signal(os.Interrupt)
+		}
+	})
+	n, err := s.w.Write(p)
+	if first {
+		time.Sleep(200 * time.Millisecond)
+	}
+	return n, err
+}
+
+// TestCancelHandoffChild is the child half of the two tests above: it runs in a
+// subprocess of this test binary, because the branch under test ends in os.Exit
+// and nothing in-process survives that.
+func TestCancelHandoffChild(t *testing.T) {
+	mode := os.Getenv("SUB_TRANSLATOR_CANCEL_HANDOFF")
+	if mode == "" {
+		t.Skip("the child half of TestACancelInFlightWinsOverAnyOtherEnding")
+	}
+	switch mode {
+	case "done-then-cancel", "error-then-cancel", "missing-input-then-cancel":
+		// These two need the cancel raised from inside the terminal event's own
+		// write. proseErr is replaced rather than bypassed so the events and the
+		// prose still share one writer, which is the production wiring the
+		// ordering under test depends on.
+		proseErr = events.NewSyncWriter(&signalOnFirstWrite{w: os.Stderr})
+		ev = events.New(proseErr)
+	default:
+		ev = events.New(proseErr)
+	}
+	if strings.HasSuffix(mode, "-then-cancel") {
+		// The cancel-arrives-second modes need a real armed handler: the whole
+		// question is what the handler does when it finds the ending already
+		// written.
+		armCancelHandler()
+		setupRunTmpDir()
+	}
+	// There is no signal handler in this process, so the handoff wait is what
+	// elapses rather than the handler's own exit arriving first. Shortened so
+	// each case costs milliseconds instead of five seconds.
+	cancelHandoffTimeout = 50 * time.Millisecond
+
+	switch mode {
+	case "error-while-cancelling":
+		cancelling.Store(true)
+		exitWith(kindErrf(errProbeFailed, "ffmpeg: signal: killed"))
+	case "error-alone":
+		exitWith(kindErrf(errProbeFailed, "ffmpeg: signal: killed"))
+	case "done-while-cancelling":
+		cancelling.Store(true)
+		emitDone(&events.Done{Path: "/tmp/subtitles.srt"})
+	case "done-alone":
+		emitDone(&events.Done{Path: "/tmp/subtitles.srt"})
+		os.Exit(0)
+
+	case "ordinary-run", "ordinary-run-while-cancelling":
+		if strings.HasSuffix(mode, "-while-cancelling") {
+			cancelling.Store(true)
+		}
+		runOrdinaryWithStubs(t, modeSRT)
+		os.Exit(0)
+
+	case "ordinary-mux-run", "ordinary-mux-run-while-cancelling":
+		if strings.HasSuffix(mode, "-while-cancelling") {
+			cancelling.Store(true)
+		}
+		runOrdinaryWithStubs(t, modeMux)
+		os.Exit(0)
+
+	case "progressive-run", "progressive-run-while-cancelling":
+		if strings.HasSuffix(mode, "-while-cancelling") {
+			cancelling.Store(true)
+		}
+		runProgressiveWithStubs(t, nil)
+		os.Exit(0)
+
+	case "progressive-partial-while-cancelling":
+		srv := stubTranslateEndpointRefusingSomeBlocks(t, refusedBlockMarker)
+		cancelling.Store(true)
+		runProgressiveWithStubs(t, srv)
+		os.Exit(0)
+
+	case "done-then-cancel":
+		emitDone(&events.Done{Path: "/tmp/subtitles.srt"})
+		// The handler is already awake and inside its own claim. Give it the
+		// process rather than racing it to an identical status, so that a handler
+		// which never fires at all shows up as the 97 below.
+		time.Sleep(5 * time.Second)
+	case "error-then-cancel":
+		// exitWith ends the process itself, with the same status the handler
+		// would; which of the two gets there first does not matter, and neither
+		// may add a second terminal event.
+		exitWith(kindErrf(errProbeFailed, "ffmpeg: signal: killed"))
+	case "usage-error-while-cancelling", "missing-input-while-cancelling":
+		// Exactly what main does for "flag provided but not defined" and for no
+		// input path, including the exit codes the flag package's own ExitOnError
+		// and the usage dump would have used.
+		cancelling.Store(true)
+		if mode == "usage-error-while-cancelling" {
+			exitAfterEmitting(&events.Error{
+				Kind:    string(errOther),
+				Message: "flag provided but not defined: -nonesuch",
+			}, 2, nil)
+		}
+		exitAfterEmitting(&events.Error{
+			Kind:    string(errOther),
+			Message: "no input file: sub-translator needs the path to a video file",
+		}, 1, func() { fmt.Fprint(proseErr, usage) })
+
+	case "missing-input-then-cancel":
+		// And what it does with no input path: the same single event, exit 1, and
+		// the usage text as this ending's own prose — the 56 lines the cancel used
+		// to land in the middle of.
+		exitAfterEmitting(&events.Error{
+			Kind:    string(errOther),
+			Message: "no input file: sub-translator needs the path to a video file",
+		}, 1, func() { fmt.Fprint(proseErr, usage) })
+
+	case "progressive-run-then-cancel":
+		// The reproduced case, with no writer tricks: the run finishes, its done
+		// event is on the wire, and only then is the cancel raised — the instant
+		// the reviewer's osascript stub occupied.
+		runProgressiveWithStubs(t, nil)
+		if p, err := os.FindProcess(os.Getpid()); err == nil {
+			_ = p.Signal(os.Interrupt)
+		}
+		time.Sleep(5 * time.Second)
+
+	default:
+		t.Fatalf("unknown mode %q", mode)
+	}
+	// Only a branch that failed to exit reaches this.
+	fmt.Fprintf(proseErr, "the child returned from mode %s without exiting\n", mode)
+	os.Exit(99)
+}
+
+// proc's registry is the list of process groups a cancel kills, and an entry
+// only leaves it when the child is waited for through proc.Wait. A caller that
+// starts a child and waits for it with a bare cmd.Wait therefore leaves a pid on
+// that list for the rest of the run — reaped, and free to be handed to somebody
+// else by the kernel, whose process group the next cancel would then SIGKILL.
+//
+// That invariant lives in internal/media and internal/whisper, where proc cannot
+// see it, so it is asserted here: after a whole run, nothing is left running.
+// Reverting either call site to cmd.Wait fails this.
+func TestAFinishedRunLeavesNothingOnTheKillList(t *testing.T) {
+	t.Run("the ordinary run, which starts ffmpeg", func(t *testing.T) {
+		before := proc.Running()
+		saved := ev
+		t.Cleanup(func() { ev = saved })
+		ev = events.New(nil)
+		captureStdout(t, func() { runOrdinaryWithStubs(t, modeSRT) })
+		if got := proc.Running(); got != before {
+			t.Errorf("%d process group(s) still on the kill list after a finished run, want %d: "+
+				"a child was started and never waited for through proc.Wait", got, before)
+		}
+	})
+	t.Run("the -fast run, which starts whisper too", func(t *testing.T) {
+		before := proc.Running()
+		saved := ev
+		t.Cleanup(func() { ev = saved })
+		ev = events.New(nil)
+		captureStdout(t, func() { runProgressiveWithStubs(t, nil) })
+		if got := proc.Running(); got != before {
+			t.Errorf("%d process group(s) still on the kill list after a finished run, want %d: "+
+				"a child was started and never waited for through proc.Wait", got, before)
+		}
+	})
+}
+
+// runOrdinaryWithStubs drives a whole default run — subtitle track in, translated
+// SRT out — against the same stubs TestRunOrdinaryEndsInOneDoneEvent uses. It
+// exists so the cancel check in front of that run's done event is asserted
+// through the pipeline rather than on the helper that holds it.
+func runOrdinaryWithStubs(t *testing.T, out outputMode) {
+	t.Helper()
+	dir := t.TempDir()
+	binDir := subtitleSourceStubs(t, dir, subtitleTrackSRT)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	stubTranslator(t, nil)
+
+	input := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(input, []byte("not really a film"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tmpDir := filepath.Join(dir, "scratch")
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runOrdinary(ordinaryOptions{
+		input:  input,
+		tmpDir: tmpDir,
+		from:   "en",
+		to:     "es",
+		source: sourceSub,
+		track:  0,
+		atrack: -1,
+		mode:   out,
+		translateOpts: translate.Options{
+			APIKey:  "sk-test",
+			Model:   translate.DefaultModel,
+			Workers: 4,
+		},
+	}); err != nil {
+		t.Fatalf("runOrdinary() = %v, want success", err)
+	}
+}
+
+// runProgressiveWithStubs is the same for the -fast path. A non-nil srv is a
+// translation endpoint that refuses some blocks, which is what reaches the
+// second of progressive.go's two done emits — the one that follows the
+// blocks_untranslated warning.
+func runProgressiveWithStubs(t *testing.T, srv *httptest.Server) {
+	t.Helper()
+	body := dialogueSRT
+	opts := translate.Options{}
+	if srv != nil {
+		body = untranslatableDialogueSRT
+		opts = translate.Options{APIKey: "sk-test", Model: translate.DefaultModel, BaseURL: srv.URL}
+	} else {
+		stubTranslator(t, nil)
+	}
+
+	dir, binDir, tmpDir, _ := progressiveStubs(t, body)
+
+	input := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(input, []byte("not really a film"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	streams := []media.Stream{{Index: 0, CodecType: "video"}, {Index: 1, CodecType: "audio"}}
+	streams[1].Tags.Language = "eng"
+	whisperOpts := whisper.Options{
+		Bin:   filepath.Join(binDir, "stub-whisper"),
+		Model: filepath.Join(dir, "ggml-test.bin"),
+	}
+
+	if err := runProgressive(input, tmpDir, streams, -1, "en", "es",
+		10*time.Minute, whisperOpts, opts, ""); err != nil {
+		t.Fatalf("runProgressive() = %v, want success", err)
 	}
 }
 
