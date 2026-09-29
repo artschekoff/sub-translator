@@ -138,7 +138,13 @@ func exitWith(err error) {
 // prose is what the path prints after its event and may be nil; it is called only
 // when this ending won, because a cancel that got there first has already ended
 // the run and 56 lines of flag documentation are not that run's epilogue.
+//
+// It yields first for the same reason the other two enders do, even though
+// claimEnding would reach the right answer without it: a cancel already in flight
+// owns the kill and the scratch-directory removal, and their order, and this must
+// not race it to the exit.
 func exitAfterEmitting(e *events.Error, code int, prose func()) {
+	yieldIfCancelling()
 	earned, won := claimEnding(e, code)
 	if !won {
 		handOverToCancelHandler(earned)
