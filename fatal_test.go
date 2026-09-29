@@ -3,6 +3,8 @@ package main
 import (
 	"errors"
 	"fmt"
+	"os"
+	"strings"
 	"testing"
 )
 
@@ -50,5 +52,65 @@ func TestAFatalErrorKeepsItsMessageExactly(t *testing.T) {
 	err := kindErrf(errRateLimited, "translate: %v", errors.New("429"))
 	if got, want := err.Error(), "translate: 429"; got != want {
 		t.Errorf("Error() = %q, want %q — the message is part of the contract", got, want)
+	}
+}
+
+// "Exactly one terminal event per run" is a property of claimEnding, and only of
+// claimEnding: it is the one place a done or an error reaches the stream, and the
+// one place that can see whether something got there first. A site that builds
+// one and hands it straight to ev.Emit opts out of the whole mechanism, and the
+// suite cannot notice unless a cancel happens to land in its window.
+//
+// That is not hypothetical. Two such sites — the usage error and the missing
+// input path — sat harmlessly below the point where the signal handler used to be
+// armed; moving the arming to the top of the run, so that a cancel during the
+// config load or -probe's ffprobe stopped being death by signal, put both of them
+// inside the armed window and re-opened the defect claimEnding had just closed,
+// reproducibly, on the missing-input path with 56 lines of usage text written
+// between the emit and the exit.
+//
+// So the rule is structural, and checked as one: no non-test file in this package
+// may pass an events.Error or an events.Done to Emit. Build it, name it, and give
+// it to claimEnding — through exitWith, emitDone or exitAfterEmitting — and the
+// exit status comes back with it.
+func TestNoTerminalEventIsEmittedOutsideClaimEnding(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Emit takes an events.Event, so claimEnding's own call reads ev.Emit(e) and
+	// cannot match these: what is being forbidden is handing Emit a freshly built
+	// terminal event, which is the only way to bypass the claim.
+	forbidden := []string{"Emit(&events.Error{", "Emit(&events.Done{"}
+
+	scanned := 0
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		body, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		scanned++
+		for i, line := range strings.Split(string(body), "\n") {
+			lineNo := i + 1
+			for _, bad := range forbidden {
+				if strings.Contains(line, bad) {
+					t.Errorf("%s:%d emits a terminal event without claiming the ending:\n\t%s\n"+
+						"Route it through claimEnding — exitWith, emitDone or exitAfterEmitting — "+
+						"or a cancel landing between this emit and the exit puts a second "+
+						"terminal event on a stream that promises one.",
+						name, lineNo, strings.TrimSpace(line))
+				}
+			}
+		}
+	}
+	// A scan that found no files would pass silently, which is the failure mode
+	// this whole test exists to rule out elsewhere.
+	if scanned < 8 {
+		t.Fatalf("scanned %d non-test .go files in package main, want the whole package", scanned)
 	}
 }

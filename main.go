@@ -379,8 +379,10 @@ func main() {
 			// too — and like -version it ends with no terminal event.
 			os.Exit(0)
 		}
-		ev.Emit(&events.Error{Kind: string(errOther), Message: err.Error()})
-		os.Exit(2)
+		// Through exitAfterEmitting, not a bare Emit: the handler is armed above
+		// this line now, so a cancel landing here would otherwise put a second
+		// terminal event on the stream.
+		exitAfterEmitting(&events.Error{Kind: string(errOther), Message: err.Error()}, 2, nil)
 	}
 
 	switch *eventsFlag {
@@ -441,17 +443,18 @@ func main() {
 		// a terminal event instead of 56 lines of flag documentation and
 		// silence on the wire.
 		//
-		// This is the one fatal path that does not go through exitWith, and the
-		// reason is the line it prints: a person with no input path needs the
+		// This is one of the two fatal paths that do not go through exitWith, and
+		// the reason is the line it prints: a person with no input path needs the
 		// usage text, not "error: no input file". exitWith would print the
-		// latter, so the emit and the exit are spelled out here instead — the
-		// same single error event, the same exit 1, arrived at by hand.
-		ev.Emit(&events.Error{
+		// latter, so this goes through exitAfterEmitting instead — the same
+		// single error event and the same exit 1, claimed the same way every
+		// other ending claims it, with the usage text as its own prose. The
+		// claim matters here more than anywhere: those 56 lines are written
+		// between the event and the exit, and the signal handler is armed above.
+		exitAfterEmitting(&events.Error{
 			Kind:    string(errOther),
 			Message: "no input file: sub-translator needs the path to a video file",
-		})
-		flag.Usage()
-		os.Exit(1)
+		}, 1, flag.Usage)
 	}
 	input := flag.Arg(0)
 	if _, err := os.Stat(input); err != nil {

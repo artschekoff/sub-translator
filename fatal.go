@@ -120,6 +120,35 @@ func exitWith(err error) {
 	os.Exit(code)
 }
 
+// exitAfterEmitting is the ending for the two fatal paths that cannot go through
+// exitWith, because the prose they owe a person is not exitWith's "error: …"
+// line: a usage error, whose message the flag package has already printed, and a
+// missing input path, which needs the usage text instead of a one-line error.
+//
+// They owe their consumer exactly one terminal event and an exit status that
+// agrees with it all the same, so they claim the ending the way every other
+// ending does. Both used to emit with a bare ev.Emit, which was safe only for as
+// long as the signal handler was armed below them. Moving the arming up to the
+// top of the run — so that a cancel during the config load or -probe's ffprobe
+// stops being death by signal — put both of them inside the armed window, and a
+// cancel landing between the emit and the exit then appended a second terminal
+// event. That window is not narrow on the missing-input path: 56 lines of usage
+// text are written inside it.
+//
+// prose is what the path prints after its event and may be nil; it is called only
+// when this ending won, because a cancel that got there first has already ended
+// the run and 56 lines of flag documentation are not that run's epilogue.
+func exitAfterEmitting(e *events.Error, code int, prose func()) {
+	earned, won := claimEnding(e, code)
+	if !won {
+		handOverToCancelHandler(earned)
+	}
+	if prose != nil {
+		prose()
+	}
+	os.Exit(code)
+}
+
 // yieldIfCancelling hands the ending to the signal handler when a cancel is
 // already in flight, and returns immediately when there is none.
 //

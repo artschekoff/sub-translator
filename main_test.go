@@ -3078,6 +3078,21 @@ func TestACancelArrivingAfterTheEndingAddsNoSecondTerminalEvent(t *testing.T) {
 			name: "a cancel landing after a -fast run has finished",
 			mode: "progressive-run-then-cancel", wantCode: 0, wantErrors: 0, wantDones: 1,
 		},
+		// The two endings that cannot go through exitWith, because the prose they
+		// owe a person is not its "error: ..." line. Both emitted with a bare
+		// ev.Emit, which was safe only while the signal handler was armed below
+		// them; arming it at the top of the run put both inside the window, and a
+		// cancel then appended a second terminal event — on the missing-input
+		// path with 56 lines of usage text written inside the gap. The fix wave
+		// that closed this defect opened these two instances of it.
+		{
+			name: "a cancel landing inside a usage error's own write",
+			mode: "usage-error-then-cancel", wantCode: 2, wantErrors: 1, wantDones: 0,
+		},
+		{
+			name: "a cancel landing inside the missing-input error's own write",
+			mode: "missing-input-then-cancel", wantCode: 1, wantErrors: 1, wantDones: 0,
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			assertCancelHandoffEnding(t, tt.mode, tt.wantCode, tt.wantErrors, tt.wantDones)
@@ -3161,7 +3176,8 @@ func TestCancelHandoffChild(t *testing.T) {
 		t.Skip("the child half of TestACancelInFlightWinsOverAnyOtherEnding")
 	}
 	switch mode {
-	case "done-then-cancel", "error-then-cancel":
+	case "done-then-cancel", "error-then-cancel",
+		"usage-error-then-cancel", "missing-input-then-cancel":
 		// These two need the cancel raised from inside the terminal event's own
 		// write. proseErr is replaced rather than bypassed so the events and the
 		// prose still share one writer, which is the production wiring the
@@ -3234,6 +3250,22 @@ func TestCancelHandoffChild(t *testing.T) {
 		// would; which of the two gets there first does not matter, and neither
 		// may add a second terminal event.
 		exitWith(kindErrf(errProbeFailed, "ffmpeg: signal: killed"))
+	case "usage-error-then-cancel":
+		// Exactly what main does for "flag provided but not defined", including
+		// the exit code the flag package's own ExitOnError would have used.
+		exitAfterEmitting(&events.Error{
+			Kind:    string(errOther),
+			Message: "flag provided but not defined: -nonesuch",
+		}, 2, nil)
+	case "missing-input-then-cancel":
+		// And what it does with no input path: the same single event, exit 1, and
+		// the usage text as this ending's own prose — the 56 lines the cancel used
+		// to land in the middle of.
+		exitAfterEmitting(&events.Error{
+			Kind:    string(errOther),
+			Message: "no input file: sub-translator needs the path to a video file",
+		}, 1, func() { fmt.Fprint(proseErr, usage) })
+
 	case "progressive-run-then-cancel":
 		// The reproduced case, with no writer tricks: the run finishes, its done
 		// event is on the wire, and only then is the cancel raised — the instant
