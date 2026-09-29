@@ -135,8 +135,16 @@ type Saved struct {
 	// ordinary run writes whatever it parsed in one pass and has no span of the
 	// container's own runtime to report. omitempty for the reason Done.Covers has
 	// it — an absent field is "unknown", never a coverage claim of "".
-	Covers    string `json:"covers,omitempty"`
-	Watchable bool   `json:"watchable"`
+	Covers string `json:"covers,omitempty"`
+	// Watchable is the -fast path's one distinguishing claim: this file is
+	// incomplete and already worth opening. It is what a window turns into "you
+	// can start watching", so it is true only where a partial file is the point.
+	// The ordinary path writes complete files and writes them at the end, so its
+	// saved events carry false: there is no early moment for a consumer to act
+	// on, and saying otherwise would offer one that does not exist. Not
+	// omitempty — false here is a stated fact about a file that exists, not an
+	// absence.
+	Watchable bool `json:"watchable"`
 }
 
 func (*Saved) kind() Kind { return KindSaved }

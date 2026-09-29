@@ -340,9 +340,15 @@ func runOrdinary(o ordinaryOptions) error {
 		// takes minutes, during which the sidecar is already there to open.
 		//
 		// No covers: that span is a thing only -fast knows (see events.Saved).
-		// Watchable, because everything the ordinary run writes is complete when
-		// it is written; a partial file is the -fast path's idea, not this one's.
-		ev.Emit(&events.Saved{Path: srtOut, Watchable: true})
+		//
+		// And watchable false, which reads backwards until you read the field's
+		// meaning: it is "a partial file is already usable", the -fast path's one
+		// distinguishing claim — the reason a person starts the film a minute in
+		// while the rest is still being produced. Nothing the ordinary run writes
+		// is partial, and nothing it writes is usable before the run ends, so a
+		// true here would hand a window the "you can start watching" moment
+		// moments before done, for a file that had no such moment to give.
+		ev.Emit(&events.Saved{Path: srtOut, Watchable: false})
 	}
 
 	if !mode.writesContainer() {
@@ -384,8 +390,9 @@ func runOrdinary(o ordinaryOptions) error {
 	// The second file in -mode both, and the only one in -mode mux. Naming it
 	// here as well as on done keeps one rule for a consumer — every file the run
 	// wrote has a saved event — instead of "the container is on done and the
-	// sidecar is on saved", which is a rule with an exception in it.
-	ev.Emit(&events.Saved{Path: outMKV, Watchable: true})
+	// sidecar is on saved", which is a rule with an exception in it. watchable
+	// false for the reason the sidecar's is: the claim belongs to -fast.
+	ev.Emit(&events.Saved{Path: outMKV, Watchable: false})
 	emitDone(&events.Done{Path: outMKV})
 	return nil
 }

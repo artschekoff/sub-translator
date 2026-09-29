@@ -964,6 +964,15 @@ func TestModeBothNamesEveryFileItWrote(t *testing.T) {
 			t.Errorf("saved for %s carries covers = %#v; the ordinary run knows no span "+
 				"of the film's runtime and must omit the field", path, e["covers"])
 		}
+		// And watchable is the -fast path's claim that an incomplete file is
+		// already worth opening. The ordinary run has no such moment to offer: a
+		// true here becomes "you can start watching" in a window, moments before
+		// done, for a file that was never partial.
+		if e["watchable"] != false {
+			t.Errorf("saved for %s has watchable = %#v, want false: the ordinary run writes "+
+				"complete files at the end of the run, so there is no early moment for a "+
+				"consumer to act on", path, e["watchable"])
+		}
 	}
 	if !slices.Equal(named, []string{wantSidecar, wantContainer}) {
 		t.Errorf("saved events named %v, want %v — the sidecar as it is written, then the "+
