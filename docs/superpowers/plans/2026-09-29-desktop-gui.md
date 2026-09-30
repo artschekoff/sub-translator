@@ -401,7 +401,10 @@ git commit -m "feat(gui): probe a file and surface what went wrong"
 **Interfaces:**
 - Produces:
   - `type RunOptions struct { Input, To, From, Mode, Out string; Track int; Source string; Fast bool }`
-  - `func Run(ctx context.Context, cli string, o RunOptions, on func(Event) error) (*Outcome, error)`
+  - `func Start(ctx context.Context, cli string, o RunOptions, on func(Event) error) (*Run, error)` — returns as soon as the child is started, streaming events to `on` as they arrive
+  - `func (r *Run) Wait() (*Outcome, error)` — blocks until the run ends
+
+**Not `func Run(...)`.** A package-level `Run` function and a `Run` type cannot coexist in one package, and — setting the compile error aside — a blocking call can never hand back a live handle for `Cancel` to act on mid-flight. My first draft of this block asked for both, which was impossible in two independent ways.
   - `type Outcome struct { Done *Done; Err *Error; ExitCode int; Saved []Saved; Warning *Warning }`
   - `func (r *Run) Cancel() error` — sends SIGINT and waits
 
