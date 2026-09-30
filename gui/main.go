@@ -456,8 +456,9 @@ type RunForm struct {
 // Start: exec's fork is short but it is still a syscall on a path that could be
 // a stalled network mount, and every other binding method — Boot, ProbeFilm,
 // FastMode — takes this same mutex. Freezing the whole window on a slow exec to
-// save one boolean is a bad trade. starting is cleared on both paths out of
-// Start below, so a child that fails to spawn does not wedge the button.
+// save one boolean is a bad trade. The claim is released on both paths out of
+// Start below, and by a defer if some future path takes neither, so a child
+// that fails to spawn does not wedge the button — see release.
 func (a *App) StartRun(f RunForm) error {
 	a.mu.Lock()
 	cli, film := a.cli, a.film
@@ -480,6 +481,44 @@ func (a *App) StartRun(f RunForm) error {
 	a.starting = claimed
 	a.stage, a.pct = "", 0
 	a.mu.Unlock()
+
+	// release settles the slot and wakes everyone waiting on the claim. It is
+	// deferred *and* called, and it is idempotent, which is three decisions:
+	//
+	//   - Deferred, because nothing below may leave the claim standing. Nothing
+	//     below returns or panics today, but CancelRun and beforeClose now block
+	//     on this channel, so the one path that ever did would wedge the Start
+	//     button and leave a window that cannot be closed. That is too much to
+	//     hang on a reading of the code below staying true.
+	//   - The whole release, not just the close. Closing the channel while
+	//     a.starting still pointed at it would turn CancelRun's wait into a spin:
+	//     it re-reads the slot after each wake, would find the same closed
+	//     channel, and would loop on it forever. A waiter must wake to a settled
+	//     slot, which means clearing a.starting is part of the same act.
+	//   - Called explicitly on the way out, not left to the defer, because
+	//     awaitRun must not start before a.run is set: a run that ends
+	//     immediately would otherwise find a.run still nil, decline to clear it,
+	//     and leave a finished run in the slot for the life of the window.
+	var run *Run
+	released := false
+	release := func() {
+		if released {
+			return
+		}
+		released = true
+		a.mu.Lock()
+		a.starting = nil
+		if run != nil {
+			a.run = run
+		}
+		a.mu.Unlock()
+		// After the lock, so a waiter that wakes on this close reads the settled
+		// slot rather than racing this function for the mutex. Reached on both
+		// paths out: a child that never spawned must release its waiters too, or
+		// a Cancel pressed in the window would block for the life of the window.
+		close(claimed)
+	}
+	defer release()
 
 	track, atrack := trackIndices(f.Source, f.Track)
 	opts := RunOptions{
@@ -509,22 +548,13 @@ func (a *App) StartRun(f RunForm) error {
 	// about one version of a library rather than a promise, which is the reason
 	// not to depend on it either way.
 	run, err := Start(context.Background(), cli, opts, a.onRunEvent)
-
-	a.mu.Lock()
-	a.starting = nil
-	if err == nil {
-		a.run = run
-	}
-	a.mu.Unlock()
-	// After the lock, so a waiter that wakes on this close reads the settled
-	// slot rather than racing this function for the mutex. Closed on both paths
-	// out: a child that never spawned must release its waiters too, or a Cancel
-	// pressed in the window would block for the life of the window.
-	close(claimed)
-
 	if err != nil {
+		// run stays nil, so release leaves the slot empty.
+		release()
 		return err
 	}
+
+	release()
 
 	go a.awaitRun(run)
 	return nil
