@@ -260,7 +260,7 @@ Closing the window while work is running asks first — "transcription is at 34%
 
 **The re-sign is not optional, and the reason is the copy.** `wails build` ad-hoc self-signs the `.app`, which seals its resources; adding a file inside `Contents/MacOS/` after that breaks the seal. A broken seal is a different Gatekeeper outcome from an unsigned app, not a milder one: `codesign -v` and `spctl -a -t exec` both report "a sealed resource is missing or invalid" and exit 1, macOS calls the app damaged, and right-click → Open offers no override — only removing the quarantine attribute clears it. So `make dmg` runs `codesign --force --deep --sign -` over the bundle after the copy, which returns `codesign -v` to *valid on disk / satisfies its Designated Requirement* and `spctl` to a plain `rejected` with exit 3 — the unidentified-developer case below. Any future change that puts a file into the bundle belongs before that step.
 
-Both are macOS-only targets and neither is part of `make validate` or `make build-all`, which must keep working on a machine with no Wails and no cgo.
+Both are macOS-only targets and neither is part of `make validate` or `make build-all`, which must keep working on a machine with no Wails and no cgo. The gui module's own suite therefore has its own target, `make validate-gui`.
 
 The DMG carries no Developer ID and is not notarised. macOS will say the developer cannot be verified; the README explains the right-click-Open path (and the `xattr -d com.apple.quarantine` alternative) and that real signing needs an Apple Developer account. Adding that signing later is a change to one target, not to the design — it replaces the ad-hoc identity above with a real one.
 

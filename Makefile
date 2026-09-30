@@ -4,7 +4,7 @@ BIN_DIR  := bin
 DIST_DIR := $(BIN_DIR)/dist
 LDFLAGS   = -ldflags "-X main.version=$(VERSION)"
 
-.PHONY: build build-all pack test fmt vet tidy validate clean install release gui dmg
+.PHONY: build build-all pack test fmt vet tidy validate validate-gui clean install release gui dmg
 
 build:
 	go build $(LDFLAGS) -o $(BIN_DIR)/$(BINARY) .
@@ -37,6 +37,24 @@ tidy:
 	go mod tidy
 
 validate: fmt vet test
+
+# The gui module's own gate. `validate` above is root-module only — gui/ is a
+# separate module and no go.work joins them, so the root `go test ./...` does not
+# reach it — and this cannot simply join `validate`, because `go test` in gui/
+# links Wails and needs cgo, while `validate` and `build-all` must keep working
+# on a machine that has neither (spec:261).
+#
+# That is why it needs a target of its own rather than being left to whoever
+# remembers to type it: three of the guards it runs protect the *root* module's
+# invariants — that its go.mod stays dependency-free, that the window never
+# imports the CLI's packages, and that no node toolchain enters the tracked tree
+# or the embedded asset set — so without this line the root module's most
+# important properties are held by tests nothing runs.
+#
+# -race because the window's run slot is read by four goroutines and one of
+# these tests races sixteen StartRun calls against each other on purpose.
+validate-gui:
+	cd gui && gofmt -w . && go vet ./... && go test -race -count=1 ./...
 
 clean:
 	rm -rf $(BIN_DIR)

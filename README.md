@@ -502,13 +502,16 @@ internal/models/      ggml model catalog, search directories, discovery, downloa
 | `make fmt`       | `gofmt -w .` |
 | `make vet`       | `go vet ./...` |
 | `make tidy`      | `go mod tidy` |
-| `make validate`  | `fmt` + `vet` + `test` |
+| `make validate`  | `fmt` + `vet` + `test` (root module only) |
+| `make validate-gui` | `fmt` + `vet` + `go test -race` inside `gui/` (macOS only; needs Wails and cgo) |
 | `make clean`     | Remove `./bin` |
 | `make gui`       | Build the desktop window with `wails build` (macOS only; needs the [Wails v2 CLI](https://wails.io)) |
 | `make dmg`       | `build` + `gui`, then pack both into `./bin/dist/sub-translator.dmg` (macOS only) |
 | `make release`   | Interactive version bump → tag → push → pack → GitHub release |
 
 `make release` reads the latest tag, prompts for a `major`/`minor`/`patch` bump (default `patch`), tags and pushes the new version, packs the cross-compiled archives, and publishes them with `gh release create --generate-notes`. It needs the [`gh` CLI](https://cli.github.com/) authenticated against this repo.
+
+`gui/` is a module of its own, so the root `go test ./...` — and therefore `make validate` — does not reach it. `make validate-gui` runs its suite, including the guards that keep the root module dependency-free and keep the window from importing the CLI's packages. It is a separate target because `go test` in `gui/` needs Wails and cgo, which `make validate` and `make build-all` must keep working without.
 
 ### Desktop app
 
