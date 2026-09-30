@@ -187,13 +187,17 @@ func TestProbeReportsASignalledExitWithAnEmptyStream(t *testing.T) {
 	}
 }
 
-// TestProbeDrainsStdoutSoTheChildNeverBlocks: -probe also prints a
-// human-readable track listing on stdout. Nothing here reads it for content,
-// but it still has to be drained: once the OS pipe buffer (tens of KB) fills
-// up, an unread pipe makes the child block on its own write, and Probe would
-// never return. The stub prints ~200 KB of prose on stdout to exceed any
-// platform's pipe buffer, alongside a normal, valid stderr stream.
-func TestProbeDrainsStdoutSoTheChildNeverBlocks(t *testing.T) {
+// TestProbeReturnsPromptlyAgainstAChattyChild: -probe also prints a
+// human-readable track listing on stdout, which ProbeFile discards via
+// cmd.Stdout = io.Discard rather than reading it. os/exec already guarantees
+// that assignment (and even a nil Stdout, which it sends to /dev/null) never
+// blocks the child, so this test is not proving "forgot to drain" — there is
+// nothing left to forget. What it guards is a regression: a future change
+// back to cmd.StdoutPipe() without a goroutine draining it, which would
+// reintroduce exactly the hang this test would catch. The stub prints ~235
+// KB of prose on stdout, comfortably past any platform's pipe buffer, to
+// make that regression visible as a timeout rather than a flake.
+func TestProbeReturnsPromptlyAgainstAChattyChild(t *testing.T) {
 	dir := t.TempDir()
 	probeLine := `{"type":"probe","t":"2026-09-30T00:00:01Z","audio":[],"subtitles":[]}` + "\n"
 	bigStdout := strings.Repeat("track listing padding to exceed a pipe buffer\n", 5000) // ~235 KB

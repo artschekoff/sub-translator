@@ -44,32 +44,20 @@ func (e *ProbeFailure) Error() string {
 // stream, and returns the track list the CLI reports.
 //
 // Stdout carries the CLI's human-readable track listing (the same listing
-// -probe prints without -events json), which nothing here reads. It is
-// still drained in a goroutine while the process runs: once the OS pipe
-// buffer fills, an unread stdout would make the child block on its own
-// write, and this call would never return.
+// -probe prints without -events json), which nothing here reads; it is
+// discarded. This needs no manual draining: os/exec already runs its own
+// copy goroutine for any non-*os.File Writer assigned to Stdout (and even
+// for a nil Stdout, which it connects to /dev/null), and Wait blocks until
+// that copy is done, so the child can never be left blocked on a full pipe
+// here.
 func ProbeFile(ctx context.Context, cli, path string) (*Probe, error) {
 	cmd := exec.CommandContext(ctx, cli, "-probe", "-events", "json", path)
+	cmd.Stdout = io.Discard
 
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, fmt.Errorf("probe: %w", err)
-	}
 	var stderrBuf bytes.Buffer
 	cmd.Stderr = &stderrBuf
 
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("probe: starting %s: %w", cli, err)
-	}
-
-	stdoutDone := make(chan struct{})
-	go func() {
-		_, _ = io.Copy(io.Discard, stdout)
-		close(stdoutDone)
-	}()
-
-	runErr := cmd.Wait()
-	<-stdoutDone
+	runErr := cmd.Run()
 
 	var probe *Probe
 	var probeErr *Error
