@@ -348,6 +348,19 @@ func TestEndedForGivesEveryEndingSomewhereToGo(t *testing.T) {
 				}
 			},
 		},
+		{
+			// buildOutcome refuses a stream with neither terminal event, so
+			// this cannot arrive — but endedFor's doc promises every ending
+			// reaches a screen, and without a guard this one reaches a nil
+			// dereference on the goroutine that reports the run's ending.
+			name:    "an outcome carrying neither terminal event",
+			outcome: &Outcome{ExitCode: 1},
+			check: func(t *testing.T, got RunEnded) {
+				if got.Route == nil || got.Route.Message == "" {
+					t.Errorf("Route = %+v, want something to show rather than a panic", got.Route)
+				}
+			},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := endedFor(tc.outcome, tc.err)

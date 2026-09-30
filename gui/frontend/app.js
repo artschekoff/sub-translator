@@ -62,6 +62,10 @@ let savedFiles = new Map();
    screen's footer are about. */
 let running = false;
 
+/* The stage line as last drawn, so a cancel that fails can put it back rather
+   than leaving "Cancelling…" on screen over a run that is still going. */
+let lastStageLine = "";
+
 /* Which track the source-language field was last prefilled for, as
    "source:index". Prefilling is a per-track act: it must happen when the
    chosen track changes, and it must not happen on a mode change, which would
@@ -433,6 +437,7 @@ function wireRunEvents() {
       line += ` — chunk ${stage.chunk} of ${stage.of}`;
       if (stage.from && stage.to) line += ` (${stage.from}–${stage.to})`;
     }
+    lastStageLine = line;
     $("run-stage").textContent = line;
     /* A new stage starts a new progress burst: the CLI's percentages are
        per-stage, so carrying the previous one over would show a bar that
@@ -553,6 +558,7 @@ async function startRun() {
   running = true;
 
   $("run-title").textContent = film ? film.name : "";
+  lastStageLine = "";
   $("run-stage").textContent = "Starting sub-translator…";
   $("run-note").hidden = true;
   $("run-watchable").hidden = true;
@@ -605,8 +611,14 @@ async function cancelRun() {
   } catch (err) {
     /* Go's Cancel returns nil for every cancel that worked, including the one
        that landed before the CLI could answer and one pressed on a run that had
-       already finished, so a rejection here really is something gone wrong. */
+       already finished, so a rejection here really is something gone wrong —
+       and the run is still going. The button comes back, because the one state
+       where someone would want to press it again is the one where it failed,
+       and the stage line goes back to saying what is happening rather than
+       leaving "Cancelling…" on screen forever. */
     showRunError(String(err));
+    button.disabled = false;
+    $("run-stage").textContent = lastStageLine || "Still working.";
   }
   /* Nothing is concluded here: the ending still arrives on run:ended, which is
      what reports the partial file and what it covers. */
@@ -806,7 +818,12 @@ function settingRow(key, value) {
     line.append(reveal);
   }
 
-  row.append(label, line, answer);
+  /* The answer sits between the label and the control, not under it. The spec
+     says a routed error "shows the message above" the field at fault, and the
+     reason is legibility rather than taste: a message under a control reads as
+     a caption for whatever comes next, and on this screen what comes next is
+     another setting. */
+  row.append(label, answer, line);
   return row;
 }
 

@@ -453,8 +453,11 @@ body.dragging .dropzone {
   margin: 12px 0;
 }
 
-/* Settings rows stack; each is a label, a control, and the CLI's own answer
-   underneath when it had one. */
+/* Settings rows stack; each is a label, the CLI's own answer when it had one,
+   and then the control. The answer goes above the control rather than below
+   it: a message under a field reads as a caption for the next field, and on a
+   screen that is eight fields in a column that is exactly the wrong reading.
+   The spec asks for "above" for the same reason. */
 .setting {
   padding: 7px 0;
 }
@@ -471,12 +474,13 @@ body.dragging .dropzone {
 }
 
 .setting .answer {
-  margin-top: 4px;
+  margin-bottom: 4px;
 }
 
-/* A setting the error routing sent the window here for. The ring is the focus
-   ring the browser draws anyway once app.js focuses the control; this is the
-   message above it, which is what makes the jump explicable. */
+/* A setting the error routing sent the window here for. The focus ring is the
+   browser's own, drawn once app.js focuses the control; this rule is the
+   message sitting above that control, which is what makes the jump from the
+   Run screen explicable instead of abrupt. */
 .setting.at-fault .answer {
   color: var(--danger);
 }

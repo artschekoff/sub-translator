@@ -72,15 +72,30 @@ var embeddedAssets embed.FS
 // App is the object the page talks to. Every exported method on it becomes
 // window.go.main.App.<Name> in the frontend.
 //
-// The mutable fields are guarded because Wails serves each binding call from
-// the webview's message pump, OnFileDrop from its own callback, OnBeforeClose
-// from a goroutine of its own (darwin/frontend.go's Quit starts one), and a
+// The mutable fields are guarded because every one of the window's entry
+// points arrives on a goroutine of its own. The webview's message pump
+// *receives* binding calls in order but dispatches one goroutine per message
+// (darwin/frontend.go), so two calls genuinely run at once; OnFileDrop comes
+// from its own callback; OnBeforeClose from a goroutine Quit starts; and a
 // run's event stream from the goroutine Start spawns. A drop arriving while
-// the page is asking about fast mode is two goroutines on the same probe, and
-// a window closed mid-run is a third reading `run` while the stream's
-// goroutine is writing `stage`.
+// the page is asking about fast mode is two goroutines on the same probe, a
+// window closed mid-run is a third reading `run` while the stream's goroutine
+// is writing `stage`, and two Start clicks are two goroutines that must not
+// both come away believing they own the run slot — see StartRun.
 type App struct {
 	ctx context.Context
+
+	// emit sends one event to the page. It is a field, assigned once in main
+	// before the window starts and never written again, rather than a direct
+	// call to wailsruntime.EventsEmit — because EventsEmit reads its frontend
+	// implementation out of the window's own context, and that context can
+	// only be built by Wails: the interface it carries lives in the library's
+	// internal/ tree, where nothing in this module is allowed to implement it.
+	// Without this seam no test could call any method that reports to the
+	// page, which is most of them. A nil emit drops the event rather than
+	// panicking, which is the right answer for an App that was never wired to
+	// a window.
+	emit func(ctx context.Context, name string, data ...interface{})
 
 	mu     sync.Mutex
 	cli    string
@@ -88,12 +103,29 @@ type App struct {
 	film   string
 	probe  *Probe
 
-	// run is the translation in flight, or nil. stage and pct are the last
-	// ones the run reported, kept only so the close-while-running question can
-	// name them — the page keeps its own copy for the screen.
-	run   *Run
-	stage string
-	pct   int
+	// run is the translation in flight, or nil, and starting is the moment
+	// between a StartRun claiming the slot and its child either existing or
+	// having failed to. Both are needed: refusing a second run on `run != nil`
+	// alone leaves the fork/exec window open, and that window is long enough
+	// for a second binding goroutine to walk through it.
+	//
+	// stage and pct are the last the run reported, kept only so the
+	// close-while-running question can name them — the page keeps its own copy
+	// for the screen.
+	run      *Run
+	starting bool
+	stage    string
+	pct      int
+}
+
+// send forwards one event to the page through the emit seam above. Every
+// report this window makes goes through it, so a test can watch what the
+// window would have told the page.
+func (a *App) send(name string, data ...interface{}) {
+	if a.emit == nil {
+		return
+	}
+	a.emit(a.ctx, name, data...)
 }
 
 // startup runs once, when the window has a context to talk through. It finds
@@ -157,7 +189,7 @@ func (a *App) onFileDrop(paths []string) {
 		dropped.Path = usable[0]
 		dropped.Ignored = len(usable) - 1
 	}
-	wailsruntime.EventsEmit(a.ctx, "film:dropped", dropped)
+	a.send("film:dropped", dropped)
 }
 
 // BootInfo is what the window needs to know before it can show anything: where
@@ -375,19 +407,42 @@ type RunForm struct {
 // StartRun starts the translation and returns as soon as the child is up. The
 // run reports itself to the page through the five run:* events below, not
 // through this call's return, because it lasts minutes.
+//
+// One run at a time, and the refusal is enforced here rather than trusted to
+// the page. Wails dispatches each binding message on a goroutine of its own, so
+// reading a.run, releasing the lock and only then claiming the slot would let
+// two calls both find nothing in flight and both spawn a CLI: the second
+// assignment would orphan the first from CancelRun and from beforeClose, and
+// the window would quit while a child was still transcribing. The page does
+// hold a `running` flag of its own, but that puts a Go invariant in the one
+// layer of this project with no test harness.
+//
+// The claim is the `starting` flag rather than the lock being held across
+// Start: exec's fork is short but it is still a syscall on a path that could be
+// a stalled network mount, and every other binding method — Boot, ProbeFilm,
+// FastMode — takes this same mutex. Freezing the whole window on a slow exec to
+// save one boolean is a bad trade. starting is cleared on both paths out of
+// Start below, so a child that fails to spawn does not wedge the button.
 func (a *App) StartRun(f RunForm) error {
 	a.mu.Lock()
-	cli, film, inFlight := a.cli, a.film, a.run != nil
-	a.mu.Unlock()
-
+	cli, film := a.cli, a.film
 	switch {
 	case cli == "":
+		a.mu.Unlock()
 		return errors.New("sub-translator has not been found yet")
 	case film == "":
+		a.mu.Unlock()
 		return errors.New("no film has been read yet")
-	case inFlight:
+	case a.run != nil || a.starting:
+		a.mu.Unlock()
 		return errors.New("a run is already going")
 	}
+	// Claimed before the lock is released, which is the whole point: from here
+	// on every other StartRun is refused, whether or not this one's child has
+	// started yet.
+	a.starting = true
+	a.stage, a.pct = "", 0
+	a.mu.Unlock()
 
 	track, atrack := trackIndices(f.Source, f.Track)
 	opts := RunOptions{
@@ -402,23 +457,32 @@ func (a *App) StartRun(f RunForm) error {
 		Fast:   f.Fast,
 	}
 
+	// context.Background, not a.ctx. A run must outlive the binding call that
+	// asked for it — it lasts minutes and reports itself through events — and
+	// it must end only by the deliberate signal-and-wait that Cancel and
+	// beforeClose perform, because that is the sequence that lets the CLI kill
+	// its own process group and close its partial file. Tying its lifetime to a
+	// context this window does not own would put that ending in someone else's
+	// hands.
+	//
+	// As it happens a.ctx would behave identically today: Wails v2.12.0 builds
+	// the window's context from context.Background() and only ever wraps it
+	// with context.WithValue (internal/app/app_production.go), deriving no
+	// cancellable context anywhere, so it never cancels it. That is a fact
+	// about one version of a library rather than a promise, which is the reason
+	// not to depend on it either way.
+	run, err := Start(context.Background(), cli, opts, a.onRunEvent)
+
 	a.mu.Lock()
-	a.stage, a.pct = "", 0
+	a.starting = false
+	if err == nil {
+		a.run = run
+	}
 	a.mu.Unlock()
 
-	// context.Background, not a.ctx: a.ctx is the window's, and cancelling a
-	// run has to be the deliberate act Cancel and beforeClose perform — one
-	// that signals and then waits for the CLI's own cleanup. Wails cancels its
-	// context as the app tears down, which would SIGINT the child and race the
-	// process exiting out from under it.
-	run, err := Start(context.Background(), cli, opts, a.onRunEvent)
 	if err != nil {
 		return err
 	}
-
-	a.mu.Lock()
-	a.run = run
-	a.mu.Unlock()
 
 	go a.awaitRun(run)
 	return nil
@@ -457,7 +521,7 @@ func (a *App) onRunEvent(ev Event) error {
 		// and a fresh one starts from nothing.
 		a.stage, a.pct = s.Name, 0
 		a.mu.Unlock()
-		wailsruntime.EventsEmit(a.ctx, "run:stage", StageView{
+		a.send("run:stage", StageView{
 			Name:  s.Name,
 			Words: StageWords(s.Name),
 			Chunk: s.Chunk,
@@ -473,25 +537,25 @@ func (a *App) onRunEvent(ev Event) error {
 		a.mu.Lock()
 		a.pct = p.Pct
 		a.mu.Unlock()
-		wailsruntime.EventsEmit(a.ctx, "run:progress", p)
+		a.send("run:progress", p)
 	case "language":
 		l, err := ev.AsLanguage()
 		if err != nil {
 			return nil
 		}
-		wailsruntime.EventsEmit(a.ctx, "run:language", l)
+		a.send("run:language", l)
 	case "saved":
 		s, err := ev.AsSaved()
 		if err != nil {
 			return nil
 		}
-		wailsruntime.EventsEmit(a.ctx, "run:saved", s)
+		a.send("run:saved", s)
 	case "warning":
 		w, err := ev.AsWarning()
 		if err != nil {
 			return nil
 		}
-		wailsruntime.EventsEmit(a.ctx, "run:warning", w)
+		a.send("run:warning", w)
 	}
 	return nil
 }
@@ -508,7 +572,7 @@ func (a *App) awaitRun(run *Run) {
 	}
 	a.mu.Unlock()
 
-	wailsruntime.EventsEmit(a.ctx, "run:ended", endedFor(outcome, err))
+	a.send("run:ended", endedFor(outcome, err))
 }
 
 // CancelRun sends SIGINT to the run and waits for the CLI's own cleanup to
@@ -660,7 +724,9 @@ func main() {
 		log.Fatal(err)
 	}
 
-	app := &App{}
+	// The emit seam (see App.emit) is wired here, before the window exists,
+	// so it is written once and read-only thereafter.
+	app := &App{emit: wailsruntime.EventsEmit}
 
 	err = wails.Run(&options.App{
 		Title: "sub-translator",

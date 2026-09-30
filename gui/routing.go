@@ -171,11 +171,14 @@ type RunEnded struct {
 // endedFor turns what (*Run).Wait returned into the ending the page renders.
 //
 // Every path through it produces either OK or a Route, so the Run screen
-// always has something to show. That includes the two endings that are not
-// error events at all: ErrCancelled, which is a cancel that landed before
-// the CLI could say anything, and a stream that broke the CLI's own
-// guarantees, whose Go-level message is the only account of what happened
-// and so is shown verbatim.
+// always has something to show — including the two endings that are not error
+// events at all (ErrCancelled, a cancel that landed before the CLI could say
+// anything, and a stream that broke the CLI's own guarantees, whose Go-level
+// message is the only account of what happened and so is shown verbatim) and
+// the two that buildOutcome's contract says cannot arrive: a nil outcome with
+// no error, and an outcome carrying neither terminal event. Both of those are
+// guarded rather than left to panic, because "every path" is either true of
+// this function or it is not a claim worth writing down.
 func endedFor(outcome *Outcome, err error) RunEnded {
 	switch {
 	case errors.Is(err, ErrCancelled):
@@ -213,6 +216,21 @@ func endedFor(outcome *Outcome, err error) RunEnded {
 		ended.OK = true
 		ended.Path = outcome.Done.Path
 		ended.Covers = outcome.Done.Covers
+		return ended
+	}
+
+	if outcome.Err == nil {
+		// Unreachable for the same reason the nil outcome above is: buildOutcome
+		// refuses a stream that carries neither terminal event. It is guarded
+		// for the same reason too — the doc above promises every ending reaches
+		// a screen, and without this the promise is false in one case, where
+		// outcome.Err.Kind would panic on the goroutine that reports the run's
+		// ending and take the report down with it.
+		ended.Route = &ErrorRoute{
+			Screen:  ScreenRun,
+			Message: "sub-translator ended with neither a result nor a reason.",
+			Retry:   true,
+		}
 		return ended
 	}
 
