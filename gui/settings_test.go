@@ -174,11 +174,20 @@ func TestReadSettingsUsesGetNotList(t *testing.T) {
 	}
 }
 
-// TestReadSettingsTreatsUnsetAsEmpty asserts the `(unset)` -> "" mapping,
-// and does so alongside one key the stub answers with a real value: a
-// ReadSettings that mapped every key to "" unconditionally (rather than
-// only the ones answered `(unset)`) would still pass a test that checked
-// only the unset keys, so this one would catch that too.
+// TestReadSettingsTreatsUnsetAsEmpty covers the defensive half of unset
+// handling, not the real contract: `config get` itself has never been
+// observed to print the literal string `(unset)` — that's `config list`'s
+// own substitution for its aligned columns (see ReadSettings' doc comment).
+// This test exists in case `get` and `list` ever converge; the contract
+// ReadSettings actually depends on today — an unset key answering with a
+// bare empty line — is pinned separately by
+// TestReadSettingsTrimsAnUnsetKeysEmptyLine below.
+//
+// It asserts the `(unset)` -> "" mapping alongside one key the stub answers
+// with a real value: a ReadSettings that mapped every key to ""
+// unconditionally (rather than only the ones answered `(unset)`) would
+// still pass a test that checked only the unset keys, so this one would
+// catch that too.
 func TestReadSettingsTreatsUnsetAsEmpty(t *testing.T) {
 	dir := t.TempDir()
 	responses := map[string]string{}
@@ -204,6 +213,45 @@ func TestReadSettingsTreatsUnsetAsEmpty(t *testing.T) {
 		}
 		if got[key] != "" {
 			t.Errorf(`ReadSettings()[%q] = %q, want "" (the stub answered "(unset)")`, key, got[key])
+		}
+	}
+}
+
+// TestReadSettingsTrimsAnUnsetKeysEmptyLine pins the real contract, as
+// confirmed against the actual built CLI with `od -c`: `config get` on an
+// unset key prints nothing but a trailing newline, never the literal string
+// `(unset)` — that substitution belongs to `config list` alone (see
+// TestReadSettingsTreatsUnsetAsEmpty above for the defensive branch this
+// test does not exercise). An empty line becomes "" once ReadSettings trims
+// the trailing newline, with no substitution needed; mixing in one key with
+// a real value keeps this from passing on an implementation that returns ""
+// for everything unconditionally.
+func TestReadSettingsTrimsAnUnsetKeysEmptyLine(t *testing.T) {
+	dir := t.TempDir()
+	responses := map[string]string{}
+	for _, key := range SettingKeys {
+		responses[key] = ""
+	}
+	responses["translate.model"] = "gpt-4o-mini"
+
+	cli, _ := writeArgvLoggingStub(t, dir, responses, 9, "unexpected config set call")
+
+	got, err := ReadSettings(context.Background(), cli)
+	if err != nil {
+		t.Fatalf("ReadSettings() error = %v, want nil", err)
+	}
+
+	if got["translate.model"] != "gpt-4o-mini" {
+		t.Errorf(`ReadSettings()["translate.model"] = %q, want "gpt-4o-mini" (a set value must not be touched)`,
+			got["translate.model"])
+	}
+	for _, key := range SettingKeys {
+		if key == "translate.model" {
+			continue
+		}
+		if got[key] != "" {
+			t.Errorf(`ReadSettings()[%q] = %q, want "" (the stub answered a bare empty line, `+
+				`the CLI's real form of unset)`, key, got[key])
 		}
 	}
 }

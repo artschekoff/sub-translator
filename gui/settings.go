@@ -37,9 +37,16 @@ var SettingKeys = []string{
 
 // ReadSettings reads every key in SettingKeys with its own `config get
 // <key>` call — never `config list` (see the package doc comment for why).
-// Each call's stdout, with its trailing newline trimmed, is the value;
-// exactly `(unset)` is mapped to the empty string, so callers never have to
-// special-case the CLI's own placeholder text.
+// Each call's stdout, with its trailing newline trimmed, is the value.
+//
+// An unset key's real contract, from `config get`, is an empty line — that
+// trims to "" on its own, no substitution needed. `(unset)` is what `config
+// list` prints instead, for its aligned human-readable columns; `config
+// get` has never been observed to print it. The `value == "(unset)"`
+// mapping below is defensive, not load-bearing: it costs nothing today and
+// only matters if `get`'s output ever converges with `list`'s, so a plain
+// alignment-column string can't end up mistaken for someone's literal
+// model name or file path.
 func ReadSettings(ctx context.Context, cli string) (map[string]string, error) {
 	settings := make(map[string]string, len(SettingKeys))
 	for _, key := range SettingKeys {
