@@ -16,18 +16,25 @@ import (
 	"strconv"
 )
 
-// ErrProbeCancelled is returned by Probe when the probe ended because it was
-// cancelled, not because the file was unreadable. Two distinct CLI endings
-// both mean this, per the README:
+// ErrProbeCancelled is returned by ProbeFile, and by Start/Wait, when the
+// run ended because it was cancelled rather than because the CLI failed.
+// Two distinct CLI endings both mean this, per the README, and both
+// subcommands can hit either one:
 //
 //   - an error event with kind "cancelled" (exit 130) — a cancel that
-//     reached the CLI's signal handler once it was armed;
+//     reached the CLI's signal handler once it was armed; Start's own
+//     buildOutcome checks for this one directly, since it also has to
+//     validate the exit code against it.
 //   - a signalled exit with an empty stream — a cancel landing in the few
 //     milliseconds at startup before the handler is armed, documented as
-//     "cancelled before the tool could answer" rather than a crash.
+//     "cancelled before the tool could answer" rather than a crash. This is
+//     the one narrow case ProbeFile and buildOutcome share verbatim (see
+//     signalled below): neither treats "nothing on the stream at all" as
+//     the CLI having broken its own protocol.
 //
-// The window must route both away from ProbeFailure: cancelling is not the
-// file being unreadable, and it is not a crash.
+// The window must route both away from ProbeFailure or a "broken stream"
+// error: cancelling is not the file being unreadable, not a crash, and not
+// a contract violation.
 var ErrProbeCancelled = errors.New("probe cancelled")
 
 // ProbeFailure is returned by Probe when the CLI ran and reported, through
@@ -257,9 +264,11 @@ func (r *Run) stream(stderr io.Reader, on func(Event) error) {
 		errEv  *Error
 		saved  []Saved
 		warn   *Warning
+		seen   int
 	)
 
 	decodeErr := Decode(stderr, func(ev Event) error {
+		seen++
 		switch ev.Type {
 		case "done":
 			d, err := ev.AsDone()
@@ -298,7 +307,7 @@ func (r *Run) stream(stderr io.Reader, on func(Event) error) {
 	// defect TestCancelDoesNotOrphanTheChild exists to catch.
 	waitErr := r.cmd.Wait()
 
-	r.outcome, r.err = buildOutcome(r.cmd.Path, decodeErr, waitErr, r.cmd.ProcessState, doneEv, errEv, saved, warn)
+	r.outcome, r.err = buildOutcome(r.cmd.Path, decodeErr, waitErr, r.cmd.ProcessState, seen, doneEv, errEv, saved, warn)
 	close(r.done)
 }
 
@@ -307,9 +316,20 @@ func (r *Run) stream(stderr io.Reader, on func(Event) error) {
 // it is. It refuses — returns a nil *Outcome and a descriptive error —
 // rather than picking a winner when the stream breaks either half of that
 // contract, per the task brief.
-func buildOutcome(cliPath string, decodeErr, waitErr error, state *os.ProcessState, doneEv *Done, errEv *Error, saved []Saved, warn *Warning) (*Outcome, error) {
+func buildOutcome(cliPath string, decodeErr, waitErr error, state *os.ProcessState, seen int, doneEv *Done, errEv *Error, saved []Saved, warn *Warning) (*Outcome, error) {
 	if decodeErr != nil {
 		return nil, fmt.Errorf("run: decoding %s's event stream: %w", cliPath, decodeErr)
+	}
+
+	// Mirrors ProbeFile's own check (see signalled below): a cancel landing
+	// in the few milliseconds before the CLI arms its signal handler kills
+	// it with nothing on the stream at all — not even version. That is the
+	// GUI's Cancel button clicked the instant a run starts, not the stream
+	// breaking its own protocol, so it must route to ErrProbeCancelled
+	// exactly as ProbeFile's identical case does, before the generic
+	// exit-code bookkeeping below ever sees the signalled exit's -1.
+	if doneEv == nil && errEv == nil && seen == 0 && signalled(waitErr) {
+		return nil, ErrProbeCancelled
 	}
 
 	var exitCode int

@@ -571,3 +571,29 @@ func TestCancelDoesNotOrphanTheChild(t *testing.T) {
 			"did not finish before Cancel returned: %v", err)
 	}
 }
+
+// TestStartReportsASignalledExitWithAnEmptyStreamAsCancelled mirrors
+// TestProbeReportsASignalledExitWithAnEmptyStream: a cancel landing in the
+// few milliseconds before the CLI arms its signal handler kills it with
+// nothing on the stream at all — no version, no error — which is exactly
+// what the GUI's own Cancel button produces if it's clicked the instant a
+// run starts. That must come back as ErrProbeCancelled, the same sentinel
+// ProbeFile already uses for its identical case, not as a "stream broke its
+// contract" error: the run wasn't broken, it was cancelled.
+func TestStartReportsASignalledExitWithAnEmptyStreamAsCancelled(t *testing.T) {
+	dir := t.TempDir()
+	cli := writeSelfSignallingStub(t, dir)
+
+	r, err := Start(context.Background(), cli, runOpts(), func(Event) error { return nil })
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	outcome, err := r.Wait()
+	if outcome != nil {
+		t.Errorf("Wait() outcome = %+v, want nil", outcome)
+	}
+	if !errors.Is(err, ErrProbeCancelled) {
+		t.Fatalf("Wait() error = %v, want errors.Is(err, ErrProbeCancelled)", err)
+	}
+}
