@@ -257,8 +257,20 @@ git commit -m "feat(gui): find the CLI without needing the CLI to find it"
 **Interfaces:**
 - Produces:
   - one struct per event type, with the JSON tags **copied from the CLI's `internal/events/events.go`** — `Stream{Index int, Lang, Title, Codec string}`, `Probe{Duration float64, Audio, Subtitles []Stream, Fast *FastRule, EmbedsSubtitles *bool}`, `FastRule{Sources, Modes []string, MinChunkMinutes int}`, `Stage{Name string, Chunk, Of int, From, To string}`, `Progress{Pct int}`, `Language{Detected string}`, `Saved{Path, Covers string, Watchable bool}`, `Warning{Kind string, Count, Total int, First []int}`, `Done{Path, Covers string}`, `Error{Kind, Message string}`
-  - `func Decode(r io.Reader, on func(Event)) error` — one callback per event, skipping prose
-  - `type Event struct { Type string; T string; Raw json.RawMessage }` plus typed accessors, or a tagged union — your choice, but say which and why
+  - `func Decode(r io.Reader, on func(Event) error) error` — one callback per event, skipping prose; a callback error stops the decode and is returned
+  - `type Event struct { Type string; T string; Raw json.RawMessage }`, with one typed accessor per event kind:
+    ```go
+    func (e Event) AsProbe() (*Probe, error)
+    func (e Event) AsStage() (*Stage, error)
+    func (e Event) AsProgress() (*Progress, error)
+    func (e Event) AsLanguage() (*Language, error)
+    func (e Event) AsSaved() (*Saved, error)
+    func (e Event) AsWarning() (*Warning, error)
+    func (e Event) AsDone() (*Done, error)
+    func (e Event) AsError() (*Error, error)
+    ```
+
+**This shape is fixed, not a choice.** Four later tasks consume `Event`, and a tagged union or a different callback signature would leave each of them guessing at an interface they cannot see. `Raw` plus accessors is chosen for one reason worth knowing: an event type this GUI has never heard of still arrives with its `Type` and `T` intact and can be logged or ignored, where a union would have to drop it or fail. The CLI's protocol carries a `version` event precisely so a consumer can outlive a change, and a decoder that cannot represent an unknown event throws that away.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -389,7 +401,7 @@ git commit -m "feat(gui): probe a file and surface what went wrong"
 **Interfaces:**
 - Produces:
   - `type RunOptions struct { Input, To, From, Mode, Out string; Track int; Source string; Fast bool }`
-  - `func Run(ctx context.Context, cli string, o RunOptions, on func(Event)) (*Outcome, error)`
+  - `func Run(ctx context.Context, cli string, o RunOptions, on func(Event) error) (*Outcome, error)`
   - `type Outcome struct { Done *Done; Err *Error; ExitCode int; Saved []Saved; Warning *Warning }`
   - `func (r *Run) Cancel() error` — sends SIGINT and waits
 
@@ -501,7 +513,8 @@ git commit -m "feat(gui): read and write settings through the CLI"
 
 **Files:**
 - Modify: `gui/main.go`
-- Create: `gui/frontend/index.html`, `gui/frontend/app.css`, `gui/frontend/app.js`
+- Create: `gui/rules.go`, `gui/rules_test.go`, `gui/frontend/index.html`, `gui/frontend/app.css`, `gui/frontend/app.js`
+- Modify: `docs/superpowers/specs/2026-09-26-desktop-gui-design.md` (the I-1 correction in Step 4)
 
 **Interfaces:**
 - Consumes: everything from Tasks 2–6, bound as Wails methods.
@@ -591,7 +604,7 @@ Three rules the window must read rather than reimplement:
 
 - [ ] **Step 5: Test what can be tested without a browser**
 
-Wails has no headless harness here, so test the **decisions**, not the DOM: extract fast-mode availability and output-mode availability into pure functions in `app.js`, and cover them with a plain `gui/frontend/rules_test.html`— no, better: put those two decisions in **Go** (`gui/rules.go`) with a table test, and have the frontend call them over the binding. A rule in JavaScript cannot be tested without a toolchain this plan forbids; the same rule in Go can.
+Wails has no headless harness here, so test the **decisions**, not the DOM. Put fast-mode availability and output-mode availability in **Go** (`gui/rules.go`), table-test them, and have the frontend call them over the Wails binding. A rule written in JavaScript cannot be tested without the toolchain this plan forbids; the same rule in Go can, and these two are the ones that get a control wrong in a way a user sees.
 
 ```go
 // FastAvailable answers the question the checkbox asks, from the rule the CLI
