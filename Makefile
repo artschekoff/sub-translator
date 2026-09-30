@@ -16,7 +16,13 @@ build-all:
 	GOOS=linux   GOARCH=arm64 go build $(LDFLAGS) -o $(BIN_DIR)/$(BINARY)-linux-arm64 .
 	GOOS=windows GOARCH=amd64 go build $(LDFLAGS) -o $(BIN_DIR)/$(BINARY)-windows-amd64.exe .
 
+# $(DIST_DIR) is emptied first, not merely created, so what it holds afterwards
+# is exactly what this run built. `release` uploads $(DIST_DIR)/* and the `dmg`
+# target writes an unversioned $(BINARY).dmg into the same directory, so without
+# this any DMG (or archive from an older tree) left lying there would be
+# published under a tag it was never built from.
 pack: build-all
+	rm -rf $(DIST_DIR)
 	mkdir -p $(DIST_DIR)
 	tar -czf $(DIST_DIR)/$(BINARY)-darwin-amd64.tar.gz  -C $(BIN_DIR) $(BINARY)-darwin-amd64
 	tar -czf $(DIST_DIR)/$(BINARY)-darwin-arm64.tar.gz  -C $(BIN_DIR) $(BINARY)-darwin-arm64
