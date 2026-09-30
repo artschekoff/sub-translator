@@ -32,7 +32,7 @@
 | `gui/locate.go` + test | finding the CLI: bundle, `PATH`, remembered path | 2 |
 | `gui/guistate.go` + test | the one thing the GUI owns: `~/Library/Application Support/sub-translator/gui.json` | 2 |
 | `gui/events.go` + test | the event types and the stream decoder | 3 |
-| `gui/runner.go` + test | `Probe`, `Run`, `Cancel`; spawning and terminal-event discipline | 4, 5 |
+| `gui/runner.go` + test | `ProbeFile`, `Run`, `Cancel`; spawning and terminal-event discipline | 4, 5 |
 | `gui/settings.go` + test | reading and writing through `sub-translator config` | 6 |
 | `gui/frontend/index.html` | the shell and the four screens' markup | 7, 8 |
 | `gui/frontend/app.css` | the scrim, the type scale, the accent, dark mode | 7 |
@@ -340,7 +340,7 @@ git commit -m "feat(gui): decode the CLI's event stream, prose and all"
 
 **Interfaces:**
 - Consumes: `LocateCLI`, `Decode` and the event types.
-- Produces: `func Probe(ctx context.Context, cli, path string) (*Probe, error)`
+- Produces: `func ProbeFile(ctx context.Context, cli, path string) (*Probe, error)` — **not** `Probe`, which is already the struct type Task 3 defines; Go forbids a function and a type sharing an identifier in one package
 
 - [ ] **Step 1: Write the failing tests**
 
