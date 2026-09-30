@@ -4,7 +4,7 @@ BIN_DIR  := bin
 DIST_DIR := $(BIN_DIR)/dist
 LDFLAGS   = -ldflags "-X main.version=$(VERSION)"
 
-.PHONY: build build-all pack test fmt vet tidy validate clean install release
+.PHONY: build build-all pack test fmt vet tidy validate clean install release gui
 
 build:
 	go build $(LDFLAGS) -o $(BIN_DIR)/$(BINARY) .
@@ -43,6 +43,9 @@ clean:
 
 install: build
 	sudo cp $(BIN_DIR)/$(BINARY) /usr/local/bin/$(BINARY)
+
+gui:
+	cd gui && wails build
 
 release:
 	@set -e; \
