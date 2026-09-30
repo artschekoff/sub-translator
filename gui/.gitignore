@@ -1,0 +1,10 @@
+# Wails build output (packaged app / installer)
+/build/
+
+# Generated JS/TS runtime bindings, including their own package.json — this
+# project ships no node toolchain; only gui/frontend/index.html is committed.
+/frontend/wailsjs/
+
+# `go build ./...` run without -o in this directory writes a binary named
+# after the directory itself (gui/main.go is the module's only package).
+/gui

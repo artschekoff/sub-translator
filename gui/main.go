@@ -16,6 +16,10 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
 )
 
+// go:embed silently drops any file in frontend/ whose name starts with "."
+// or "_" (Go's default embed behavior, not an `all:` prefix) — an asset with
+// such a name would build cleanly but simply be missing at runtime.
+//
 //go:embed frontend
 var embeddedAssets embed.FS
 
