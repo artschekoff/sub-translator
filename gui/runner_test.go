@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -223,5 +224,350 @@ func TestProbeReturnsPromptlyAgainstAChattyChild(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("Probe() did not return within 10s — an unread stdout pipe likely filled and blocked the child")
+	}
+}
+
+// --- Run / Start / Cancel -------------------------------------------------
+
+// writeSlowStub creates a stub CLI that emits version then stage
+// immediately, sleeps for sleep, then emits done and exits 0.
+// TestStartStreamsEventsAsTheyArriveNotAfterExit uses the gap between the
+// stage event's arrival and Wait's return to prove events reach on() while
+// the child is still running, not only after it exits.
+func writeSlowStub(t *testing.T, dir string, sleep time.Duration) string {
+	t.Helper()
+
+	script := "#!/bin/sh\n" +
+		"echo '" + strings.TrimRight(versionLine, "\n") + "' 1>&2\n" +
+		"echo '{\"type\":\"stage\",\"t\":\"2026-09-30T00:00:00Z\",\"name\":\"translate\"}' 1>&2\n" +
+		"sleep " + fmt.Sprintf("%.2f", sleep.Seconds()) + "\n" +
+		"echo '{\"type\":\"done\",\"t\":\"2026-09-30T00:00:01Z\",\"path\":\"/out/movie.es.srt\"}' 1>&2\n" +
+		"exit 0\n"
+	path := filepath.Join(dir, "sub-translator")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("writing slow stub CLI: %v", err)
+	}
+	return path
+}
+
+// writeTrapCLI creates a stub CLI that traps SIGINT, emits version
+// immediately, then blocks until interrupted, then sleeps briefly —
+// simulating the real CLI's own graceful shutdown between the signal
+// landing and its process-group kill actually finishing — touches a marker
+// file, emits error{cancelled} and exits 130. TestCancelSendsSIGINTAndWaitsFor130
+// and TestCancelDoesNotOrphanTheChild use the marker file to prove Cancel
+// waits for that whole sequence rather than returning the moment the
+// signal is sent.
+func writeTrapCLI(t *testing.T, dir string) (cli, marker string) {
+	t.Helper()
+
+	marker = filepath.Join(dir, "marker")
+	script := "#!/bin/sh\n" +
+		"trapped=\n" +
+		"trap 'trapped=1' INT\n" +
+		"echo '" + strings.TrimRight(versionLine, "\n") + "' 1>&2\n" +
+		"i=0\n" +
+		"while [ -z \"$trapped\" ] && [ $i -lt 1000 ]; do\n" +
+		"  sleep 0.01\n" +
+		"  i=$((i+1))\n" +
+		"done\n" +
+		"sleep 0.3\n" +
+		"touch '" + marker + "'\n" +
+		"echo '{\"type\":\"error\",\"t\":\"2026-09-30T00:00:01Z\",\"kind\":\"cancelled\",\"message\":\"cancelled\"}' 1>&2\n" +
+		"exit 130\n"
+	path := filepath.Join(dir, "sub-translator")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("writing trap stub CLI: %v", err)
+	}
+	return path, marker
+}
+
+// runOpts is a minimal, valid RunOptions for the stub CLIs in this file,
+// which ignore argv entirely — only the values matter for tests that
+// inspect what Start built, which none here do.
+func runOpts() RunOptions {
+	return RunOptions{Input: "movie.mkv", From: "en", To: "es", Track: -1}
+}
+
+// TestStartStreamsEventsAsTheyArriveNotAfterExit is the test the task
+// brief's trap exists to prevent silently passing under: a refactor to the
+// buffer-then-decode shape ProbeFile uses (correct for a short probe, wrong
+// for a run that streams stage and progress events for minutes) would still
+// pass every other test in this file, because none of them distinguish "the
+// stage event arrived while the child was still running" from "the stage
+// event arrived only once the child had already exited". This one does, by
+// timing the gap between the two.
+func TestStartStreamsEventsAsTheyArriveNotAfterExit(t *testing.T) {
+	dir := t.TempDir()
+	const sleep = 400 * time.Millisecond
+	cli := writeSlowStub(t, dir, sleep)
+
+	var stageAt time.Time
+	got := make(chan struct{})
+	r, err := Start(context.Background(), cli, runOpts(), func(ev Event) error {
+		if ev.Type == "stage" {
+			stageAt = time.Now()
+			close(got)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	select {
+	case <-got:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stage event never reached on()")
+	}
+
+	outcome, err := r.Wait()
+	waitReturnedAt := time.Now()
+	if err != nil {
+		t.Fatalf("Wait() error = %v, want nil", err)
+	}
+	if outcome.Done == nil {
+		t.Fatal("outcome.Done is nil, want the stub's done event")
+	}
+
+	gap := waitReturnedAt.Sub(stageAt)
+	if gap < sleep/2 {
+		t.Fatalf("stage event arrived only %v before Wait() returned (the stub sleeps %v between "+
+			"emitting stage and emitting done) — this is what buffering the whole stream until "+
+			"the process exits, instead of decoding it live, would look like", gap, sleep)
+	}
+}
+
+// TestRunRefusesTwoTerminalEvents: the CLI guarantees exactly one terminal
+// event and an exit code that agrees with it. The window's completion
+// screen is built on that guarantee, so a stream that violates it — here, a
+// done followed by an error{cancelled} — must come back as an error naming
+// both, not a silently-picked winner.
+func TestRunRefusesTwoTerminalEvents(t *testing.T) {
+	dir := t.TempDir()
+	stderr := versionLine +
+		`{"type":"done","t":"2026-09-30T00:00:01Z","path":"/out/movie.es.srt"}` + "\n" +
+		`{"type":"error","t":"2026-09-30T00:00:02Z","kind":"cancelled","message":"cancelled"}` + "\n"
+	cli := writeStubCLI(t, dir, "", stderr, 130)
+
+	r, err := Start(context.Background(), cli, runOpts(), func(Event) error { return nil })
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	outcome, err := r.Wait()
+	if outcome != nil {
+		t.Errorf("Wait() outcome = %+v, want nil on a broken stream", outcome)
+	}
+	if err == nil {
+		t.Fatal("Wait() error = nil, want an error naming both terminal events")
+	}
+	if !strings.Contains(err.Error(), "done") || !strings.Contains(err.Error(), "error") {
+		t.Errorf("Wait() error = %q, want it to name both the done and the error event", err.Error())
+	}
+}
+
+// TestRunPairsTheExitCodeWithTheEnding: the CLI guarantees the exit code
+// agrees with which terminal event it sent — 0 for done, 130 for a
+// cancelled error, otherwise 1 (or 2 for a usage error, not exercised
+// here). A stream that disagrees with its own exit code is as broken as one
+// with the wrong number of terminal events.
+func TestRunPairsTheExitCodeWithTheEnding(t *testing.T) {
+	cases := []struct {
+		name    string
+		stderr  string
+		code    int
+		wantErr bool
+	}{
+		{
+			name:    "done and 0 agree",
+			stderr:  versionLine + `{"type":"done","t":"x","path":"/out/movie.es.srt"}` + "\n",
+			code:    0,
+			wantErr: false,
+		},
+		{
+			name:    "error and 1 agree",
+			stderr:  versionLine + `{"type":"error","t":"x","kind":"other","message":"boom"}` + "\n",
+			code:    1,
+			wantErr: false,
+		},
+		{
+			name:    "cancelled error and 130 agree",
+			stderr:  versionLine + `{"type":"error","t":"x","kind":"cancelled","message":"cancelled"}` + "\n",
+			code:    130,
+			wantErr: false,
+		},
+		{
+			name:    "done and 1 disagree",
+			stderr:  versionLine + `{"type":"done","t":"x","path":"/out/movie.es.srt"}` + "\n",
+			code:    1,
+			wantErr: true,
+		},
+		{
+			name:    "error and 0 disagree",
+			stderr:  versionLine + `{"type":"error","t":"x","kind":"other","message":"boom"}` + "\n",
+			code:    0,
+			wantErr: true,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			cli := writeStubCLI(t, dir, "", c.stderr, c.code)
+
+			r, err := Start(context.Background(), cli, runOpts(), func(Event) error { return nil })
+			if err != nil {
+				t.Fatalf("Start() error = %v", err)
+			}
+			outcome, err := r.Wait()
+
+			if c.wantErr {
+				if err == nil {
+					t.Fatalf("Wait() error = nil, want an exit-code-disagreement error (outcome=%+v)", outcome)
+				}
+				if outcome != nil {
+					t.Errorf("Wait() outcome = %+v, want nil alongside the error", outcome)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Wait() error = %v, want nil", err)
+			}
+			if outcome == nil {
+				t.Fatal("Wait() outcome = nil, want a populated *Outcome")
+			}
+			if outcome.ExitCode != c.code {
+				t.Errorf("outcome.ExitCode = %d, want %d", outcome.ExitCode, c.code)
+			}
+		})
+	}
+}
+
+// TestRunCollectsEverySavedFile: -mode both emits one saved event per file
+// (a sidecar and a container), so the window can offer "Show in Finder" for
+// each. Run must collect all of them, in order, not just the last one.
+func TestRunCollectsEverySavedFile(t *testing.T) {
+	dir := t.TempDir()
+	stderr := versionLine +
+		`{"type":"saved","t":"x","path":"/out/movie.es.srt","watchable":false}` + "\n" +
+		`{"type":"saved","t":"x","path":"/out/movie.mkv","covers":"container","watchable":false}` + "\n" +
+		`{"type":"done","t":"x","path":"/out/movie.mkv","covers":"container"}` + "\n"
+	cli := writeStubCLI(t, dir, "", stderr, 0)
+
+	r, err := Start(context.Background(), cli, RunOptions{Input: "movie.mkv", From: "en", To: "es", Mode: "both", Track: -1}, func(Event) error { return nil })
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	outcome, err := r.Wait()
+	if err != nil {
+		t.Fatalf("Wait() error = %v, want nil", err)
+	}
+	if outcome == nil {
+		t.Fatal("Wait() outcome = nil")
+	}
+
+	if len(outcome.Saved) != 2 {
+		t.Fatalf("len(Saved) = %d, want 2: %+v", len(outcome.Saved), outcome.Saved)
+	}
+	if outcome.Saved[0].Path != "/out/movie.es.srt" {
+		t.Errorf("Saved[0].Path = %q, want the sidecar path", outcome.Saved[0].Path)
+	}
+	if outcome.Saved[1].Path != "/out/movie.mkv" {
+		t.Errorf("Saved[1].Path = %q, want the container path", outcome.Saved[1].Path)
+	}
+	if outcome.Saved[1].Covers != "container" {
+		t.Errorf("Saved[1].Covers = %q, want %q", outcome.Saved[1].Covers, "container")
+	}
+}
+
+// TestCancelSendsSIGINTAndWaitsFor130: against a stub that traps INT,
+// Cancel must deliver the signal (the stub only reacts to INT, not TERM or
+// KILL) and then block until the stub's own graceful shutdown — simulated
+// here by a sleep before it touches a marker file — has actually finished.
+func TestCancelSendsSIGINTAndWaitsFor130(t *testing.T) {
+	dir := t.TempDir()
+	cli, marker := writeTrapCLI(t, dir)
+
+	ready := make(chan struct{})
+	r, err := Start(context.Background(), cli, runOpts(), func(ev Event) error {
+		if ev.Type == "version" {
+			close(ready)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	select {
+	case <-ready:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stub never emitted version — trap may not be installed yet")
+	}
+
+	if err := r.Cancel(); err != nil {
+		t.Fatalf("Cancel() error = %v, want nil", err)
+	}
+
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("marker file missing right after Cancel() returned — Cancel returned before "+
+			"the stub's graceful shutdown (which writes it right before exiting) finished: %v", err)
+	}
+
+	outcome, err := r.Wait()
+	if err != nil {
+		t.Fatalf("Wait() error = %v, want nil", err)
+	}
+	if outcome.Err == nil || outcome.Err.Kind != "cancelled" {
+		t.Fatalf("outcome.Err = %+v, want kind=cancelled", outcome.Err)
+	}
+	if outcome.ExitCode != 130 {
+		t.Errorf("outcome.ExitCode = %d, want 130", outcome.ExitCode)
+	}
+}
+
+// TestCancelDoesNotOrphanTheChild: the CLI kills its own process group, so
+// Cancel must wait for the process rather than returning while it dies. A
+// GUI that quits as soon as Cancel returns must not leave an ffmpeg (or, in
+// this stub, the shell itself) running — Cancel returning is only correct
+// once cmd.Wait has actually reaped the child.
+func TestCancelDoesNotOrphanTheChild(t *testing.T) {
+	dir := t.TempDir()
+	cli, marker := writeTrapCLI(t, dir)
+
+	ready := make(chan struct{})
+	r, err := Start(context.Background(), cli, runOpts(), func(ev Event) error {
+		if ev.Type == "version" {
+			close(ready)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	select {
+	case <-ready:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stub never emitted version — trap may not be installed yet")
+	}
+
+	if err := r.Cancel(); err != nil {
+		t.Fatalf("Cancel() error = %v, want nil", err)
+	}
+
+	// r.cmd is unexported but this test lives in the same package: it can
+	// check directly that the child was actually reaped, which is the one
+	// fact a marker file alone cannot prove.
+	if r.cmd.ProcessState == nil {
+		t.Fatal("Cancel() returned before the child was reaped: cmd.ProcessState is nil")
+	}
+	if code := r.cmd.ProcessState.ExitCode(); code != 130 {
+		t.Errorf("reaped child's exit code = %d, want 130", code)
+	}
+
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("marker file missing after Cancel() returned: the stub's own graceful shutdown "+
+			"did not finish before Cancel returned: %v", err)
 	}
 }
