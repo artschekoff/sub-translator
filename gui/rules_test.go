@@ -179,6 +179,34 @@ func TestFastAvailableFollowsTheRuleItIsGiven(t *testing.T) {
 	}
 }
 
+// TestFastAvailableIgnoresTheChunkFloor states, as an assertion rather than
+// only as a comment, which part of probe.fast this window reads.
+//
+// min_chunk_minutes is a real clause of the CLI's own validateFastFlags, but
+// it constrains -chunk, and the File screen has no chunk control and sends no
+// -chunk — so the CLI's own default applies and the floor cannot be violated
+// from this window. The answer must therefore not move with the field, and a
+// reviewer reading FastAvailable and finding two checks where the event has
+// three fields should land here rather than on a guess.
+//
+// This is the test to break when a chunk-length control is added: at that
+// point the third check becomes reachable and has to exist.
+func TestFastAvailableIgnoresTheChunkFloor(t *testing.T) {
+	for _, floor := range []int{0, 1, 10, 9999} {
+		rule := &FastRule{
+			Sources:         []string{"audio"},
+			Modes:           []string{"srt"},
+			MinChunkMinutes: floor,
+		}
+		ok, reason := FastAvailable(&Probe{Fast: rule}, "audio", "srt")
+		if !ok {
+			t.Errorf("min_chunk_minutes=%d changed the answer to false (%q); "+
+				"this window sends no -chunk, so the floor must not reach the checkbox",
+				floor, reason)
+		}
+	}
+}
+
 // boolPtr is how the three states of probe.embeds_subtitles are built in these
 // tests: nil, &false and &true.
 func boolPtr(b bool) *bool { return &b }

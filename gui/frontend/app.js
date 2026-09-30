@@ -130,9 +130,20 @@ async function boot() {
 
   /* Registered only once the bindings are up, because window.runtime and the
      bindings arrive from the same injected runtime script and this page must
-     not assume it ran first. */
+     not assume it ran first.
+
+     This is the only reliable notice that a drag ended. DisableWebViewDrop
+     stops WebKit navigating to the dropped film, and it stops the DOM drop
+     event with it, so the highlight is cleared here — first, before anything
+     that might return early. Go emits on every drop, including one that
+     carried no file at all, for exactly this reason. */
   window.runtime.EventsOn("film:dropped", (dropped) => {
     document.body.classList.remove("dragging");
+    if (!dropped.path) {
+      noteDrop("That drop carried no file.", true);
+      show("drop");
+      return;
+    }
     loadFilm(dropped.path, dropped.ignored);
   });
 
@@ -149,6 +160,7 @@ async function loadFilm(path, ignored) {
   if (!path) return;
 
   const app = await ready();
+  document.body.classList.remove("dragging");
   noteDrop("", false);
   $("busy-message").textContent = "Reading " + baseName(path) + "…";
   show("busy");

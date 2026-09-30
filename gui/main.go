@@ -39,15 +39,31 @@ import (
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
-// Note: without an "all:" prefix, go:embed silently drops any file in
-// frontend/ whose name starts with "." or "_", and drops an entire
-// subdirectory whose only contents are such a file — the asset would build
-// cleanly but simply be missing at runtime. The three files this window ships
-// (index.html, app.css, app.js) are all plainly named, so the plain form is
-// kept: it also excludes the wailsjs/ directory `wails build` generates, which
-// nothing here loads.
+// The three files are named one by one rather than embedded as a directory,
+// and both halves of that matter.
 //
-//go:embed frontend
+// `//go:embed frontend` does not mean "the three files this window ships". It
+// means everything under frontend/ except path elements beginning with "." or
+// "_" — and `wails build` generates frontend/wailsjs/ there, gitignored, with
+// its own package.json inside it. That directory is neither dot- nor
+// underscore-prefixed, so the directory form embeds it: nothing here loads it,
+// but it ships inside the binary, putting a package.json in the artifact of a
+// project whose constraints forbid a node toolchain.
+// TestTheTrackedTreeHasNoNodeToolchain cannot see that, and is right not to —
+// it guards the tracked tree, which is a different surface — so
+// TestTheEmbeddedAssetsHaveNoNodeToolchain guards this one.
+//
+// Naming the files also makes the embedded set deterministic. With the
+// directory form, what ships depends on whether `wails build` has ever run on
+// the machine doing the building: three files on a clean clone, nine on a
+// machine that has built once. An artifact that varies with the builder's
+// history is not reproducible from the tracked tree.
+//
+// The "." / "_" rule still applies to what is named here, so a future asset
+// must keep a plain name or take an "all:" prefix of its own: without one it
+// would build cleanly and simply be missing at runtime.
+//
+//go:embed frontend/index.html frontend/app.css frontend/app.js
 var embeddedAssets embed.FS
 
 // App is the object the page talks to. Every exported method on it becomes
@@ -101,14 +117,34 @@ type Dropped struct {
 // onFileDrop forwards a drop to the page as an event rather than probing here,
 // so a dropped file and a file chosen through the dialog take exactly the same
 // path afterwards: the page calls ProbeFilm either way.
+//
+// It emits on every drop, including one that carried nothing this window can
+// use, and that is not defensiveness for its own sake. A drag of text, or of
+// an image from another application, still reaches the native view's
+// performDragOperation; because DisableWebViewDrop is set, that method returns
+// without letting a DOM drop event through, so this event is the page's only
+// notice that the drag ended. Staying silent here left the dropzone's
+// highlight on until the next drag.
+//
+// Empty paths are filtered rather than counted. The native side joins the file
+// URLs it found with newlines and the dispatcher splits on them, so a drag
+// with no file URLs at all arrives as a one-element slice holding "" — not as
+// an empty slice — and counting that would report one file dropped and then
+// show nothing.
 func (a *App) onFileDrop(paths []string) {
-	if len(paths) == 0 {
-		return
+	usable := make([]string, 0, len(paths))
+	for _, path := range paths {
+		if strings.TrimSpace(path) != "" {
+			usable = append(usable, path)
+		}
 	}
-	wailsruntime.EventsEmit(a.ctx, "film:dropped", Dropped{
-		Path:    paths[0],
-		Ignored: len(paths) - 1,
-	})
+
+	dropped := Dropped{}
+	if len(usable) > 0 {
+		dropped.Path = usable[0]
+		dropped.Ignored = len(usable) - 1
+	}
+	wailsruntime.EventsEmit(a.ctx, "film:dropped", dropped)
 }
 
 // BootInfo is what the window needs to know before it can show anything: where

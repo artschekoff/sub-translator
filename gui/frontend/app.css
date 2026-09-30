@@ -8,8 +8,20 @@
   painted with a translucent scrim so body text clears 7:1 over a white beach
   or a black poster alike.
 
-  Three type sizes, one accent on three things, hairlines at 8%, no shadows and
-  no gradients.
+  Three type sizes, hairlines at 8%, no shadows and no gradients.
+
+  The accent is painted on exactly the three things the spec names — the
+  selected radio, the primary button, and (Task 8) the progress fill — plus
+  one stated exception: the keyboard focus ring. A focus ring is an
+  accessibility affordance rather than decoration; removing its colour to keep
+  a count would make the window harder to use with a keyboard, which is not
+  what "nothing else is coloured" is protecting. The exception is written into
+  the spec's Visual design section too, so the two agree.
+
+  Check: the accent variable is used by three rules below — the radio, that
+  focus ring, and the primary button. The progress fill is Task 8's fourth and
+  last. Anything else that wants the accent is decoration, and the answer is
+  no.
 */
 
 :root {
@@ -86,7 +98,6 @@ body {
   font: var(--size-body) -apple-system, "Segoe UI Variable", "Segoe UI", sans-serif;
   color: var(--fg);
   -webkit-font-smoothing: antialiased;
-  accent-color: var(--accent);
   /* The window is a fixed size and nothing in it is a document: only the track
      list scrolls, and it scrolls inside the card. */
   overflow: hidden;
@@ -189,8 +200,11 @@ body {
   gap: 8px;
 }
 
+/* Feedback while a file is over the window, done with the line that is
+   already there rather than with colour: the accent is spoken for, and a
+   drop hint is decoration. */
 body.dragging .dropzone {
-  border-color: var(--accent);
+  border-style: solid;
 }
 
 /* The track list. It is the only thing in the window that scrolls, which is
@@ -221,6 +235,15 @@ body.dragging .dropzone {
   margin: 0;
 }
 
+/* The selected radio, which is the accent's first job. It is scoped to the
+   radio rather than set on body, where it would also tint the fast-mode
+   checkbox — a control the spec does not list. A native checkbox still draws
+   in the platform's own accent when it is checked; that is the platform
+   rendering its control, not this stylesheet colouring something extra. */
+.row input[type="radio"] {
+  accent-color: var(--accent);
+}
+
 .row .idx {
   opacity: 0.6;
   font-variant-numeric: tabular-nums;
@@ -229,6 +252,19 @@ body.dragging .dropzone {
 
 .row .lang {
   min-width: 3.2em;
+}
+
+/* The one row cell whose content has no bound: a track's title tag is
+   whatever the release group typed. Without min-width:0 a flex item refuses
+   to shrink below its content, and .rows has overflow-y:auto, which makes
+   overflow-x compute to auto — so a long title grew a horizontal scrollbar
+   inside the list instead of being clipped. */
+.row .ttl {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .row .what {
@@ -288,6 +324,8 @@ body.dragging .dropzone {
   width: 6.5em;
 }
 
+/* The stated exception to "one accent on three things": a focus ring is an
+   accessibility affordance, and an uncoloured one is a worse window. */
 .control:focus {
   outline: 2px solid var(--accent);
   outline-offset: -1px;
@@ -333,7 +371,7 @@ body.dragging .dropzone {
   opacity: 0.4;
 }
 
-/* The only filled button, and one of the accent's three jobs. */
+/* The only filled button, and the accent's third job. */
 .btn.primary {
   background: var(--accent);
   border-color: transparent;

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -109,16 +110,35 @@ func trackedFiles(dir string) ([]string, error) {
 }
 
 // trackedNodeFiles reports which of dir's tracked files (per trackedFiles)
-// are a node toolchain artifact: package.json, one of its common lockfiles,
-// or anything under a node_modules/ directory. It takes a directory rather
-// than assuming the current one so it can be pointed at a disposable fixture
-// repository in a test, not only at this module's own working tree.
+// are a node toolchain artifact (see isNodeToolchainPath). It takes a
+// directory rather than assuming the current one so it can be pointed at a
+// disposable fixture repository in a test, not only at this module's own
+// working tree.
 func trackedNodeFiles(dir string) ([]string, error) {
 	files, err := trackedFiles(dir)
 	if err != nil {
 		return nil, err
 	}
 
+	var violations []string
+	for _, path := range files {
+		if isNodeToolchainPath(path) {
+			violations = append(violations, path)
+		}
+	}
+	return violations, nil
+}
+
+// isNodeToolchainPath reports whether a slash-separated path is a node
+// toolchain artifact: package.json, one of its common lockfiles, or anything
+// under a node_modules/ directory.
+//
+// The predicate is shared by the two guards that need it, deliberately. The
+// "no node toolchain" constraint has two surfaces — what is committed
+// (TestTheTrackedTreeHasNoNodeToolchain) and what is shipped
+// (TestTheEmbeddedAssetsHaveNoNodeToolchain) — and a second copy of this list
+// would let one surface start accepting a lockfile the other still rejects.
+func isNodeToolchainPath(path string) bool {
 	nodeFiles := map[string]bool{
 		"package.json":      true,
 		"package-lock.json": true,
@@ -127,18 +147,73 @@ func trackedNodeFiles(dir string) ([]string, error) {
 		"bun.lockb":         true,
 	}
 
-	var violations []string
-	for _, path := range files {
-		base := filepath.Base(path)
-		switch {
-		case nodeFiles[base]:
-			violations = append(violations, path)
-		case path == "node_modules" || strings.HasPrefix(path, "node_modules/") ||
-			strings.Contains(path, "/node_modules/"):
-			violations = append(violations, path)
+	if nodeFiles[filepath.Base(path)] {
+		return true
+	}
+	return path == "node_modules" || strings.HasPrefix(path, "node_modules/") ||
+		strings.Contains(path, "/node_modules/")
+}
+
+// TestTheEmbeddedAssetsHaveNoNodeToolchain guards the shipped artifact, which
+// is a different surface from the tracked tree and was unguarded until now.
+//
+// TestTheTrackedTreeHasNoNodeToolchain reads `git ls-files`, by design: a
+// generated file sitting untracked next to the source is expected and fine.
+// But //go:embed does not consult git. A directory-form `//go:embed frontend`
+// takes everything under frontend/ whose path elements do not begin with "."
+// or "_", and `wails build` generates frontend/wailsjs/ there — gitignored,
+// with its own package.json. So the tracked-tree guard passed truthfully
+// while the built binary carried a package.json inside it, in a project whose
+// constraints forbid a node toolchain. Nothing looked at the artifact.
+//
+// This walks embeddedAssets itself, so it sees exactly what ships. It is
+// insensitive to how the directive is spelled: it fails for the directory
+// form on any machine where `wails build` has run, and it keeps failing if a
+// later asset drags a lockfile in with it.
+func TestTheEmbeddedAssetsHaveNoNodeToolchain(t *testing.T) {
+	var embedded []string
+
+	err := fs.WalkDir(embeddedAssets, ".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		embedded = append(embedded, path)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A walk that found nothing would pass silently, and an empty embed is its
+	// own defect: the window would start and serve a blank page.
+	if len(embedded) == 0 {
+		t.Fatal("the embedded asset set is empty")
+	}
+
+	for _, path := range embedded {
+		if isNodeToolchainPath(path) {
+			t.Errorf("the shipped binary embeds a node toolchain artifact: %s\n"+
+				"embedded set: %v\n"+
+				"a directory-form //go:embed takes frontend/wailsjs/ with it; "+
+				"name the asset files instead", path, embedded)
 		}
 	}
-	return violations, nil
+
+	// The three files the window actually loads must be in there, or the embed
+	// directive has been narrowed past the point of working.
+	for _, want := range []string{
+		"frontend/index.html",
+		"frontend/app.css",
+		"frontend/app.js",
+	} {
+		if !slices.Contains(embedded, want) {
+			t.Errorf("%s is not embedded; the window would serve a 404 for it\nembedded set: %v",
+				want, embedded)
+		}
+	}
 }
 
 // TestTheTrackedTreeHasNoNodeToolchain guards the plan-wide "no node

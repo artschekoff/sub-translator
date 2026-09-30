@@ -39,6 +39,16 @@ type FastState struct {
 // combination either, because no rule was stated. The reason says which of
 // those two it is.
 //
+// It reads two of the rule's three fields, and the third is skipped on
+// purpose rather than overlooked. `fast.min_chunk_minutes` is a real clause of
+// the CLI's own check — validateFastFlags in progressive.go rejects a
+// -chunk below it — but it is a condition on a flag this window never sends.
+// There is no chunk-length control on the File screen, so the CLI applies its
+// own default and the floor cannot be violated from here; consulting the field
+// would mean inventing a chunk value to test it against. If a chunk control is
+// ever added, this is the function that has to grow a third check, and
+// TestFastAvailableIgnoresTheChunkFloor is the test that has to stop passing.
+//
 // The returned reason is empty exactly when the first return is true.
 func FastAvailable(p *Probe, source, mode string) (bool, string) {
 	if p == nil {

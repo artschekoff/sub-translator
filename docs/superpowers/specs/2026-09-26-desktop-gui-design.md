@@ -214,6 +214,8 @@ Minimal, flat, and translucent — the window borrows the desktop behind it rath
 
 **One accent colour**, taken from the OS where it is available (`AccentColor` / `-apple-system-blue`) so it matches whatever the user chose in their system settings. It appears on exactly three things: the selected radio, the progress fill, and the primary button. Nothing else is coloured except errors, which are the system red, and the "you can start watching" line, which is the system green.
 
+One exception, added during implementation: the **keyboard focus ring** is the accent too. It is an accessibility affordance rather than decoration, and an uncoloured focus ring makes the window harder to use with a keyboard — which is not what the rule above is protecting. Everything else stayed out: the drag-over highlight on the Drop screen is drawn by changing the existing hairline from dashed to solid rather than by tinting it, and `accent-color` is scoped to the radio rather than set on `body`, where it would also tint the fast-mode checkbox. A native checkbox still draws in the platform's own accent when it is checked; that is the platform rendering its own control, not the window colouring a fourth thing.
+
 **Dark and light follow the OS**, through `prefers-color-scheme` and `mac.Appearance` — no in-app theme switch. Everything is expressed as CSS custom properties on `:root` and redefined once under the dark media query, so the two themes cannot drift apart.
 
 ```
