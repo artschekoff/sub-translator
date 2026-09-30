@@ -6,19 +6,23 @@
   Every question with an answer that could be wrong in a way a user sees is
   asked of Go over the Wails binding: whether fast mode applies
   (App.FastMode -> FastAvailable), which output modes to offer (App.ProbeFilm
-  -> OutputModes), and whether the chosen track needs a source language
-  (App.SourceLang -> SourceLanguage). All three are table-tested in
-  gui/rules_test.go. This project ships no node toolchain, so a rule written
-  here would have no harness at all — which is the whole reason they are not
-  written here.
+  -> OutputModes), whether the chosen track needs a source language
+  (App.SourceLang -> SourceLanguage), which flag the chosen track index goes on
+  (App.StartRun -> trackIndices), and where an error leads (run:ended's route
+  -> RoutesToSettings). All of them are table-tested in gui/rules_test.go,
+  gui/runner_test.go and gui/routing_test.go. This project ships no node
+  toolchain, so a rule written here would have no harness at all — which is the
+  whole reason they are not written here.
 
   What this file does decide is presentation: how a duration reads, what an
-  untagged track is called, which screen is visible.
+  untagged track is called, what a setting's label says, which screen is
+  visible.
 */
 
 const $ = (id) => document.getElementById(id);
 
-const SCREENS = ["setup", "drop", "busy", "file", "run", "settings"];
+/* Five screens, one card, one size. Nothing here ever calls WindowSetSize. */
+const SCREENS = ["drop", "busy", "file", "run", "settings"];
 
 function show(name) {
   for (const screen of SCREENS) {
@@ -42,6 +46,21 @@ const form = {
 
 let film = null;
 let fromNeeded = false;
+
+/* Where "Done" on the Settings screen goes back to. Settings is reachable from
+   three places — the Drop screen, the File screen and an error that routed here
+   — and returning to the Drop screen from all of them would throw away a film
+   the user had already chosen a track for. */
+let settingsReturn = "drop";
+
+/* Every file the run has reported through `saved`, keyed by path so the -fast
+   path's repeated saves for the same growing file update one row instead of
+   adding fourteen. */
+let savedFiles = new Map();
+
+/* Whether a run is in flight, which is what the Cancel button and the Run
+   screen's footer are about. */
+let running = false;
 
 /* Which track the source-language field was last prefilled for, as
    "source:index". Prefilling is a per-track act: it must happen when the
@@ -123,8 +142,15 @@ async function boot() {
   try {
     app = await ready();
   } catch (err) {
-    $("setup-message").textContent = String(err);
-    show("setup");
+    /* Nothing can be asked of Go, so the only screen that can say anything is
+       the static one, and Settings is where a setup problem belongs. Its
+       controls all need the bindings, so none of them is offered: an enabled
+       Done that leads to a Drop screen which cannot probe anything would be a
+       worse answer than one dead end with the reason on it. */
+    noteSettings(String(err));
+    $("cli-path").textContent = "Unknown";
+    $("settings-done").disabled = true;
+    show("settings");
     return;
   }
 
@@ -147,10 +173,16 @@ async function boot() {
     loadFilm(dropped.path, dropped.ignored);
   });
 
+  wireRunEvents();
+
   const info = await app.Boot();
   if (!info.found) {
-    $("setup-message").textContent = info.error;
-    show("setup");
+    /* The spec: failing to find the CLI "opens on its settings screen saying
+       it cannot find the tool, with a file picker — the same treatment as a
+       missing key, and for the same reason: it is a setup step, not a run
+       failure". So the same screen, not one of its own. */
+    settingsReturn = "drop";
+    await openSettings(info.error);
     return;
   }
   show("drop");
@@ -385,17 +417,457 @@ function validate() {
   $("start").disabled = !ok;
 }
 
+/* --------------------------------------------------------------- Run screen */
+
+/* Registered once the bindings are up, because window.runtime arrives from the
+   same injected script. Every one of these is a fact the CLI stated; none of
+   them is a decision. */
+function wireRunEvents() {
+  window.runtime.EventsOn("run:stage", (stage) => {
+    /* The words come from Go (StageWords) so this line and the
+       closing-while-running question cannot end up with two vocabularies for
+       the same phase. The chunk detail is -fast's alone: the ordinary run's
+       stage events carry no chunk/of at all. */
+    let line = stage.words;
+    if (stage.of > 0) {
+      line += ` — chunk ${stage.chunk} of ${stage.of}`;
+      if (stage.from && stage.to) line += ` (${stage.from}–${stage.to})`;
+    }
+    $("run-stage").textContent = line;
+    /* A new stage starts a new progress burst: the CLI's percentages are
+       per-stage, so carrying the previous one over would show a bar that
+       jumps backwards. */
+    setProgress(0);
+  });
+
+  window.runtime.EventsOn("run:progress", (progress) => setProgress(progress.pct));
+
+  window.runtime.EventsOn("run:language", (language) => {
+    const note = $("run-note");
+    note.textContent = language.detected
+      ? `whisper heard ${language.detected}.`
+      : "";
+    note.hidden = !note.textContent;
+  });
+
+  window.runtime.EventsOn("run:saved", (saved) => {
+    savedFiles.set(saved.path, saved);
+    renderSaved();
+
+    /* watchable:true is the -fast path's one distinguishing claim — this file
+       is incomplete and already worth opening — and the ordinary path always
+       sends false, so this line appears on one path only. Showing it on the
+       ordinary path would promise a moment that run never earned. */
+    if (saved.watchable) {
+      const note = $("run-watchable");
+      note.textContent = saved.covers
+        ? `You can start watching now — ${baseName(saved.path)} covers ${saved.covers}.`
+        : `You can start watching now — ${baseName(saved.path)} is already usable.`;
+      note.hidden = false;
+    }
+  });
+
+  window.runtime.EventsOn("run:warning", (warning) => showWarning(warning));
+
+  window.runtime.EventsOn("run:ended", (ended) => endRun(ended));
+}
+
+function setProgress(pct) {
+  const clamped = Math.max(0, Math.min(100, Number(pct) || 0));
+  $("run-fill").style.width = clamped + "%";
+  $("run-bar").setAttribute("aria-valuenow", String(clamped));
+  $("run-pct").textContent = clamped + "%";
+}
+
+/* One row per file the run wrote, each with its own "Show in Finder". -mode
+   both writes a sidecar and a container, `done` names only the container, and
+   the sidecar landed minutes before the mux finished — so the paths come from
+   `saved`, not from `done`. */
+function renderSaved() {
+  const box = $("run-files");
+  box.replaceChildren();
+  for (const saved of savedFiles.values()) {
+    box.append(savedRow(saved));
+  }
+}
+
+function savedRow(saved) {
+  const row = document.createElement("div");
+  row.className = "filerow";
+
+  const name = document.createElement("span");
+  name.className = "name";
+  name.textContent = saved.path;
+  name.title = saved.path;
+
+  const covers = document.createElement("span");
+  covers.className = "covers";
+  covers.textContent = saved.covers || "";
+
+  const reveal = document.createElement("button");
+  reveal.className = "btn";
+  reveal.textContent = "Show in Finder";
+  reveal.addEventListener("click", async () => {
+    const app = await ready();
+    try {
+      await app.RevealFile(saved.path);
+    } catch (err) {
+      showRunError(String(err));
+    }
+  });
+
+  row.append(name, covers, reveal);
+  return row;
+}
+
+/* A file twelve blocks short of translated must not look identical to one that
+   is not. */
+function showWarning(warning) {
+  const line = $("run-warning");
+  if (!warning || !warning.count) {
+    line.hidden = true;
+    return;
+  }
+  const of = warning.total > 0 ? ` of ${warning.total}` : "";
+  line.textContent =
+    warning.count === 1
+      ? `1 subtitle block${of} could not be translated and kept its original text.`
+      : `${warning.count} subtitle blocks${of} could not be translated and kept their original text.`;
+  line.hidden = false;
+}
+
+function showRunError(message) {
+  const line = $("run-error");
+  line.textContent = message || "";
+  line.hidden = !message;
+}
+
+async function startRun() {
+  /* Go refuses a second run too (StartRun), but a disabled-looking button that
+     silently rejects is worse than one that does nothing. */
+  if (running) return;
+
+  const app = await ready();
+
+  savedFiles = new Map();
+  running = true;
+
+  $("run-title").textContent = film ? film.name : "";
+  $("run-stage").textContent = "Starting sub-translator…";
+  $("run-note").hidden = true;
+  $("run-watchable").hidden = true;
+  $("run-warning").hidden = true;
+  $("run-files").replaceChildren();
+  showRunError("");
+  setProgress(0);
+
+  $("run-cancel").hidden = false;
+  $("run-cancel").disabled = false;
+  $("run-back").hidden = true;
+  $("run-retry").hidden = true;
+
+  show("run");
+
+  try {
+    /* The form's state, in the CLI's own vocabulary. Which of -track and
+       -atrack the chosen index goes on is Go's decision (trackIndices), not
+       this file's: the two flags are different streams, and sending an audio
+       index as -track is a run that transcribes the wrong dub with no error to
+       show for it. */
+    await app.StartRun({
+      source: form.source,
+      track: form.track,
+      from: form.from,
+      to: form.to,
+      mode: form.mode,
+      out: form.out,
+      fast: form.fast,
+    });
+  } catch (err) {
+    /* The child never started, so no event stream will arrive and run:ended
+       will never fire. This is the only notice there will be. */
+    running = false;
+    endRun({
+      ok: false,
+      route: { screen: "run", message: String(err), retry: true },
+    });
+  }
+}
+
+async function cancelRun() {
+  const app = await ready();
+  const button = $("run-cancel");
+  button.disabled = true;
+  $("run-stage").textContent = "Cancelling — waiting for sub-translator to clean up…";
+
+  try {
+    await app.CancelRun();
+  } catch (err) {
+    /* Go's Cancel returns nil for every cancel that worked, including the one
+       that landed before the CLI could answer and one pressed on a run that had
+       already finished, so a rejection here really is something gone wrong. */
+    showRunError(String(err));
+  }
+  /* Nothing is concluded here: the ending still arrives on run:ended, which is
+     what reports the partial file and what it covers. */
+}
+
+async function endRun(ended) {
+  running = false;
+
+  $("run-cancel").hidden = true;
+  $("run-back").hidden = false;
+  $("run-back").textContent = film ? "Back to the file" : "Choose another file";
+
+  /* The authoritative list, in case a `saved` event was emitted before this
+     page had a listener for it. */
+  if (ended.saved && ended.saved.length > 0) {
+    savedFiles = new Map(ended.saved.map((saved) => [saved.path, saved]));
+    renderSaved();
+  }
+  showWarning(ended.warning);
+
+  if (ended.ok) {
+    setProgress(100);
+    $("run-stage").textContent = "Done.";
+    $("run-watchable").hidden = true;
+    showRunError("");
+    $("run-retry").hidden = true;
+    return;
+  }
+
+  /* Go always sends a route with an ending that is not ok (endedFor), so this
+     fallback should be unreachable. It exists because the one thing this screen
+     must never do after twenty minutes of work is go blank. */
+  const route = ended.route || {
+    screen: "run",
+    message: "sub-translator ended without saying how.",
+    retry: true,
+  };
+
+  $("run-stage").textContent = ended.cancelled ? "Cancelled." : "Stopped.";
+  $("run-watchable").hidden = true;
+
+  if (route.screen === "settings") {
+    /* Not a failure to report but a setup step to complete. The field at fault
+       is focused and the message sits above it; Retry is deliberately not
+       offered, because a key with a typo in it can never succeed on one. */
+    settingsReturn = "file";
+    await openSettings(route.message, route.field);
+    return;
+  }
+
+  showRunError(route.message);
+  $("run-retry").hidden = !route.retry;
+}
+
+/* ---------------------------------------------------------- Settings screen */
+
+/* The labels are presentation, so they live here. The keys and their order are
+   Go's (SettingKeys), and the rows are built from what Go sends, so a key added
+   there appears here without this file changing — labelled with its own key
+   until someone writes it a better one, which is visibly unpolished rather than
+   silently missing. */
+const SETTING_LABELS = {
+  "translate.api-key": "OpenAI API key",
+  "translate.model": "Translation model",
+  "translate.workers": "Batches translated at once",
+  "whisper.bin": "whisper-cli binary",
+  "whisper.model": "whisper ggml model",
+  "whisper.vad-model": "Silero VAD model",
+  "whisper.chunk-minutes": "Chunk length for fast mode, in minutes",
+  "models.dir": "Where models are kept",
+};
+
+function noteSettings(message) {
+  const note = $("settings-message");
+  note.textContent = message || "";
+  note.hidden = !message;
+}
+
+/* openSettings reads every value through the CLI each time the screen opens.
+   The window keeps no copy: a value changed in the terminal has to show up
+   here, and the other way round, which is the whole reason these go through
+   `config get` and `config set` rather than through a file this window also
+   parses. */
+async function openSettings(message, field) {
+  const app = await ready();
+
+  show("settings");
+  /* The message goes above the field it is about when there is one — that is
+     what makes a screen change explicable — and at the top of the screen only
+     when it belongs to the screen rather than to a setting. */
+  noteSettings(field ? "" : message);
+
+  let view;
+  try {
+    view = await app.LoadSettings();
+  } catch (err) {
+    noteSettings(String(err));
+    return;
+  }
+
+  $("cli-path").textContent = view.cli || "Not found";
+  renderSettings(view);
+
+  const notices = new Set();
+  if (message && !field) notices.add(message);
+  if (view.error) notices.add(view.error);
+  noteSettings([...notices].join(" "));
+
+  if (field) focusSetting(field, message);
+}
+
+function renderSettings(view) {
+  const box = $("settings-fields");
+  box.replaceChildren();
+
+  if (!view.found) {
+    /* Every one of the eight is read by running the CLI, so with no CLI there
+       is nothing honest to put in the fields. Saying so beats eight empty
+       boxes that silently refuse to save. */
+    const note = document.createElement("p");
+    note.className = "hint";
+    note.textContent =
+      "sub-translator's own settings are read and written by running it, so " +
+      "they cannot be shown until the binary above is found.";
+    box.append(note);
+    $("settings-done").disabled = true;
+    return;
+  }
+
+  $("settings-done").disabled = false;
+  for (const key of view.keys || []) {
+    box.append(settingRow(key, (view.values && view.values[key]) || ""));
+  }
+}
+
+function settingRow(key, value) {
+  const row = document.createElement("div");
+  row.className = "setting";
+  row.dataset.key = key;
+
+  const label = document.createElement("label");
+  label.className = "label";
+  label.textContent = SETTING_LABELS[key] || key;
+  label.setAttribute("for", "set-" + key);
+
+  const line = document.createElement("div");
+  line.className = "line";
+
+  const input = document.createElement("input");
+  input.className = "control";
+  input.id = "set-" + key;
+  input.dataset.key = key;
+  input.autocomplete = "off";
+  input.spellcheck = false;
+  input.value = value;
+
+  const answer = document.createElement("p");
+  answer.className = "hint answer";
+  answer.hidden = true;
+
+  /* Written on change — which fires on blur and on Enter — rather than on
+     every keystroke: each write is one `config set` subprocess, and an API key
+     typed character by character would be fifty of them. */
+  input.addEventListener("change", async () => {
+    const app = await ready();
+    row.classList.remove("at-fault");
+    try {
+      await app.SaveSetting(key, input.value.trim());
+      answer.classList.remove("error");
+      answer.textContent = "Saved.";
+    } catch (err) {
+      /* The CLI's own rejection, verbatim. `config set translate.workers -1`
+         answers `translate.workers must be a positive integer, got "-1"`, and
+         this window has no better wording for a rule it deliberately holds no
+         copy of. Four of these keys and the API key validate nothing at all, so
+         they simply save. */
+      answer.classList.add("error");
+      answer.textContent = String(err);
+    }
+    answer.hidden = false;
+  });
+
+  line.append(input);
+
+  /* The API key is masked with a Show toggle beside the field rather than an
+     eye glyph inside it: "no web fonts, no icon fonts" rules out the glyph. */
+  if (key === "translate.api-key") {
+    input.type = "password";
+    const reveal = document.createElement("button");
+    reveal.className = "btn reveal";
+    reveal.textContent = "Show";
+    reveal.addEventListener("click", () => {
+      const masked = input.type === "password";
+      input.type = masked ? "text" : "password";
+      reveal.textContent = masked ? "Hide" : "Show";
+    });
+    line.append(reveal);
+  }
+
+  row.append(label, line, answer);
+  return row;
+}
+
+/* The other half of "errors lead somewhere": the screen changed, so the reason
+   has to be visible at the control that caused it, and the control has to be
+   the one the keyboard is already in. */
+function focusSetting(key, message) {
+  const row = $("settings-fields").querySelector('.setting[data-key="' + key + '"]');
+  if (!row) return;
+
+  row.classList.add("at-fault");
+
+  const answer = row.querySelector(".answer");
+  if (answer && message) {
+    answer.textContent = message;
+    answer.classList.add("error");
+    answer.hidden = false;
+  }
+
+  const input = row.querySelector("input");
+  if (input) {
+    input.focus();
+    input.scrollIntoView({ block: "nearest" });
+  }
+}
+
 /* ------------------------------------------------------------------- wiring */
 
 function wire() {
-  $("setup-choose").addEventListener("click", async () => {
+  $("drop-settings").addEventListener("click", async () => {
+    settingsReturn = "drop";
+    await openSettings("");
+  });
+
+  $("cli-choose").addEventListener("click", async () => {
     const app = await ready();
-    const info = await app.ChooseCLI();
-    if (info.found) {
-      show("drop");
+    let info;
+    try {
+      info = await app.ChooseCLI();
+    } catch (err) {
+      noteSettings(String(err));
       return;
     }
-    $("setup-message").textContent = info.error;
+    /* Reopened rather than patched in place: finding the CLI is what makes the
+       eight settings below readable at all. */
+    await openSettings(info.found ? "" : info.error);
+  });
+
+  $("settings-done").addEventListener("click", () => {
+    show(settingsReturn === "file" && film ? "file" : "drop");
+  });
+
+  $("run-cancel").addEventListener("click", () => cancelRun());
+  $("run-retry").addEventListener("click", () => startRun());
+  $("run-back").addEventListener("click", () => {
+    if (film) {
+      show("file");
+      return;
+    }
+    noteDrop("", false);
+    show("drop");
   });
 
   $("drop-choose").addEventListener("click", async () => {
@@ -444,11 +916,8 @@ function wire() {
   });
 
   $("start").addEventListener("click", () => {
-    /* The Run screen is the next task's. Until it exists this says so rather
-       than doing nothing, and it must not pretend a run began. */
-    const error = $("file-error");
-    error.textContent = "Starting a run is not wired up yet.";
-    error.hidden = false;
+    $("file-error").hidden = true;
+    startRun();
   });
 
   /* The drop itself is delivered by Go, from runtime.OnFileDrop: on macOS the

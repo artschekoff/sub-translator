@@ -11,17 +11,21 @@
   Three type sizes, hairlines at 8%, no shadows and no gradients.
 
   The accent is painted on exactly the three things the spec names — the
-  selected radio, the primary button, and (Task 8) the progress fill — plus
-  one stated exception: the keyboard focus ring. A focus ring is an
-  accessibility affordance rather than decoration; removing its colour to keep
-  a count would make the window harder to use with a keyboard, which is not
-  what "nothing else is coloured" is protecting. The exception is written into
-  the spec's Visual design section too, so the two agree.
+  selected radio, the primary button, and the progress fill — plus one stated
+  exception: the keyboard focus ring. A focus ring is an accessibility
+  affordance rather than decoration; removing its colour to keep a count would
+  make the window harder to use with a keyboard, which is not what "nothing
+  else is coloured" is protecting. The exception is written into the spec's
+  Visual design section too, so the two agree.
 
-  Check: the accent variable is used by three rules below — the radio, that
-  focus ring, and the primary button. The progress fill is Task 8's fourth and
-  last. Anything else that wants the accent is decoration, and the answer is
+  Check: the accent variable is used by four rules below — the radio, the
+  focus ring, the primary button and the progress fill, which is the last of
+  them. Anything else that wants the accent is decoration, and the answer is
   no.
+
+  Two other colours appear, and both are the spec's: errors are the system red
+  (.error) and the "you can start watching" line is the system green
+  (.watchable). Nothing else is coloured.
 */
 
 :root {
@@ -178,6 +182,13 @@ body {
   color: var(--danger);
 }
 
+/* The spec's one green: the moment a partial file is worth opening. It is
+   never shown on the ordinary path, which sends watchable:false. */
+.watchable {
+  color: var(--ok);
+  font-weight: 600;
+}
+
 /* Ticking numbers must not jitter. */
 .tnum {
   font-variant-numeric: tabular-nums;
@@ -295,8 +306,10 @@ body.dragging .dropzone {
   min-width: 0;
 }
 
-.field.grow {
-  flex: 1;
+.field.grow,
+.grow {
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
 .field p {
@@ -376,4 +389,94 @@ body.dragging .dropzone {
   background: var(--accent);
   border-color: transparent;
   color: #fff;
+}
+
+/* ------------------------------------------------------------- Run screen */
+
+/* The progress bar. The accent's fourth and last job; the track behind it is
+   the same 8% hairline every other line in the window is, drawn as a fill
+   rather than a border because it is 4px tall. */
+.bar-track {
+  flex: none;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--hairline);
+  overflow: hidden;
+}
+
+.bar-fill {
+  height: 100%;
+  width: 0;
+  background: var(--accent);
+  /* Long enough to read as movement, short enough that a burst of updates
+     does not lag behind the number beside it. */
+  transition: width 200ms linear;
+}
+
+/* One output file, with its own "Show in Finder". A run in -mode both has two
+   of these and the sidecar arrives minutes before the container. */
+.filerow {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 0;
+  border-top: 1px solid var(--hairline);
+}
+
+.filerow:first-child {
+  border-top: 0;
+}
+
+.filerow .name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.filerow .covers {
+  opacity: 0.6;
+  font-size: var(--size-hint);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* -------------------------------------------------------- Settings screen */
+
+/* The line the spec asks for above the CLI path: the window's own one setting
+   on one side of it, the tool's shared configuration on the other. */
+.divider {
+  flex: none;
+  height: 1px;
+  background: var(--hairline);
+  margin: 12px 0;
+}
+
+/* Settings rows stack; each is a label, a control, and the CLI's own answer
+   underneath when it had one. */
+.setting {
+  padding: 7px 0;
+}
+
+.setting .line {
+  align-items: center;
+}
+
+/* The API key is masked, and the Show toggle sits beside it rather than
+   inside: an eye glyph inside a text field would need an icon font, which the
+   spec's "no web fonts, no icon fonts" rules out. */
+.setting .reveal {
+  flex: none;
+}
+
+.setting .answer {
+  margin-top: 4px;
+}
+
+/* A setting the error routing sent the window here for. The ring is the focus
+   ring the browser draws anyway once app.js focuses the control; this is the
+   message above it, which is what makes the jump explicable. */
+.setting.at-fault .answer {
+  color: var(--danger);
 }

@@ -1,9 +1,18 @@
 <!doctype html>
 <!--
-  One window, one card, four contents. The card never changes size and the
-  window never changes size with it: Task 7 fills the setup, drop and file
-  screens, Task 8 fills run and settings, and all of them are children of the
-  same #card element so the surface stays put between them.
+  One window, one card, five contents. The card never changes size and the
+  window never changes size with it: Drop, Busy, File, Run and Settings are all
+  children of the same #card element so the surface stays put between them.
+
+  There is no separate setup screen. Task 7 added one for the case where the
+  CLI cannot be found, but the spec says that case "opens on its settings
+  screen ... with a file picker — the same treatment as a missing key, and for
+  the same reason: it is a setup step, not a run failure", and a missing key
+  lands on Settings. Two screens for one idea meant the window and its spec
+  disagreed, and it also meant the place that says "I cannot find the tool" was
+  not the place that lets you set where the tool is for good. So the CLI path
+  lives on the Settings screen above its divider, labelled as the one setting
+  this window keeps for itself, and a launch that found no CLI opens there.
 
   Everything textual lives inside the card, which carries the scrim. The blur
   shows in the gutter around it and in the strip under the title bar — that is
@@ -20,19 +29,6 @@
   <body>
     <main id="shell">
       <section class="card" id="card">
-        <!-- Setup: LocateCLI found nothing. A setup step, not a run failure. -->
-        <div class="screen centred" id="screen-setup" hidden>
-          <h1 class="title">No sub-translator</h1>
-          <p class="body" id="setup-message"></p>
-          <p>
-            <button class="btn primary" id="setup-choose">Choose the binary…</button>
-          </p>
-          <p class="hint">
-            The desktop app looks beside itself first, then on your PATH, then
-            wherever you last pointed it.
-          </p>
-        </div>
-
         <!-- Drop: the empty window inviting a film. -->
         <div class="screen centred" id="screen-drop" hidden>
           <div class="dropzone" id="dropzone">
@@ -41,6 +37,7 @@
             <p><button class="btn" id="drop-choose">Choose…</button></p>
           </div>
           <p class="hint" id="drop-note" hidden></p>
+          <p><button class="btn" id="drop-settings">Settings</button></p>
         </div>
 
         <!-- Busy: the probe takes a moment on a feature film. -->
@@ -123,10 +120,83 @@
           </footer>
         </div>
 
-        <!-- Run and Settings are Task 8's. They are declared here, empty, so
-             the shell they fill is the one that already exists. -->
-        <div class="screen centred" id="screen-run" hidden></div>
-        <div class="screen centred" id="screen-settings" hidden></div>
+        <!--
+          Run: the stage in words, a bar, and — on the -fast path only — the
+          growing coverage and the line saying the file is worth opening now.
+          On completion every file the run reported through `saved` gets its own
+          "Show in Finder": -mode both writes a sidecar and a container, `done`
+          names only the container, and the sidecar landed minutes earlier.
+        -->
+        <div class="screen" id="screen-run" hidden>
+          <header class="filehead">
+            <h1 class="title" id="run-title"></h1>
+            <p class="body" id="run-stage"></p>
+            <p class="hint" id="run-note" hidden></p>
+          </header>
+
+          <div class="bar-track" id="run-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100">
+            <div class="bar-fill" id="run-fill"></div>
+          </div>
+          <p class="hint tnum" id="run-pct"></p>
+
+          <!-- The system green, and the spec's one use for it: the moment the
+               partial file is worth opening. Only `saved` with watchable:true
+               shows it, which is the -fast path alone. -->
+          <p class="body watchable" id="run-watchable" hidden></p>
+
+          <div class="rows" id="run-files"></div>
+
+          <p class="body" id="run-warning" hidden></p>
+          <p class="body error" id="run-error" hidden></p>
+
+          <footer class="bar">
+            <button class="btn" id="run-cancel">Cancel</button>
+            <button class="btn" id="run-back" hidden>Choose another file</button>
+            <span class="spacer"></span>
+            <button class="btn primary" id="run-retry" hidden>Retry</button>
+          </footer>
+        </div>
+
+        <!--
+          Settings: the CLI path above a divider, labelled as the one setting
+          this window keeps for itself, then the eight config keys. Every one of
+          those is read and written by running the CLI, so a value changed in
+          the terminal shows up here and the other way round, and this window
+          holds no second copy of the validation rules.
+
+          The rows themselves are built in app.js from the key list Go sends,
+          so the order is SettingKeys' order and cannot drift from it.
+        -->
+        <div class="screen" id="screen-settings" hidden>
+          <header class="filehead">
+            <h1 class="title">Settings</h1>
+            <p class="body error" id="settings-message" hidden></p>
+          </header>
+
+          <div class="rows" id="settings-rows">
+            <div class="field">
+              <p class="label">sub-translator binary</p>
+              <div class="line">
+                <p class="body clip grow" id="cli-path"></p>
+                <button class="btn" id="cli-choose">Choose…</button>
+              </div>
+              <p class="hint">
+                The one setting this window keeps for itself, because it has to
+                find the tool before it can ask the tool anything. Everything
+                below is the tool's own configuration, shared with the terminal.
+              </p>
+            </div>
+
+            <div class="divider"></div>
+
+            <div id="settings-fields"></div>
+          </div>
+
+          <footer class="bar">
+            <span class="spacer"></span>
+            <button class="btn primary" id="settings-done">Done</button>
+          </footer>
+        </div>
       </section>
     </main>
 
