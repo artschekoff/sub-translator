@@ -18,6 +18,25 @@ type guiState struct {
 // deliberately a file the GUI reads and writes directly with encoding/json,
 // not one it goes through the CLI to reach, because the CLI's location is
 // exactly the thing being looked up.
+//
+// Platform policy: this path is macOS's, on every platform, with no GOOS
+// branch — and that is a decision rather than an oversight. The spec names
+// ~/Library/Application Support/sub-translator/gui.json outright, `make gui`
+// and `make dmg` are macOS-only targets, and the DMG is the only way the CLI
+// ships beside the GUI executable, so macOS is the only platform this window
+// is delivered on today. Task 7's window options name Windows fields too
+// (Wails puts the translucency flags on a per-platform struct and there is no
+// top-level place to set them), which makes the question live but does not
+// make the app shipped there.
+//
+// What it means concretely on Windows: os.UserHomeDir returns %USERPROFILE%
+// and filepath.Join builds C:\Users\name\Library\Application
+// Support\sub-translator\gui.json. That is a valid, writable, round-trippable
+// path — RememberCLI's MkdirAll creates it and RememberedCLI reads it back —
+// so nothing breaks; it simply ignores the platform's convention, which is
+// %AppData%. On Linux it likewise ignores $XDG_CONFIG_HOME. Whoever ships
+// this window on a second platform should branch here first; until then a
+// GOOS branch would be untested code for a platform with no build target.
 func statePath() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {

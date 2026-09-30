@@ -1,10 +1,166 @@
 <!doctype html>
-<html>
+<!--
+  One window, one card, four contents. The card never changes size and the
+  window never changes size with it: Task 7 fills the setup, drop and file
+  screens, Task 8 fills run and settings, and all of them are children of the
+  same #card element so the surface stays put between them.
+
+  Everything textual lives inside the card, which carries the scrim. The blur
+  shows in the gutter around it and in the strip under the title bar — that is
+  where glass reads as glass — and never behind a paragraph, which is what the
+  7:1 contrast constraint needs.
+-->
+<html lang="en">
   <head>
     <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>sub-translator</title>
+    <link rel="stylesheet" href="app.css" />
   </head>
   <body>
-    <p>sub-translator</p>
+    <main id="shell">
+      <section class="card" id="card">
+        <!-- Setup: LocateCLI found nothing. A setup step, not a run failure. -->
+        <div class="screen centred" id="screen-setup" hidden>
+          <h1 class="title">No sub-translator</h1>
+          <p class="body" id="setup-message"></p>
+          <p>
+            <button class="btn primary" id="setup-choose">Choose the binary…</button>
+          </p>
+          <p class="hint">
+            The desktop app looks beside itself first, then on your PATH, then
+            wherever you last pointed it.
+          </p>
+        </div>
+
+        <!-- Drop: the empty window inviting a film. -->
+        <div class="screen centred" id="screen-drop" hidden>
+          <div class="dropzone" id="dropzone">
+            <h1 class="title">Drop a film here</h1>
+            <p class="body">MKV, MP4, MOV, AVI and anything else ffprobe reads.</p>
+            <p><button class="btn" id="drop-choose">Choose…</button></p>
+          </div>
+          <p class="hint" id="drop-note" hidden></p>
+        </div>
+
+        <!-- Busy: the probe takes a moment on a feature film. -->
+        <div class="screen centred" id="screen-busy" hidden>
+          <p class="body" id="busy-message">Reading the file…</p>
+        </div>
+
+        <!-- File: the whole choice, in the order the run needs it. -->
+        <div class="screen" id="screen-file" hidden>
+          <header class="filehead">
+            <h1 class="title" id="film-name"></h1>
+            <p class="hint tnum" id="film-meta"></p>
+          </header>
+
+          <div class="rows" id="tracks">
+            <p class="label">Track</p>
+            <div id="audio-tracks"></div>
+            <p class="hint" id="subs-none" hidden>No subtitle tracks in this file.</p>
+            <div id="subtitle-tracks"></div>
+          </div>
+
+          <div class="form">
+            <div class="line">
+              <div class="field" id="from-field" hidden>
+                <label class="label" for="from">Subtitles are in</label>
+                <input
+                  class="control narrow"
+                  id="from"
+                  list="langs"
+                  autocomplete="off"
+                  spellcheck="false"
+                  placeholder="e.g. en"
+                />
+              </div>
+
+              <div class="field">
+                <label class="label" for="to">Translate into</label>
+                <input
+                  class="control narrow"
+                  id="to"
+                  list="langs"
+                  autocomplete="off"
+                  spellcheck="false"
+                  placeholder="e.g. es"
+                />
+              </div>
+
+            </div>
+
+            <div class="field">
+              <label class="label" for="mode">Output</label>
+              <select class="control" id="mode"></select>
+            </div>
+            <p class="hint" id="modes-note" hidden></p>
+
+            <div class="line">
+              <div class="field grow">
+                <p class="label">Save to</p>
+                <p class="body clip" id="out-path">Beside the film, named by sub-translator</p>
+              </div>
+              <button class="btn" id="out-choose">Change…</button>
+              <button class="btn" id="out-reset" hidden>Reset</button>
+            </div>
+
+            <div>
+              <label class="check">
+                <input type="checkbox" id="fast" />
+                <span id="fast-label">Fast mode — start watching within a minute</span>
+              </label>
+              <p class="hint" id="fast-reason" hidden></p>
+            </div>
+          </div>
+
+          <p class="body error" id="file-error" hidden></p>
+
+          <footer class="bar">
+            <button class="btn" id="file-back">Choose another file</button>
+            <span class="spacer"></span>
+            <button class="btn primary" id="start" disabled>Start</button>
+          </footer>
+        </div>
+
+        <!-- Run and Settings are Task 8's. They are declared here, empty, so
+             the shell they fill is the one that already exists. -->
+        <div class="screen centred" id="screen-run" hidden></div>
+        <div class="screen centred" id="screen-settings" hidden></div>
+      </section>
+    </main>
+
+    <!--
+      The language codes sub-translator's own prompt suggests, as suggestions
+      only: the field stays free text because the CLI accepts any code and a
+      fixed menu would lock out a language it would have translated.
+    -->
+    <datalist id="langs">
+      <option value="en">English</option>
+      <option value="ru">Russian</option>
+      <option value="es">Spanish</option>
+      <option value="fr">French</option>
+      <option value="de">German</option>
+      <option value="it">Italian</option>
+      <option value="pt">Portuguese</option>
+      <option value="nl">Dutch</option>
+      <option value="pl">Polish</option>
+      <option value="uk">Ukrainian</option>
+      <option value="cs">Czech</option>
+      <option value="sv">Swedish</option>
+      <option value="da">Danish</option>
+      <option value="fi">Finnish</option>
+      <option value="no">Norwegian</option>
+      <option value="tr">Turkish</option>
+      <option value="el">Greek</option>
+      <option value="he">Hebrew</option>
+      <option value="ar">Arabic</option>
+      <option value="hi">Hindi</option>
+      <option value="zh">Chinese</option>
+      <option value="ja">Japanese</option>
+      <option value="ko">Korean</option>
+    </datalist>
+
+    <script src="app.js"></script>
   </body>
 </html>

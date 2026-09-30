@@ -1,0 +1,341 @@
+/*
+  The scrim, which is what makes glass legible.
+
+  Nothing here draws a background for the window: html and body are
+  transparent, the operating system's compositor supplies the blur (see the Mac
+  and Windows blocks in main.go, and the BackgroundColour that has to be zero
+  alpha for either to show). The only painted surface is .card, and it is
+  painted with a translucent scrim so body text clears 7:1 over a white beach
+  or a black poster alike.
+
+  Three type sizes, one accent on three things, hairlines at 8%, no shadows and
+  no gradients.
+*/
+
+:root {
+  --scrim: rgba(255, 255, 255, 0.72);
+  --fg: #1c1c1e;
+  --hairline: rgba(28, 28, 30, 0.08);
+  /* A hex default, because a custom property set to a colour keyword the
+     engine does not know is not rejected at parse time — it becomes invalid at
+     computed-value time and falls back to nothing, not to an earlier
+     declaration. So the keywords go in @supports blocks below, which are
+     skipped where they would not work. */
+  --accent: #0a84ff;
+  --danger: #d70015;
+  --ok: #248a3d;
+  --radius-card: 10px;
+  --radius-control: 6px;
+  --size-body: 13px;
+  --size-hint: 11px;
+  --size-title: 20px;
+  /* The gutter is where the blur shows. */
+  --gutter: 16px;
+  /* macOS draws its title bar over the page (FullSizeContent), so the card
+     starts below it and the blur shows through there too. */
+  --titlebar: 30px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --scrim: rgba(28, 28, 30, 0.72);
+    --fg: #f2f2f7;
+    --hairline: rgba(242, 242, 247, 0.08);
+    --danger: #ff453a;
+    --ok: #30d158;
+  }
+}
+
+/* The system's own semantic colours, which follow light and dark themselves —
+   hence after the media query rather than inside it. */
+@supports (color: -apple-system-red) {
+  :root {
+    --danger: -apple-system-red;
+    --ok: -apple-system-green;
+  }
+}
+
+/* The user's chosen accent, which -apple-system-blue is not: that one is
+   always blue. Last, so it wins wherever both are understood. */
+@supports (color: AccentColor) {
+  :root {
+    --accent: AccentColor;
+  }
+}
+@supports not (color: AccentColor) {
+  @supports (color: -apple-system-blue) {
+    :root {
+      --accent: -apple-system-blue;
+    }
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  /* The blur comes from the OS. */
+  background: transparent;
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  font: var(--size-body) -apple-system, "Segoe UI Variable", "Segoe UI", sans-serif;
+  color: var(--fg);
+  -webkit-font-smoothing: antialiased;
+  accent-color: var(--accent);
+  /* The window is a fixed size and nothing in it is a document: only the track
+     list scrolls, and it scrolls inside the card. */
+  overflow: hidden;
+  cursor: default;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+#shell {
+  height: 100%;
+  padding: calc(var(--titlebar) + var(--gutter)) var(--gutter) var(--gutter);
+  display: flex;
+}
+
+.card {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--scrim);
+  border-radius: var(--radius-card);
+  overflow: hidden;
+}
+
+/* One card, four contents. hidden has to win over the flex display below. */
+[hidden] {
+  display: none !important;
+}
+
+.screen {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px;
+  overflow: hidden;
+}
+
+.screen.centred {
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  gap: 6px;
+}
+
+/* Type carries the hierarchy: three sizes, nothing else. */
+.title {
+  font-size: var(--size-title);
+  font-weight: 600;
+  line-height: 1.2;
+  margin: 0;
+  /* A film's name is long and often has no spaces in it. */
+  overflow-wrap: anywhere;
+}
+
+.body {
+  font-size: var(--size-body);
+  margin: 0;
+  line-height: 1.35;
+}
+
+.hint {
+  font-size: var(--size-hint);
+  opacity: 0.6;
+  margin: 0;
+  line-height: 1.35;
+}
+
+.label {
+  font-size: var(--size-hint);
+  opacity: 0.6;
+  margin: 0 0 4px;
+  text-transform: none;
+}
+
+.error {
+  color: var(--danger);
+}
+
+/* Ticking numbers must not jitter. */
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+.filehead {
+  flex: none;
+}
+
+/* The one place a line earns its keep on the Drop screen: without it there is
+   nothing to say the window takes a file at all. */
+.dropzone {
+  width: 100%;
+  padding: 28px 16px;
+  border: 1px dashed var(--hairline);
+  border-radius: var(--radius-card);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+
+body.dragging .dropzone {
+  border-color: var(--accent);
+}
+
+/* The track list. It is the only thing in the window that scrolls, which is
+   how a file with nine tracks fits a window that never resizes. */
+.rows {
+  flex: 1 1 auto;
+  min-height: 64px;
+  overflow-y: auto;
+  /* Room for the scrollbar, so the right-hand column of a long list is not
+     drawn underneath it. */
+  padding-right: 8px;
+  padding-bottom: 2px;
+}
+
+.row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 0;
+  border-top: 1px solid var(--hairline);
+}
+
+.row:first-of-type {
+  border-top: 0;
+}
+
+.row input {
+  margin: 0;
+}
+
+.row .idx {
+  opacity: 0.6;
+  font-variant-numeric: tabular-nums;
+  min-width: 2.2em;
+}
+
+.row .lang {
+  min-width: 3.2em;
+}
+
+.row .what {
+  opacity: 0.6;
+  font-size: var(--size-hint);
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+.form {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--hairline);
+}
+
+/* Controls sit on one line where they fit, which is what leaves the track list
+   the height it needs in a window that never grows. */
+.line {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+}
+
+.field {
+  min-width: 0;
+}
+
+.field.grow {
+  flex: 1;
+}
+
+.field p {
+  margin: 0;
+}
+
+.clip {
+  /* A chosen output path is long and the window is not. */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.control {
+  font: inherit;
+  color: inherit;
+  background: transparent;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-control);
+  padding: 4px 7px;
+  width: 100%;
+}
+
+.control.narrow {
+  width: 6.5em;
+}
+
+.control:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.check {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+}
+
+.check input {
+  margin: 0;
+}
+
+.check input:disabled + span {
+  opacity: 0.4;
+}
+
+.bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-top: 10px;
+  border-top: 1px solid var(--hairline);
+}
+
+.spacer {
+  flex: 1;
+}
+
+.btn {
+  font: inherit;
+  color: inherit;
+  background: transparent;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-control);
+  padding: 4px 11px;
+}
+
+.btn:disabled {
+  opacity: 0.4;
+}
+
+/* The only filled button, and one of the accent's three jobs. */
+.btn.primary {
+  background: var(--accent);
+  border-color: transparent;
+  color: #fff;
+}
