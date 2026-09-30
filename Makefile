@@ -47,12 +47,25 @@ install: build
 gui:
 	cd gui && wails build
 
-# Unsigned on purpose: no Developer ID, no notarisation. A first run needs
-# right-click → Open, or `xattr -d com.apple.quarantine`, which the README says.
+# Unsigned by an authority, not unsigned: `wails build` ad-hoc self-signs the
+# bundle, and the copy below adds a file inside Contents/MacOS/ *after* that
+# signature is sealed — which invalidates the seal. Those are two different
+# Gatekeeper outcomes, not degrees of the same one. An ad-hoc signature with an
+# intact seal is the unidentified-developer case: `spctl` exits 3, and
+# right-click → Open overrides it, which is what the README documents. A broken
+# seal reports "a sealed resource is missing or invalid" and exits 1, right-click
+# → Open offers no override for it at all, and only `xattr -d` clears it.
+#
+# So the bundle is re-signed after everything that goes in it is in it. That
+# returns `codesign -v` to valid and `spctl -a -t exec` to the pristine exit 3 —
+# the first-run experience the README is written for. It is still ad-hoc: no
+# Developer ID, no notarisation, and a first run still needs right-click → Open
+# or `xattr -d com.apple.quarantine`.
 dmg: build gui
 	rm -rf $(BIN_DIR)/dmg && mkdir -p $(BIN_DIR)/dmg $(DIST_DIR)
 	cp -R gui/build/bin/$(BINARY).app $(BIN_DIR)/dmg/
 	cp $(BIN_DIR)/$(BINARY) $(BIN_DIR)/dmg/$(BINARY).app/Contents/MacOS/
+	codesign --force --deep --sign - $(BIN_DIR)/dmg/$(BINARY).app
 	hdiutil create -volname $(BINARY) -srcfolder $(BIN_DIR)/dmg \
 		-ov -format UDZO $(DIST_DIR)/$(BINARY).dmg
 

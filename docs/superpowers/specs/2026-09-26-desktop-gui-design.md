@@ -12,7 +12,7 @@ A desktop window for people who do not want a terminal. Drag a film onto it, see
 - Replacing the CLI. It stays the primary interface and keeps working unchanged.
 - Batch processing, a queue, or a library view. One film at a time.
 - Editing subtitles after they are produced.
-- Code signing and notarization. The DMG ships unsigned; the README explains the Gatekeeper prompt.
+- Code signing and notarization. The app carries only the ad-hoc signature `wails build` gives it, with no Developer ID behind it; the README explains the Gatekeeper prompt. See Packaging for why the ad-hoc signature still has to be reapplied after the bundle is assembled.
 - A settings UI for anything the CLI cannot already configure.
 
 ## Context
@@ -256,11 +256,13 @@ Closing the window while work is running asks first — "transcription is at 34%
 
 ## Packaging
 
-`make gui` builds `gui/build/bin/sub-translator.app` with `wails build`. `make dmg` builds the CLI and the `.app`, copies the CLI binary inside `Contents/MacOS/` (beside the window's own `sub-translator-gui` executable, so `LocateCLI`'s first branch finds it before it ever checks `$PATH`), and packs the bundle with `hdiutil` into `bin/dist/sub-translator.dmg`. The disk image holds only the `.app` — no version in the filename and no symlink to `/Applications`; dragging the app out of the mounted volume is enough, since it carries its own CLI.
+`make gui` builds `gui/build/bin/sub-translator.app` with `wails build`. `make dmg` builds the CLI and the `.app`, copies the CLI binary inside `Contents/MacOS/` (beside the window's own `sub-translator-gui` executable, so `LocateCLI`'s first branch finds it before it ever checks `$PATH`), re-signs the bundle ad-hoc, and packs it with `hdiutil` into `bin/dist/sub-translator.dmg`. The disk image holds only the `.app` — no version in the filename and no symlink to `/Applications`; dragging the app out of the mounted volume is enough, since it carries its own CLI.
+
+**The re-sign is not optional, and the reason is the copy.** `wails build` ad-hoc self-signs the `.app`, which seals its resources; adding a file inside `Contents/MacOS/` after that breaks the seal. A broken seal is a different Gatekeeper outcome from an unsigned app, not a milder one: `codesign -v` and `spctl -a -t exec` both report "a sealed resource is missing or invalid" and exit 1, macOS calls the app damaged, and right-click → Open offers no override — only removing the quarantine attribute clears it. So `make dmg` runs `codesign --force --deep --sign -` over the bundle after the copy, which returns `codesign -v` to *valid on disk / satisfies its Designated Requirement* and `spctl` to a plain `rejected` with exit 3 — the unidentified-developer case below. Any future change that puts a file into the bundle belongs before that step.
 
 Both are macOS-only targets and neither is part of `make validate` or `make build-all`, which must keep working on a machine with no Wails and no cgo.
 
-The DMG is unsigned. macOS will say the developer cannot be verified; the README explains the right-click-Open path (and the `xattr -d com.apple.quarantine` alternative) and that signing needs an Apple Developer account. Adding signing later is a change to one target, not to the design.
+The DMG carries no Developer ID and is not notarised. macOS will say the developer cannot be verified; the README explains the right-click-Open path (and the `xattr -d com.apple.quarantine` alternative) and that real signing needs an Apple Developer account. Adding that signing later is a change to one target, not to the design — it replaces the ad-hoc identity above with a real one.
 
 ## Testing
 

@@ -514,7 +514,9 @@ internal/models/      ggml model catalog, search directories, discovery, downloa
 
 `make gui` builds `gui/build/bin/sub-translator.app` — a small window over the same CLI, with a drop target for the film and a Settings screen for the config file. `make dmg` builds the CLI too and copies it inside the `.app` bundle (`Contents/MacOS/sub-translator`, beside the window's own binary), so the mounted disk image is self-contained: no separate CLI install is needed, and it takes priority over any `sub-translator` already on `$PATH`. The result lands at `bin/dist/sub-translator.dmg`.
 
-The DMG is unsigned — there is no Apple Developer ID behind it, and it is not notarised. macOS Gatekeeper will refuse to open it with a plain double-click the first time. Either:
+The DMG is not signed by an authority — there is no Apple Developer ID behind it, and it is not notarised. `wails build` ad-hoc self-signs the bundle and `make dmg` re-signs it the same way after copying the CLI in, because adding a file inside `Contents/MacOS/` breaks the seal of the signature already there; a bundle with a broken seal reports "damaged" and has no right-click → Open override, which is why the re-sign is part of the target rather than an optional polish.
+
+With that, macOS Gatekeeper gives the ordinary unidentified-developer refusal: it will not open the app with a plain double-click the first time. Either:
 
 ```bash
 xattr -d com.apple.quarantine /Applications/sub-translator.app   # after copying it there
