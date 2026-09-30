@@ -3,10 +3,12 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -218,6 +220,161 @@ func TestDecodeStopsOnACallbackError(t *testing.T) {
 	}
 }
 
+// TestDecodeOverEveryProtocolVersion is spec:270 built: the version event's
+// `events` number must be refused when it is newer than this window
+// understands, rather than read as if it were the number this window was built
+// for.
+//
+// The CLI's own comment on internal/events.ProtocolVersion states the contract
+// this satisfies: "a consumer that understands fewer versions than it sees
+// should say so rather than guess." Older and equal are not refused — an absent
+// field decodes as zero and an unknown field is ignored, so a lower number is
+// at worst a subset of what this decoder reads.
+func TestDecodeOverEveryProtocolVersion(t *testing.T) {
+	cases := []struct {
+		name    string
+		events  int
+		refused bool
+	}{
+		{"older than this window", ProtocolVersion - 1, false},
+		{"the version this window was built for", ProtocolVersion, false},
+		{"one newer than this window", ProtocolVersion + 1, true},
+		{"far newer than this window", ProtocolVersion + 96, true},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			in := strings.Join([]string{
+				fmt.Sprintf(`{"type":"version","t":"x","events":%d,"tool":"9.9.9"}`, c.events),
+				`{"type":"progress","t":"x","pct":42}`,
+				`{"type":"done","t":"x","path":"/tmp/film.es.srt"}`,
+			}, "\n")
+
+			var got []Event
+			err := Decode(strings.NewReader(in), func(e Event) error {
+				got = append(got, e)
+				return nil
+			})
+
+			if !c.refused {
+				if err != nil {
+					t.Fatalf("Decode of events:%d returned %v, want nil — an older or equal "+
+						"protocol is readable", c.events, err)
+				}
+				if len(got) != 3 {
+					t.Fatalf("got %d events, want 3", len(got))
+				}
+				v, err := got[0].AsVersion()
+				if err != nil {
+					t.Fatalf("AsVersion: %v", err)
+				}
+				if v.Events != c.events || v.Tool != "9.9.9" {
+					t.Errorf("AsVersion = %+v, want Events=%d Tool=9.9.9", v, c.events)
+				}
+				return
+			}
+
+			var unsupported *UnsupportedProtocol
+			if !errors.As(err, &unsupported) {
+				t.Fatalf("Decode of events:%d returned %v, want an *UnsupportedProtocol — a stream "+
+					"this window cannot read must be refused, not guessed at", c.events, err)
+			}
+			if unsupported.Events != c.events {
+				t.Errorf("UnsupportedProtocol.Events = %d, want %d", unsupported.Events, c.events)
+			}
+			// The refusal has to name both numbers, or it tells the user nothing
+			// they can act on.
+			msg := unsupported.Error()
+			for _, want := range []string{
+				strconv.Itoa(c.events),
+				strconv.Itoa(ProtocolVersion),
+				"9.9.9",
+			} {
+				if !strings.Contains(msg, want) {
+					t.Errorf("the refusal %q does not mention %q", msg, want)
+				}
+			}
+			// And it must refuse before it hands anything over: the events after
+			// the version line are exactly the ones whose meaning is in doubt.
+			if len(got) != 0 {
+				t.Errorf("Decode delivered %d events from a stream it refused, want 0", len(got))
+			}
+		})
+	}
+}
+
+// TestDecodeDoesNotRequireAVersionEvent pins the other half of the decision
+// above. -probe, -version and the config subcommands emit version and no
+// terminal event; a cancel can kill the CLI before it emits anything at all,
+// and ProbeFile's signalled-with-an-empty-stream case depends on that being an
+// ordinary cancel. So an absent version event is not a protocol violation.
+func TestDecodeDoesNotRequireAVersionEvent(t *testing.T) {
+	in := `{"type":"progress","t":"x","pct":7}` + "\n"
+
+	seen := 0
+	if err := Decode(strings.NewReader(in), func(Event) error { seen++; return nil }); err != nil {
+		t.Fatalf("Decode of a stream with no version event returned %v, want nil", err)
+	}
+	if seen != 1 {
+		t.Errorf("Decode delivered %d events, want 1", seen)
+	}
+
+	if err := Decode(strings.NewReader(""), func(Event) error { seen++; return nil }); err != nil {
+		t.Fatalf("Decode of an empty stream returned %v, want nil", err)
+	}
+}
+
+// TestDecodeRefusesAMalformedVersionNumber: a version line whose `events` is
+// not a number parses as an envelope and would otherwise slip past the check
+// with Events left at zero — which reads as "older", the one value that is
+// accepted.
+func TestDecodeRefusesAMalformedVersionNumber(t *testing.T) {
+	in := `{"type":"version","t":"x","events":"two","tool":"9.9.9"}` + "\n"
+
+	seen := 0
+	err := Decode(strings.NewReader(in), func(Event) error { seen++; return nil })
+	if err == nil {
+		t.Fatal("Decode of a version line whose events is a string returned nil, want an error")
+	}
+	if seen != 0 {
+		t.Errorf("Decode delivered %d events from a version line it could not read, want 0", seen)
+	}
+}
+
+// TestTheWindowsProtocolVersionMatchesTheCLIs is the other direction of I2's
+// defect. The refusal above protects this window from a *newer* CLI shipped
+// separately; nothing protects it from the CLI in this same tree bumping its
+// own ProtocolVersion and leaving this module silently reading version 2 as
+// version 1. The two constants are separate on purpose — the programs ship
+// apart — but within one tree they must agree, and this is the line that says
+// so out loud.
+//
+// The CLI's file is read as text for the reason TestTheGUIStructsMatchTheCLIsJSONTags
+// reads it as text: this module cannot import it.
+func TestTheWindowsProtocolVersionMatchesTheCLIs(t *testing.T) {
+	src, err := os.ReadFile("../internal/events/events.go")
+	if err != nil {
+		t.Fatalf("reading the CLI's events.go: %v", err)
+	}
+
+	m := regexp.MustCompile(`const ProtocolVersion = (\d+)`).FindSubmatch(src)
+	if m == nil {
+		t.Fatal("could not find `const ProtocolVersion = <n>` in internal/events/events.go — " +
+			"has the CLI's file changed shape? this guard needs updating")
+	}
+	cli, err := strconv.Atoi(string(m[1]))
+	if err != nil {
+		t.Fatalf("parsing the CLI's ProtocolVersion %q: %v", m[1], err)
+	}
+
+	if cli != ProtocolVersion {
+		t.Errorf("internal/events.ProtocolVersion is %d and gui.ProtocolVersion is %d: the CLI in "+
+			"this tree emits a protocol this window refuses (or reads a newer one as an older one). "+
+			"Teach gui/events.go the new version, then raise gui.ProtocolVersion to %d",
+			cli, ProtocolVersion, cli)
+	}
+}
+
 // TestEventAccessorsRejectTheWrongEventType exercises every accessor's
 // mismatch path in one pass: each one must refuse to decode an event of a
 // different kind rather than silently returning zero-valued data.
@@ -228,6 +385,7 @@ func TestEventAccessorsRejectTheWrongEventType(t *testing.T) {
 		name string
 		call func() error
 	}{
+		{"AsVersion", func() error { _, err := e.AsVersion(); return err }},
 		{"AsProbe", func() error { _, err := e.AsProbe(); return err }},
 		{"AsStage", func() error { _, err := e.AsStage(); return err }},
 		{"AsLanguage", func() error { _, err := e.AsLanguage(); return err }},
@@ -314,6 +472,7 @@ func TestTheGUIStructsMatchTheCLIsJSONTags(t *testing.T) {
 		structName string
 		ours       interface{}
 	}{
+		{"Version", Version{}},
 		{"Stream", Stream{}},
 		{"Probe", Probe{}},
 		{"FastRule", FastRule{}},

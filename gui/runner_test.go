@@ -189,6 +189,71 @@ func TestProbeReportsASignalledExitWithAnEmptyStream(t *testing.T) {
 	}
 }
 
+// TestBothCallersSurfaceAnUnsupportedProtocol proves the decision behind I2's
+// fix: the version refusal lives in Decode alone, and that is enough because
+// both consumers in this module read their stream through it — ProbeFile
+// buffered, (*Run).stream live. Neither has a copy of the rule, and neither can
+// forget it.
+//
+// It also pins that the refusal arrives as itself. ProbeFile wraps a decode
+// error with %w and buildOutcome does the same, so errors.As still reaches the
+// number; without that, "the CLI speaks a protocol this window cannot read"
+// would reach the user as an unexplained broken stream.
+func TestBothCallersSurfaceAnUnsupportedProtocol(t *testing.T) {
+	newer := fmt.Sprintf(`{"type":"version","t":"2026-09-30T00:00:00Z","events":%d,"tool":"9.9.9"}`,
+		ProtocolVersion+1) + "\n"
+
+	t.Run("ProbeFile", func(t *testing.T) {
+		dir := t.TempDir()
+		probeLine := `{"type":"probe","t":"2026-09-30T00:00:01Z","audio":[],"subtitles":[]}` + "\n"
+		cli := writeStubCLI(t, dir, "", newer+probeLine, 0)
+
+		got, err := ProbeFile(context.Background(), cli, "movie.mkv")
+		if got != nil {
+			t.Errorf("ProbeFile() = %+v, want nil *Probe — the probe event came off a stream this "+
+				"window cannot read", got)
+		}
+		var unsupported *UnsupportedProtocol
+		if !errors.As(err, &unsupported) {
+			t.Fatalf("ProbeFile() error = %v, want errors.As(err, **UnsupportedProtocol)", err)
+		}
+		if unsupported.Events != ProtocolVersion+1 {
+			t.Errorf("UnsupportedProtocol.Events = %d, want %d", unsupported.Events, ProtocolVersion+1)
+		}
+		// And it is not mistaken for the file being unreadable, which is the one
+		// probe failure that routes the user somewhere else entirely.
+		var failure *ProbeFailure
+		if errors.As(err, &failure) {
+			t.Errorf("ProbeFile() reported a ProbeFailure (%+v) for a protocol it cannot read", failure)
+		}
+	})
+
+	t.Run("Start", func(t *testing.T) {
+		dir := t.TempDir()
+		doneLine := `{"type":"done","t":"2026-09-30T00:00:02Z","path":"/out/movie.es.srt"}` + "\n"
+		cli := writeStubCLI(t, dir, "", newer+doneLine, 0)
+
+		var delivered int
+		run, err := Start(context.Background(), cli, RunOptions{Input: "movie.mkv", To: "es", Track: -1, Atrack: -1},
+			func(Event) error { delivered++; return nil })
+		if err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+
+		outcome, err := run.Wait()
+		if outcome != nil {
+			t.Errorf("Wait() = %+v, want nil *Outcome", outcome)
+		}
+		var unsupported *UnsupportedProtocol
+		if !errors.As(err, &unsupported) {
+			t.Fatalf("Wait() error = %v, want errors.As(err, **UnsupportedProtocol)", err)
+		}
+		if delivered != 0 {
+			t.Errorf("%d events reached the window from a stream it refused, want 0", delivered)
+		}
+	})
+}
+
 // TestProbeReturnsPromptlyAgainstAChattyChild: -probe also prints a
 // human-readable track listing on stdout, which ProbeFile discards via
 // cmd.Stdout = io.Discard rather than reading it. os/exec already guarantees

@@ -18,6 +18,40 @@ import (
 	"io"
 )
 
+// ProtocolVersion is the highest `events` number this window knows how to
+// read. It is the counterpart of internal/events.ProtocolVersion, which is the
+// number the CLI writes, and the two are deliberately separate constants: the
+// whole point of the number is that the two programs can ship apart, so a
+// window built today must be able to meet a CLI built later and say so.
+const ProtocolVersion = 1
+
+// Version is the first event of every invocation — every run, every -probe,
+// every subcommand. Events is the protocol number; Tool is the CLI's own
+// version string.
+type Version struct {
+	Events int    `json:"events"`
+	Tool   string `json:"tool"`
+}
+
+// UnsupportedProtocol is returned by Decode when a stream announces an `events`
+// number newer than ProtocolVersion. It is a type rather than a formatted error
+// so a screen that wants to say something better than the sentence below can
+// reach the number with errors.As.
+type UnsupportedProtocol struct {
+	Events int
+	Tool   string
+}
+
+func (e *UnsupportedProtocol) Error() string {
+	tool := e.Tool
+	if tool == "" {
+		tool = "sub-translator"
+	}
+	return fmt.Sprintf("%s speaks event protocol %d and this window understands %d: "+
+		"reading its stream anyway would mean guessing at a format that has changed. "+
+		"Update the window, or point it at a matching sub-translator.", tool, e.Events, ProtocolVersion)
+}
+
 // Stream is one audio or subtitle track as the probe reports it.
 type Stream struct {
 	Index int    `json:"index"`
@@ -119,6 +153,31 @@ type envelope struct {
 // error naming the line: the CLI's protocol guarantees every line is whole,
 // so a malformed '{'-leading line means something upstream is broken. If on
 // returns an error, Decode stops and returns that error.
+//
+// # Where the protocol version is refused
+//
+// Here, and only here. A version event announcing an `events` number higher
+// than ProtocolVersion stops the decode with an *UnsupportedProtocol before on
+// is called even once.
+//
+// This is the right layer because the protocol version is a property of the
+// stream, not of whoever happens to be reading it. Every consumer in this
+// module already goes through Decode — ProbeFile buffers a stream through it,
+// (*Run).stream pipes one through it live — so a check here cannot be
+// forgotten by a third consumer added later, and both existing callers already
+// wrap a decode error with %w, which keeps errors.As working on the way out.
+// Putting it in ProbeFile and Start instead would be two copies of one rule in
+// the module whose whole design is "the window holds no second copy of the
+// CLI's rules", and adding it to both layers would be three.
+//
+// Two deliberate narrownesses. An *older* number is accepted: this window's
+// structs ignore fields they do not know and read absent ones as zero, so a
+// lower number is at worst a subset of what it can read, and spec:270 asks for
+// a refusal when the number is *newer*. And a missing version event is not an
+// error: -probe, -version and the config subcommands emit version and no
+// terminal event, a cancel can kill the CLI before it emits anything at all,
+// and ProbeFile's own signalled-with-an-empty-stream case depends on that
+// being an ordinary cancel rather than a protocol violation.
 func Decode(r io.Reader, on func(Event) error) error {
 	sc := bufio.NewScanner(r)
 	// The default 64 KB scanner buffer is too small for a warning event
@@ -139,6 +198,16 @@ func Decode(r io.Reader, on func(Event) error) error {
 			return fmt.Errorf("events: malformed line %s: %w", line, err)
 		}
 
+		if env.Type == "version" {
+			var v Version
+			if err := json.Unmarshal(line, &v); err != nil {
+				return fmt.Errorf("events: malformed version line %s: %w", line, err)
+			}
+			if v.Events > ProtocolVersion {
+				return &UnsupportedProtocol{Events: v.Events, Tool: v.Tool}
+			}
+		}
+
 		raw := make(json.RawMessage, len(line))
 		copy(raw, line)
 
@@ -154,6 +223,17 @@ func Decode(r io.Reader, on func(Event) error) error {
 // kind than the one it decodes.
 func wrongType(want, got string) error {
 	return fmt.Errorf("events: not a %q event (type=%q)", want, got)
+}
+
+func (e Event) AsVersion() (*Version, error) {
+	if e.Type != "version" {
+		return nil, wrongType("version", e.Type)
+	}
+	var v Version
+	if err := json.Unmarshal(e.Raw, &v); err != nil {
+		return nil, err
+	}
+	return &v, nil
 }
 
 func (e Event) AsProbe() (*Probe, error) {
