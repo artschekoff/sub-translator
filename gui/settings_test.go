@@ -256,16 +256,20 @@ func TestReadSettingsTrimsAnUnsetKeysEmptyLine(t *testing.T) {
 	}
 }
 
-// TestWriteSettingSurfacesTheCLIsRejection: the CLI validates values — a
-// negative worker count, a whisper binary that is not executable. The
-// window shows what it said instead of validating in parallel, so
-// WriteSetting's error must carry the CLI's own message.
+// TestWriteSettingSurfacesTheCLIsRejection: the CLI validates some of its
+// keys — translate.workers rejects anything but a positive integer. The
+// fixture's rejectionMsg is not invented: it is what the real built CLI
+// actually answers for `sub-translator config set translate.workers -1`
+// (confirmed with the binary, `error: translate.workers must be a positive
+// integer, got "-1"`), so this is an example a reader could reproduce
+// themselves. The window shows what it said instead of validating in
+// parallel, so WriteSetting's error must carry the CLI's own message.
 func TestWriteSettingSurfacesTheCLIsRejection(t *testing.T) {
 	dir := t.TempDir()
-	const rejectionMsg = `whisper.bin must be an executable file, got "/not/a/binary"`
+	const rejectionMsg = `error: translate.workers must be a positive integer, got "-1"`
 	cli, log := writeArgvLoggingStub(t, dir, nil, 1, rejectionMsg)
 
-	err := WriteSetting(context.Background(), cli, "whisper.bin", "/not/a/binary")
+	err := WriteSetting(context.Background(), cli, "translate.workers", "-1")
 	if err == nil {
 		t.Fatal("WriteSetting() error = nil, want the CLI's rejection")
 	}
@@ -277,7 +281,7 @@ func TestWriteSettingSurfacesTheCLIsRejection(t *testing.T) {
 	if len(calls) != 1 {
 		t.Fatalf("stub was invoked %d times, want exactly 1: %v", len(calls), calls)
 	}
-	want := []string{"config", "set", "whisper.bin", "/not/a/binary"}
+	want := []string{"config", "set", "translate.workers", "-1"}
 	if strings.Join(calls[0], "\x1f") != strings.Join(want, "\x1f") {
 		t.Errorf("stub was invoked with %v, want %v", calls[0], want)
 	}

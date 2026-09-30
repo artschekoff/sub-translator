@@ -7,11 +7,12 @@
 // <value>`.
 //
 // `config list` is deliberately never used to read settings: it prints
-// aligned columns for a human (`  translate.model      (unset)`), a prose
-// layout nobody promised to keep stable and whose alignment shifts as key
-// names grow. Parsing it would turn that prose format into this window's
-// API. `config get <key>` is the stable, one-value-per-call interface
-// instead — one exec.CommandContext per key.
+// aligned columns for a human (`  translate.model        (unset)`, the
+// actual spacing `cmd_config.go`'s `%-22s` produces), a prose layout nobody
+// promised to keep stable and whose alignment shifts as key names grow.
+// Parsing it would turn that prose format into this window's API. `config
+// get <key>` is the stable, one-value-per-call interface instead — one
+// exec.CommandContext per key.
 package main
 
 import (
@@ -68,10 +69,19 @@ func ReadSettings(ctx context.Context, cli string) (map[string]string, error) {
 }
 
 // WriteSetting writes one key with `config set <key> <value>` and surfaces
-// the CLI's own rejection verbatim on failure. The CLI validates values (a
-// negative worker count, a whisper binary that is not executable), and this
-// window shows what it said instead of validating the value itself in
-// parallel.
+// the CLI's own rejection verbatim on failure. The CLI validates some of
+// these keys — translate.workers, for one, rejects anything but a positive
+// integer: run against the real built binary, `sub-translator config set
+// translate.workers -1` answers `error: translate.workers must be a
+// positive integer, got "-1"` — and this window shows what it said instead
+// of validating the value itself in parallel.
+//
+// Not every key here validates: whisper.bin, whisper.model,
+// whisper.vad-model and models.dir only run expandPath on the value
+// (internal/config/config.go), and translate.api-key only trims it —
+// neither checks the path exists, is a file, or is executable. WriteSetting
+// makes no distinction; it surfaces whatever the CLI said, or nothing, for
+// every key alike.
 //
 // The returned error is built only from the CLI's stderr, or the process
 // error's own message when the CLI never got to say anything — never from
