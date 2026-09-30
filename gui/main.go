@@ -97,25 +97,60 @@ type App struct {
 	// a window.
 	emit func(ctx context.Context, name string, data ...interface{})
 
+	// ask puts one question to the user and returns the button they chose. It
+	// is a field for the same reason emit is: wailsruntime.MessageDialog reads
+	// the window's dialog implementation out of a context only Wails can
+	// build, so without this seam beforeClose — the one method whose whole
+	// behaviour is a question — would be unreachable from a test. A nil ask
+	// means there is no window to ask through, which beforeClose treats as the
+	// question having failed rather than as a reason to panic.
+	ask func(ctx context.Context, opts wailsruntime.MessageDialogOptions) (string, error)
+
 	mu     sync.Mutex
 	cli    string
 	cliErr error
 	film   string
 	probe  *Probe
 
-	// run is the translation in flight, or nil, and starting is the moment
-	// between a StartRun claiming the slot and its child either existing or
-	// having failed to. Both are needed: refusing a second run on `run != nil`
-	// alone leaves the fork/exec window open, and that window is long enough
-	// for a second binding goroutine to walk through it.
+	// run and starting are the two halves of one slot, and the invariant over
+	// that slot is "one run at a time, honoured at every reader of it" — not
+	// just at the writer. run is the translation in flight, or nil. starting is
+	// non-nil from the moment a StartRun claims the slot until its child either
+	// exists or has failed to, and the channel it holds is closed at that
+	// moment; it is a channel rather than a bool so a reader that arrives inside
+	// the window can wait the window out instead of guessing.
+	//
+	// Both are needed: refusing a second run on `run != nil` alone leaves the
+	// fork/exec window open, and that window is long enough for a second
+	// binding goroutine to walk through it. And both must be read *together*,
+	// by everyone — CancelRun that read run alone returned nil to a Cancel click
+	// while the run went on to completion, and a beforeClose that read run alone
+	// let the window quit with the child still transcribing. Use runSlot below
+	// rather than touching either field directly.
 	//
 	// stage and pct are the last the run reported, kept only so the
 	// close-while-running question can name them — the page keeps its own copy
 	// for the screen.
 	run      *Run
-	starting bool
+	starting chan struct{}
 	stage    string
 	pct      int
+}
+
+// runSlot reads the run slot the way every reader of it must: a run that is
+// still starting counts as a run.
+//
+// It returns the run in flight, or — when a StartRun has claimed the slot but
+// its child does not exist yet — the channel that closes when that claim
+// resolves. Both nil means the slot is free. At most one is ever non-nil,
+// because StartRun clears starting and sets run under one hold of the mutex.
+func (a *App) runSlot() (*Run, <-chan struct{}) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.run != nil {
+		return a.run, nil
+	}
+	return nil, a.starting
 }
 
 // send forwards one event to the page through the emit seam above. Every
@@ -433,14 +468,16 @@ func (a *App) StartRun(f RunForm) error {
 	case film == "":
 		a.mu.Unlock()
 		return errors.New("no film has been read yet")
-	case a.run != nil || a.starting:
+	case a.run != nil || a.starting != nil:
 		a.mu.Unlock()
 		return errors.New("a run is already going")
 	}
 	// Claimed before the lock is released, which is the whole point: from here
 	// on every other StartRun is refused, whether or not this one's child has
-	// started yet.
-	a.starting = true
+	// started yet. The channel is what lets CancelRun and beforeClose wait the
+	// claim out rather than mistake it for an empty slot.
+	claimed := make(chan struct{})
+	a.starting = claimed
 	a.stage, a.pct = "", 0
 	a.mu.Unlock()
 
@@ -474,11 +511,16 @@ func (a *App) StartRun(f RunForm) error {
 	run, err := Start(context.Background(), cli, opts, a.onRunEvent)
 
 	a.mu.Lock()
-	a.starting = false
+	a.starting = nil
 	if err == nil {
 		a.run = run
 	}
 	a.mu.Unlock()
+	// After the lock, so a waiter that wakes on this close reads the settled
+	// slot rather than racing this function for the mutex. Closed on both paths
+	// out: a child that never spawned must release its waiters too, or a Cancel
+	// pressed in the window would block for the life of the window.
+	close(claimed)
 
 	if err != nil {
 		return err
@@ -585,14 +627,33 @@ func (a *App) awaitRun(run *Run) {
 // Cancelling when nothing is running is not an error either. The Cancel button
 // is live until the page redraws, so it can be pressed in the moment between
 // the CLI's last event and the screen changing.
+//
+// A run that is still starting is a run. The Run screen reveals a live Cancel
+// button before it awaits StartRun, so the first click can land inside the
+// fork/exec window, and this used to read a.run alone: it saw nil, returned
+// nil, and the page — which treats a nil return as "the cancel was carried
+// out" — left the button disabled under "Cancelling…" while the run went on to
+// completion with no way to stop it. So the wait here is deliberate: the caller
+// asked for the run to end, and the only honest answer inside the window is to
+// let the claim resolve and then cancel the child it produced. That costs the
+// length of one fork/exec — the same syscall StartRun is already blocked on —
+// and CancelRun blocks for the CLI's whole cleanup anyway, which is longer.
+//
+// The loop, rather than a single wait, covers the slot being claimed again by a
+// StartRun that follows a failed spawn: each turn waits out a different claim,
+// so it terminates.
 func (a *App) CancelRun() error {
-	a.mu.Lock()
-	run := a.run
-	a.mu.Unlock()
-	if run == nil {
-		return nil
+	for {
+		run, claimed := a.runSlot()
+		switch {
+		case run != nil:
+			return run.Cancel()
+		case claimed != nil:
+			<-claimed
+		default:
+			return nil
+		}
 	}
-	return run.Cancel()
 }
 
 // RevealFile shows one of the run's output files in the Finder, selected
@@ -681,41 +742,64 @@ func (a *App) SaveSetting(key, value string) error {
 //
 // Wails calls this on a goroutine of its own (darwin/frontend.go's Quit), so
 // both the dialog and the wait inside Cancel are safe to block on here.
+//
+// A run that is still starting is a run here too. Reading a.run alone let a
+// Cmd-Q inside the fork/exec window skip the question entirely and return
+// false, and the window then quit with a child that was about to start
+// transcribing — the background orphan the spec forbids outright. The question
+// is asked on the claim as well, and closePrompt already has words for a run
+// that has reported no stage yet, which is exactly what a starting run is.
 func (a *App) beforeClose(ctx context.Context) bool {
+	run, claimed := a.runSlot()
+
 	a.mu.Lock()
-	run, stage, pct := a.run, a.stage, a.pct
+	stage, pct := a.stage, a.pct
 	a.mu.Unlock()
 
-	if run == nil {
+	if run == nil && claimed == nil {
 		return false
 	}
 
 	const quit = "Cancel the run and quit"
-	choice, err := wailsruntime.MessageDialog(ctx, wailsruntime.MessageDialogOptions{
-		Type:          wailsruntime.QuestionDialog,
-		Title:         "sub-translator is still working",
-		Message:       closePrompt(stage, pct),
-		Buttons:       []string{quit, "Keep working"},
-		DefaultButton: "Keep working",
-		CancelButton:  "Keep working",
-	})
+	choice, err := a.askToClose(ctx, quit, closePrompt(stage, pct))
 	if err != nil {
 		// The question could not be put. Trapping someone in a window they
 		// asked to close is worse than losing the run, so the close goes
 		// ahead — but the child still gets cancelled and waited for on the way
 		// out, which is the part that leaves no orphans.
-		_ = run.Cancel()
+		_ = a.CancelRun()
 		return false
 	}
 	if choice != quit {
 		return true
 	}
 
-	// Cancel's own contract: it returns only once the CLI has finished its
-	// cleanup and the child is reaped. Whatever it reports, the window is
-	// going — there is nobody left to show an error to.
-	_ = run.Cancel()
+	// CancelRun rather than run.Cancel: it is the one reader that knows how to
+	// cancel a run that is still starting, and its own contract is that it
+	// returns only once the CLI has finished its cleanup and the child is
+	// reaped. Whatever it reports, the window is going — there is nobody left
+	// to show an error to.
+	_ = a.CancelRun()
 	return false
+}
+
+// askToClose puts the close-while-running question through the ask seam. A nil
+// ask is an App that was never wired to a window, which is not a state that can
+// answer a question: it reports the question as having failed, and beforeClose's
+// err path then cancels the child and lets the close through — the same choice
+// it makes when a real dialog cannot be shown.
+func (a *App) askToClose(ctx context.Context, quit, message string) (string, error) {
+	if a.ask == nil {
+		return "", errors.New("no window to ask through")
+	}
+	return a.ask(ctx, wailsruntime.MessageDialogOptions{
+		Type:          wailsruntime.QuestionDialog,
+		Title:         "sub-translator is still working",
+		Message:       message,
+		Buttons:       []string{quit, "Keep working"},
+		DefaultButton: "Keep working",
+		CancelButton:  "Keep working",
+	})
 }
 
 func main() {
@@ -724,9 +808,12 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// The emit seam (see App.emit) is wired here, before the window exists,
-	// so it is written once and read-only thereafter.
-	app := &App{emit: wailsruntime.EventsEmit}
+	// The emit and ask seams (see App.emit, App.ask) are wired here, before the
+	// window exists, so each is written once and read-only thereafter.
+	app := &App{
+		emit: wailsruntime.EventsEmit,
+		ask:  wailsruntime.MessageDialog,
+	}
 
 	err = wails.Run(&options.App{
 		Title: "sub-translator",
