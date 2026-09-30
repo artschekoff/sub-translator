@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -132,8 +133,8 @@ func TestProbeSurfacesProbeFailed(t *testing.T) {
 	if err == nil {
 		t.Fatal("Probe() error = nil, want a probe_failed error")
 	}
-	if errors.Is(err, ErrProbeCancelled) {
-		t.Fatalf("Probe() error = %v, want it NOT to be ErrProbeCancelled", err)
+	if errors.Is(err, ErrCancelled) {
+		t.Fatalf("Probe() error = %v, want it NOT to be ErrCancelled", err)
 	}
 
 	var pf *ProbeFailure
@@ -150,7 +151,7 @@ func TestProbeSurfacesProbeFailed(t *testing.T) {
 
 // TestProbeSurvivesACancelledProbe: a cancel during -probe now yields
 // error{kind:cancelled} and exit 130 — the window must not read that as a
-// probe failure (a *ProbeFailure), only as ErrProbeCancelled.
+// probe failure (a *ProbeFailure), only as ErrCancelled.
 func TestProbeSurvivesACancelledProbe(t *testing.T) {
 	dir := t.TempDir()
 	errLine := `{"type":"error","t":"2026-09-30T00:00:01Z","kind":"cancelled","message":"cancelled"}` + "\n"
@@ -160,8 +161,8 @@ func TestProbeSurvivesACancelledProbe(t *testing.T) {
 	if got != nil {
 		t.Errorf("Probe() = %+v, want nil *Probe on cancel", got)
 	}
-	if !errors.Is(err, ErrProbeCancelled) {
-		t.Fatalf("Probe() error = %v, want errors.Is(err, ErrProbeCancelled)", err)
+	if !errors.Is(err, ErrCancelled) {
+		t.Fatalf("Probe() error = %v, want errors.Is(err, ErrCancelled)", err)
 	}
 
 	var pf *ProbeFailure
@@ -183,8 +184,8 @@ func TestProbeReportsASignalledExitWithAnEmptyStream(t *testing.T) {
 	if got != nil {
 		t.Errorf("Probe() = %+v, want nil *Probe", got)
 	}
-	if !errors.Is(err, ErrProbeCancelled) {
-		t.Fatalf("Probe() error = %v, want errors.Is(err, ErrProbeCancelled)", err)
+	if !errors.Is(err, ErrCancelled) {
+		t.Fatalf("Probe() error = %v, want errors.Is(err, ErrCancelled)", err)
 	}
 }
 
@@ -286,7 +287,25 @@ func writeTrapCLI(t *testing.T, dir string) (cli, marker string) {
 // which ignore argv entirely — only the values matter for tests that
 // inspect what Start built, which none here do.
 func runOpts() RunOptions {
-	return RunOptions{Input: "movie.mkv", From: "en", To: "es", Track: -1}
+	return RunOptions{Input: "movie.mkv", From: "en", To: "es", Track: -1, Atrack: -1}
+}
+
+// writeSilentBlockingStub creates a stub that says nothing at all and blocks
+// until it is signalled. `exec sleep` replaces the shell, so the SIGINT
+// Cancel sends reaches a process whose default disposition is to die by it:
+// a signalled exit with an empty stream, which is the startup-race cancel
+// exactly as the README describes it. (If the exec has not happened yet the
+// signal lands on the shell instead, which also dies by it with nothing
+// written — the same shape either way, so the test has no race to lose.)
+func writeSilentBlockingStub(t *testing.T, dir string) string {
+	t.Helper()
+
+	script := "#!/bin/sh\nexec sleep 30\n"
+	path := filepath.Join(dir, "sub-translator")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("writing silent blocking stub: %v", err)
+	}
+	return path
 }
 
 // TestStartStreamsEventsAsTheyArriveNotAfterExit is the test the task
@@ -577,7 +596,7 @@ func TestCancelDoesNotOrphanTheChild(t *testing.T) {
 // few milliseconds before the CLI arms its signal handler kills it with
 // nothing on the stream at all — no version, no error — which is exactly
 // what the GUI's own Cancel button produces if it's clicked the instant a
-// run starts. That must come back as ErrProbeCancelled, the same sentinel
+// run starts. That must come back as ErrCancelled, the same sentinel
 // ProbeFile already uses for its identical case, not as a "stream broke its
 // contract" error: the run wasn't broken, it was cancelled.
 func TestStartReportsASignalledExitWithAnEmptyStreamAsCancelled(t *testing.T) {
@@ -593,7 +612,169 @@ func TestStartReportsASignalledExitWithAnEmptyStreamAsCancelled(t *testing.T) {
 	if outcome != nil {
 		t.Errorf("Wait() outcome = %+v, want nil", outcome)
 	}
-	if !errors.Is(err, ErrProbeCancelled) {
-		t.Fatalf("Wait() error = %v, want errors.Is(err, ErrProbeCancelled)", err)
+	if !errors.Is(err, ErrCancelled) {
+		t.Fatalf("Wait() error = %v, want errors.Is(err, ErrCancelled)", err)
+	}
+}
+
+// --- argv -----------------------------------------------------------------
+
+// TestBuildRunArgs is the argv coverage the spec's Testing section asks for —
+// "argv construction from the form's state, for every combination of source,
+// mode and fast" — and which no test in this file had. Its absence is how
+// -atrack went missing: every other test here uses a stub that ignores argv
+// entirely, so a run could be composed with the audio index on the wrong flag
+// and nothing would notice but a user watching the wrong dub.
+func TestBuildRunArgs(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts RunOptions
+		want []string
+	}{
+		{
+			name: "transcribe an audio track to a sidecar",
+			opts: RunOptions{Input: "movie.mkv", To: "es", Mode: "srt", Source: "audio", Track: -1, Atrack: 3},
+			want: []string{
+				"-events", "json", "-to", "es", "-mode", "srt", "-source", "audio",
+				"-track", "-1", "-atrack", "3", "movie.mkv",
+			},
+		},
+		{
+			name: "translate a subtitle track, which needs -from",
+			opts: RunOptions{Input: "movie.mkv", From: "en", To: "es", Mode: "srt", Source: "sub", Track: 2, Atrack: -1},
+			want: []string{
+				"-events", "json", "-from", "en", "-to", "es", "-mode", "srt", "-source", "sub",
+				"-track", "2", "-atrack", "-1", "movie.mkv",
+			},
+		},
+		{
+			name: "mux, with a chosen output path",
+			opts: RunOptions{Input: "movie.mkv", To: "es", Mode: "mux", Out: "/films/out.mkv", Source: "audio", Track: -1, Atrack: 0},
+			want: []string{
+				"-events", "json", "-to", "es", "-mode", "mux", "-out", "/films/out.mkv",
+				"-source", "audio", "-track", "-1", "-atrack", "0", "movie.mkv",
+			},
+		},
+		{
+			name: "both, fast",
+			opts: RunOptions{Input: "movie.mkv", To: "es", Mode: "both", Source: "audio", Track: -1, Atrack: 1, Fast: true},
+			want: []string{
+				"-events", "json", "-to", "es", "-mode", "both", "-source", "audio",
+				"-track", "-1", "-atrack", "1", "-fast", "movie.mkv",
+			},
+		},
+		{
+			name: "nothing but the input: the CLI's own defaults stand",
+			opts: RunOptions{Input: "movie.mkv", Track: -1, Atrack: -1},
+			want: []string{"-events", "json", "-track", "-1", "-atrack", "-1", "movie.mkv"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildRunArgs(tc.opts)
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("buildRunArgs()\n got %q\nwant %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestTrackIndicesPutsTheChosenStreamOnTheFlagThatReadsIt is defect 1 pinned
+// at its source: -track is the subtitle index and -atrack is the audio one,
+// and the File screen offers both lists as one choice, so something has to
+// decide which flag the chosen index belongs on.
+func TestTrackIndicesPutsTheChosenStreamOnTheFlagThatReadsIt(t *testing.T) {
+	for _, tc := range []struct {
+		source        string
+		chosen        int
+		track, atrack int
+		why           string
+	}{
+		{"audio", 3, -1, 3, "an audio index on -track is read by nothing: the CLI picks its own stream"},
+		{"audio", 0, -1, 0, "index 0 is a real stream, not an unset value"},
+		{"sub", 2, 2, -1, "a subtitle index belongs on -track"},
+		{"auto", 5, -1, -1, "nothing was chosen from either list, so neither flag is set"},
+		{"", 5, -1, -1, "same, for an unset source"},
+	} {
+		t.Run(tc.source+"/"+strconv.Itoa(tc.chosen), func(t *testing.T) {
+			track, atrack := trackIndices(tc.source, tc.chosen)
+			if track != tc.track || atrack != tc.atrack {
+				t.Errorf("trackIndices(%q, %d) = (%d, %d), want (%d, %d) — %s",
+					tc.source, tc.chosen, track, atrack, tc.track, tc.atrack, tc.why)
+			}
+		})
+	}
+}
+
+// --- Cancel's error contract ---------------------------------------------
+
+// TestCancelInTheStartupRaceIsNotAFailure pins the first of Cancel's two
+// undocumented cases. A cancel landing before the CLI arms its handler kills
+// it with nothing on the stream, which Wait reports as ErrCancelled — the
+// cancel having worked exactly as asked. Cancel must not pass that on as its
+// own error: the Cancel button's only use for a non-nil return is to put a
+// dialog on screen, and a dialog for a successful cancel is a bug the user
+// sees every time they cancel a run they just started.
+func TestCancelInTheStartupRaceIsNotAFailure(t *testing.T) {
+	dir := t.TempDir()
+	cli := writeSilentBlockingStub(t, dir)
+
+	r, err := Start(context.Background(), cli, runOpts(), func(Event) error { return nil })
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	if err := r.Cancel(); err != nil {
+		t.Errorf("Cancel() in the startup race = %v, want nil: the cancel succeeded, and a "+
+			"non-nil return here is what the Run screen shows an error dialog for", err)
+	}
+
+	// Wait still tells the whole truth: the sentinel stays where a caller asks
+	// how the run ended, rather than being swallowed along with the error.
+	outcome, waitErr := r.Wait()
+	if outcome != nil {
+		t.Errorf("Wait() outcome = %+v, want nil", outcome)
+	}
+	if !errors.Is(waitErr, ErrCancelled) {
+		t.Errorf("Wait() error = %v, want errors.Is(err, ErrCancelled)", waitErr)
+	}
+}
+
+// TestCancelAfterTheRunAlreadyEndedReportsTheRealOutcome pins the second
+// case. The Cancel button is live until the page redraws, so it can be
+// pressed on a run that has already finished. Signalling a reaped process
+// returns os.ErrProcessDone, and reporting that told the user "os: process
+// already finished" about a run that had in fact completed successfully —
+// a signalling complaint standing in for the run's real ending.
+func TestCancelAfterTheRunAlreadyEndedReportsTheRealOutcome(t *testing.T) {
+	dir := t.TempDir()
+	stderr := versionLine +
+		`{"type":"saved","t":"2026-09-30T00:00:01Z","path":"/out/movie.es.srt","watchable":false}` + "\n" +
+		`{"type":"done","t":"2026-09-30T00:00:02Z","path":"/out/movie.es.srt"}` + "\n"
+	cli := writeStubCLI(t, dir, "", stderr, 0)
+
+	r, err := Start(context.Background(), cli, runOpts(), func(Event) error { return nil })
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	// Let it finish naturally, and let the stream goroutine's cmd.Wait reap
+	// it — which is what makes a later Signal return os.ErrProcessDone.
+	outcome, err := r.Wait()
+	if err != nil {
+		t.Fatalf("Wait() error = %v, want nil", err)
+	}
+	if outcome.Done == nil {
+		t.Fatalf("outcome = %+v, want a done event", outcome)
+	}
+
+	if err := r.Cancel(); err != nil {
+		t.Errorf("Cancel() after the run already finished = %v, want nil: there was nothing "+
+			"left to cancel, and the run's real ending was a success", err)
+	}
+
+	// And the outcome is unchanged by having been cancelled after the fact.
+	again, err := r.Wait()
+	if err != nil || again.Done == nil {
+		t.Errorf("Wait() after Cancel() = (%+v, %v), want the same done outcome", again, err)
 	}
 }

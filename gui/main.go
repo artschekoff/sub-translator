@@ -264,7 +264,7 @@ func (a *App) ProbeFilm(path string) (*FileInfo, error) {
 		switch {
 		case errors.As(err, &failure):
 			return nil, errors.New(failure.Message)
-		case errors.Is(err, ErrProbeCancelled):
+		case errors.Is(err, ErrCancelled):
 			return nil, errors.New("the probe was cancelled")
 		}
 		return nil, err

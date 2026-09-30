@@ -16,8 +16,17 @@ import (
 	"strconv"
 )
 
-// ErrProbeCancelled is returned by ProbeFile, and by Start/Wait, when the
-// run ended because it was cancelled rather than because the CLI failed.
+// ErrCancelled is returned by ProbeFile, and by Start/Wait, when the run
+// ended because it was cancelled rather than because the CLI failed.
+//
+// It was called ErrProbeCancelled until the Run screen was built, and the
+// name named the wrong operation from the moment Start began returning it:
+// what a user cancels is a twenty-minute translation far more often than a
+// probe. The Run screen's Cancel button is the first consumer to write
+// errors.Is on it while handling a cancelled *translation*, which is the
+// moment the old name stopped being merely imprecise and started reading as
+// a check on something else entirely.
+//
 // Two distinct CLI endings both mean this, per the README, and both
 // subcommands can hit either one:
 //
@@ -35,7 +44,7 @@ import (
 // The window must route both away from ProbeFailure or a "broken stream"
 // error: cancelling is not the file being unreadable, not a crash, and not
 // a contract violation.
-var ErrProbeCancelled = errors.New("probe cancelled")
+var ErrCancelled = errors.New("cancelled")
 
 // ProbeFailure is returned by Probe when the CLI ran and reported, through
 // its own error event, that the probe itself failed — most commonly kind
@@ -98,7 +107,7 @@ func ProbeFile(ctx context.Context, cli, path string) (*Probe, error) {
 
 	if probeErr != nil {
 		if probeErr.Kind == "cancelled" {
-			return nil, ErrProbeCancelled
+			return nil, ErrCancelled
 		}
 		return nil, &ProbeFailure{Kind: probeErr.Kind, Message: probeErr.Message}
 	}
@@ -108,7 +117,7 @@ func ProbeFile(ctx context.Context, cli, path string) (*Probe, error) {
 	// version — is the startup race documented in the README: a cancel
 	// landing before the CLI's own handler is armed.
 	if seen == 0 && signalled(runErr) {
-		return nil, ErrProbeCancelled
+		return nil, ErrCancelled
 	}
 
 	if runErr != nil {
@@ -137,18 +146,48 @@ func signalled(err error) bool {
 // by buildRunArgs; -events json is always added on top of what's here so
 // the run has a stream to decode in the first place.
 //
-// Track's zero value is not treated as "unset": the CLI's own -track default
-// is -1 (auto), so RunOptions follows the same convention — a caller that
-// wants auto-selection sets Track: -1, exactly as it would type -track -1
-// on the CLI's own command line. Mode, Out and Source are only added to the
+// Track and Atrack are two different flags on two different streams, and
+// that distinction is why Atrack exists at all. The CLI's -track is the
+// *subtitle* stream index (`flag.Int("track", -1, "subtitle stream index")`)
+// and -atrack is the audio one. Until Atrack was added, the window sent the
+// audio index the user picked from the track list as -track — a flag the
+// audio path never reads — so the CLI fell back to pickAudioStream and
+// transcribed whatever it chose. Picking "#3 eng" and getting the Russian
+// dub is a defect with no error message attached to it.
+//
+// Neither field's zero value means "unset": both of the CLI's own defaults
+// are -1 (auto), so RunOptions follows the same convention — a caller that
+// wants auto-selection sets -1, exactly as it would type -track -1 on the
+// CLI's own command line. Use trackIndices to turn the one track the File
+// screen chose into the pair. Mode, Out and Source are only added to the
 // argv when non-empty, so leaving them blank keeps the CLI's own defaults
 // ("srt", unset, "auto") rather than sending it an empty string it would
 // have to reject.
 type RunOptions struct {
 	Input, To, From, Mode, Out string
 	Track                      int
+	Atrack                     int
 	Source                     string
 	Fast                       bool
+}
+
+// trackIndices maps the single track the File screen chose onto the two
+// flags the CLI has for it: -track for a subtitle stream, -atrack for an
+// audio one. The other flag is left at the CLI's own auto sentinel, because
+// the run does not use it — an audio-source run never reads -track, and a
+// subtitle-source run never reads -atrack.
+//
+// Source "" or "auto" leaves both on auto: there is no chosen stream to
+// place, and guessing which list an index came from is exactly the mistake
+// this function exists to stop being possible.
+func trackIndices(source string, chosen int) (track, atrack int) {
+	switch source {
+	case "audio":
+		return -1, chosen
+	case "sub":
+		return chosen, -1
+	}
+	return -1, -1
 }
 
 // Outcome summarizes how a completed run ended. The CLI guarantees exactly
@@ -208,7 +247,12 @@ func buildRunArgs(o RunOptions) []string {
 	if o.Source != "" {
 		args = append(args, "-source", o.Source)
 	}
+	// Both are always sent, both always explicit. -1 is the CLI's own default
+	// for each, so sending it changes nothing, and sending both unconditionally
+	// means there is no argv shape where one of the two silently goes missing
+	// — which is precisely how -atrack came to be absent in the first place.
 	args = append(args, "-track", strconv.Itoa(o.Track))
+	args = append(args, "-atrack", strconv.Itoa(o.Atrack))
 	if o.Fast {
 		args = append(args, "-fast")
 	}
@@ -325,11 +369,11 @@ func buildOutcome(cliPath string, decodeErr, waitErr error, state *os.ProcessSta
 	// in the few milliseconds before the CLI arms its signal handler kills
 	// it with nothing on the stream at all — not even version. That is the
 	// GUI's Cancel button clicked the instant a run starts, not the stream
-	// breaking its own protocol, so it must route to ErrProbeCancelled
+	// breaking its own protocol, so it must route to ErrCancelled
 	// exactly as ProbeFile's identical case does, before the generic
 	// exit-code bookkeeping below ever sees the signalled exit's -1.
 	if doneEv == nil && errEv == nil && seen == 0 && signalled(waitErr) {
-		return nil, ErrProbeCancelled
+		return nil, ErrCancelled
 	}
 
 	var exitCode int
@@ -400,10 +444,41 @@ func (r *Run) Wait() (*Outcome, error) {
 // would hand control back to the caller — free to quit the app — while
 // that cleanup is still in flight, orphaning whatever the CLI's own
 // children were doing.
+//
+// # The error contract
+//
+// A non-nil return means the cancel itself could not be carried out, or the
+// run's stream could not be turned into an outcome. It never means "the run
+// ended because you cancelled it" — which is what the two cases below used
+// to make it mean, and the Cancel button is the consumer that could not live
+// with either.
+//
+//   - A cancel landing in the startup race, before the CLI arms its handler,
+//     makes Wait return ErrCancelled. That is the cancel working exactly as
+//     asked, so Cancel reports nil and leaves the sentinel for Wait, whose
+//     job is to say how the run ended. Surfacing it here put an error dialog
+//     on screen for a successful cancel.
+//   - Cancel called on a run that already finished naturally — the user
+//     pressing the button in the moment between the last event and the
+//     screen redrawing — used to return "os: process already finished",
+//     which is os.ErrProcessDone from signalling a reaped process. That is
+//     not a failure of anything: there was simply nothing left to cancel, and
+//     reporting it hid the run's real ending behind a signalling complaint.
+//     Cancel now waits and reports the run's own outcome error instead, which
+//     for a successful run is nil.
+//
+// So: nil covers every ending the run can reach, cancelled or not. What is
+// left over — a signal that could not be delivered for any other reason, a
+// stream that broke the CLI's own guarantees, a process that could not be
+// waited on — is what a caller should actually show, and Wait returns the
+// same thing for a caller that only wants the ending.
 func (r *Run) Cancel() error {
-	if err := r.cmd.Process.Signal(os.Interrupt); err != nil {
+	if err := r.cmd.Process.Signal(os.Interrupt); err != nil && !errors.Is(err, os.ErrProcessDone) {
 		return fmt.Errorf("run: signalling %s: %w", r.cmd.Path, err)
 	}
 	<-r.done
+	if errors.Is(r.err, ErrCancelled) {
+		return nil
+	}
 	return r.err
 }
