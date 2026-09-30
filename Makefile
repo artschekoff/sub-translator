@@ -4,7 +4,7 @@ BIN_DIR  := bin
 DIST_DIR := $(BIN_DIR)/dist
 LDFLAGS   = -ldflags "-X main.version=$(VERSION)"
 
-.PHONY: build build-all pack test fmt vet tidy validate clean install release gui
+.PHONY: build build-all pack test fmt vet tidy validate clean install release gui dmg
 
 build:
 	go build $(LDFLAGS) -o $(BIN_DIR)/$(BINARY) .
@@ -46,6 +46,15 @@ install: build
 
 gui:
 	cd gui && wails build
+
+# Unsigned on purpose: no Developer ID, no notarisation. A first run needs
+# right-click → Open, or `xattr -d com.apple.quarantine`, which the README says.
+dmg: build gui
+	rm -rf $(BIN_DIR)/dmg && mkdir -p $(BIN_DIR)/dmg $(DIST_DIR)
+	cp -R gui/build/bin/$(BINARY).app $(BIN_DIR)/dmg/
+	cp $(BIN_DIR)/$(BINARY) $(BIN_DIR)/dmg/$(BINARY).app/Contents/MacOS/
+	hdiutil create -volname $(BINARY) -srcfolder $(BIN_DIR)/dmg \
+		-ov -format UDZO $(DIST_DIR)/$(BINARY).dmg
 
 release:
 	@set -e; \

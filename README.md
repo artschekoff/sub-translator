@@ -504,9 +504,23 @@ internal/models/      ggml model catalog, search directories, discovery, downloa
 | `make tidy`      | `go mod tidy` |
 | `make validate`  | `fmt` + `vet` + `test` |
 | `make clean`     | Remove `./bin` |
+| `make gui`       | Build the desktop window with `wails build` (macOS only; needs the [Wails v2 CLI](https://wails.io)) |
+| `make dmg`       | `build` + `gui`, then pack both into `./bin/dist/sub-translator.dmg` (macOS only) |
 | `make release`   | Interactive version bump → tag → push → pack → GitHub release |
 
 `make release` reads the latest tag, prompts for a `major`/`minor`/`patch` bump (default `patch`), tags and pushes the new version, packs the cross-compiled archives, and publishes them with `gh release create --generate-notes`. It needs the [`gh` CLI](https://cli.github.com/) authenticated against this repo.
+
+### Desktop app
+
+`make gui` builds `gui/build/bin/sub-translator.app` — a small window over the same CLI, with a drop target for the film and a Settings screen for the config file. `make dmg` builds the CLI too and copies it inside the `.app` bundle (`Contents/MacOS/sub-translator`, beside the window's own binary), so the mounted disk image is self-contained: no separate CLI install is needed, and it takes priority over any `sub-translator` already on `$PATH`. The result lands at `bin/dist/sub-translator.dmg`.
+
+The DMG is unsigned — there is no Apple Developer ID behind it, and it is not notarised. macOS Gatekeeper will refuse to open it with a plain double-click the first time. Either:
+
+```bash
+xattr -d com.apple.quarantine /Applications/sub-translator.app   # after copying it there
+```
+
+or right-click (or Control-click) the app in Finder and choose **Open**, then confirm in the dialog that appears — that one-time step is only needed once per machine.
 
 ## License
 

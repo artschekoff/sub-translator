@@ -256,11 +256,11 @@ Closing the window while work is running asks first — "transcription is at 34%
 
 ## Packaging
 
-`make gui` builds the `.app` with `wails build`. `make dmg` packs it with `hdiutil` into `bin/dist/sub-translator-<version>.dmg`, containing the bundle and a symlink to `/Applications`, with the CLI binary placed inside `Contents/MacOS/` so the GUI finds it first.
+`make gui` builds `gui/build/bin/sub-translator.app` with `wails build`. `make dmg` builds the CLI and the `.app`, copies the CLI binary inside `Contents/MacOS/` (beside the window's own `sub-translator-gui` executable, so `LocateCLI`'s first branch finds it before it ever checks `$PATH`), and packs the bundle with `hdiutil` into `bin/dist/sub-translator.dmg`. The disk image holds only the `.app` — no version in the filename and no symlink to `/Applications`; dragging the app out of the mounted volume is enough, since it carries its own CLI.
 
 Both are macOS-only targets and neither is part of `make validate` or `make build-all`, which must keep working on a machine with no Wails and no cgo.
 
-The DMG is unsigned. macOS will say the developer cannot be verified; the README explains the right-click-Open path and that signing needs an Apple Developer account. Adding signing later is a change to one target, not to the design.
+The DMG is unsigned. macOS will say the developer cannot be verified; the README explains the right-click-Open path (and the `xattr -d com.apple.quarantine` alternative) and that signing needs an Apple Developer account. Adding signing later is a change to one target, not to the design.
 
 ## Testing
 
