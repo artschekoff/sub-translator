@@ -359,6 +359,87 @@ func TestRunProgressiveEndToEnd(t *testing.T) {
 	}
 }
 
+// TestRunProgressiveTranslatesEveryBlock tests that even when the model fails
+// on the initial batch request but succeeds on individual retries, no block
+// is left in the source language. A previous bug left failed blocks as the
+// source text because the fallback retry wrote the source string back into
+// results.
+func TestRunProgressiveTranslatesEveryBlock(t *testing.T) {
+	dir, binDir, tmpDir, _ := progressiveStubs(t, dialogueSRT)
+
+	input := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(input, []byte("not really a film"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	outPath := media.DefaultSRTPath(input, "es")
+
+	// Build a server that fails the first multi-block request, so the
+	// translator must fall back to per-block retries.
+	var mu sync.Mutex
+	attempts := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Messages []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var user string
+		for _, m := range req.Messages {
+			if m.Role == "user" {
+				user = m.Content
+			}
+		}
+		var payload struct {
+			Translate map[string]string `json:"translate"`
+		}
+		if err := json.Unmarshal([]byte(user), &payload); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		attempts++
+		mu.Unlock()
+		if len(payload.Translate) > 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		out := make(map[string]string, len(payload.Translate))
+		for k, v := range payload.Translate {
+			out[k] = "ES:" + v
+		}
+		content, _ := json.Marshal(out)
+		fmt.Fprintf(w, `{"choices":[{"message":{"role":"assistant","content":%q}}]}`, content)
+	}))
+	t.Cleanup(srv.Close)
+
+	streams := []media.Stream{{Index: 0, CodecType: "video"}, {Index: 1, CodecType: "audio"}}
+	streams[1].Tags.Language = "eng"
+	opts := whisper.Options{
+		Bin:   filepath.Join(binDir, "stub-whisper"),
+		Model: filepath.Join(dir, "ggml-test.bin"),
+	}
+
+	if err := runProgressive(input, tmpDir, streams, -1, "en", "es",
+		10*time.Minute, opts, translate.Options{APIKey: "sk-test", Model: translate.DefaultModel, BaseURL: srv.URL}, ""); err != nil {
+		t.Fatalf("runProgressive() = %v, want success", err)
+	}
+
+	blocks, err := srt.Parse(outPath)
+	if err != nil {
+		t.Fatalf("parse %s: %v", outPath, err)
+	}
+	for _, b := range blocks {
+		if !strings.HasPrefix(strings.TrimSpace(b.Text), "ES:") {
+			t.Errorf("block %s still contains source text: %q", b.Index, b.Text)
+		}
+	}
+}
+
 // A silent opening must not cost the user the whole film. Ten minutes with no
 // speech in them is ordinary — an overture, a title sequence, a commentary track
 // that starts quiet — and before this branch the fast path transcribed such a

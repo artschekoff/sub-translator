@@ -98,25 +98,36 @@ func DefaultDir() (string, error) {
 
 // SearchDirs lists the directories scanned for an already-present model, in
 // precedence order. Directories that do not exist are harmless: Discover skips
-// them.
+// them. A configured directory that coincides with one of the fallbacks is only
+// listed once.
 func SearchDirs(configuredDir string) []string {
 	var dirs []string
 	if strings.TrimSpace(configuredDir) != "" {
 		dirs = append(dirs, configuredDir)
 	}
-	if own, err := DefaultDir(); err == nil {
+	if own, err := DefaultDir(); err == nil && own != configuredDir {
 		dirs = append(dirs, own)
 	}
 	if home, err := os.UserHomeDir(); err == nil {
 		if runtime.GOOS == "darwin" {
 			// Slaive is a macOS whisper.cpp front-end. Reading its models saves
 			// re-downloading well over a gigabyte.
-			dirs = append(dirs, filepath.Join(home,
-				"Library", "Application Support", "net.slaive.app", "models"))
+			slaive := filepath.Join(home,
+				"Library", "Application Support", "net.slaive.app", "models")
+			if slaive != configuredDir {
+				dirs = append(dirs, slaive)
+			}
 		}
-		dirs = append(dirs, filepath.Join(home, ".cache", "whisper.cpp"))
+		cache := filepath.Join(home, ".cache", "whisper.cpp")
+		if cache != configuredDir {
+			dirs = append(dirs, cache)
+		}
 	}
-	return append(dirs, "models")
+	rel := "models"
+	if rel != configuredDir {
+		dirs = append(dirs, rel)
+	}
+	return dirs
 }
 
 // IsVADFile reports whether a ggml file is a voice-activity-detection model.

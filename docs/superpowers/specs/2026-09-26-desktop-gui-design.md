@@ -12,7 +12,7 @@ A desktop window for people who do not want a terminal. Drag a film onto it, see
 - Replacing the CLI. It stays the primary interface and keeps working unchanged.
 - Batch processing, a queue, or a library view. One film at a time.
 - Editing subtitles after they are produced.
-- Code signing and notarization. The DMG ships unsigned; the README explains the Gatekeeper prompt.
+- Code signing and notarization. The app carries only the ad-hoc signature `wails build` gives it, with no Developer ID behind it; the README explains the Gatekeeper prompt. See Packaging for why the ad-hoc signature still has to be reapplied after the bundle is assembled.
 - A settings UI for anything the CLI cannot already configure.
 
 ## Context
@@ -111,7 +111,9 @@ With `-events json` it emits JSON; without it, the human-readable track listing 
 
 **`-probe`, `-version`, `-h` and the subcommands carry no terminal event when they succeed.** None of them is a run: each emits `version` (and `-probe` its `probe`), exits 0, and emits no `done` and no `error`. A decoder shared between the probe call, a settings read and the run call must not wait for one. Two things end them with an `error` instead, and both are failures rather than endings: `-probe` on a file ffprobe cannot read emits `error{probe_failed}` and exits 1, and a cancel reaching `-probe`, `-version` or `-h` emits `error{cancelled}` and exits 130 like any other cancel, because the handler is armed above all three. The subcommands are dispatched before it is armed and are unaffected.
 
-`-events json` composes with the `config` and `model` subcommands rather than being refused by them, so a wrapper can append the flag to every invocation uniformly: the flag is taken out of the arguments the subcommand itself counts, the subcommand's own plain-text output on stdout is unchanged, and the stream carries the `version` event alone. The Settings screen still reads and writes through them as text.
+`-events json` composes with the `config` and `model` subcommands rather than being refused by them, so a wrapper can append the flag to every invocation uniformly: where the flag sits inside or after the subcommand it is taken out of the arguments the subcommand itself counts, the subcommand's own plain-text output on stdout is unchanged, and the stream carries the `version` event alone. The Settings screen still reads and writes through them as text.
+
+**"Append" is literal, and the position matters.** `sub-translator config get translate.model -events json` works, and so does `sub-translator config -events json get translate.model`. What does *not* work is putting the flag before the subcommand: `sub-translator -events json config list` is parsed as an ordinary run whose input path is `config`, and it emits `version` then `error{probe_failed}` with "input file not found: config" and exits 1. That follows from where the flag is honoured — `flag.Parse`'s own rules, which stop at the first positional argument — so a wrapper that wants one uniform argv must append the flag rather than prefix it. Nothing depends on this today: the Settings screen never sends `-events json` to a subcommand at all.
 
 ### Typed errors
 
@@ -184,9 +186,13 @@ Failing all three, the GUI opens on its settings screen saying it cannot find th
 
 **Drop.** An empty window inviting a film, with a "Choose…" button opening the native dialog for anyone who prefers it. `runtime.OnFileDrop` supplies absolute paths; a drop of more than one file takes the first and says so.
 
-**File.** Filename and duration, the audio tracks and subtitle tracks as radio lists (index, language, title), a target-language picker, output mode (sidecar `.srt` / embed in a new container / both) with a save path, and a "fast mode" checkbox. Start is disabled until a track and a language are chosen.
+**File.** Filename and duration, the audio tracks and subtitle tracks as radio lists (index, language, title), a source-language picker shown when the chosen track is a subtitle track, a target-language picker, output mode (sidecar `.srt` / embed in a new container / both) with a save path, and a "fast mode" checkbox. Start is disabled until a track and a target language are chosen — and, when the source-language picker is showing, until it has a value too.
+
+The source-language picker was missing from the first version of this paragraph, and without it the screen could only compose runs that fail. `-source sub` requires `-from`: `runOrdinary` reaches `if from == "" && source == sourceSub { from = promptLang("Source") }`, and `promptLang` reads stdin, which under this window is a pipe rather than a terminal — so an empty `-from` ends the run with "no source language given" and a Retry button that can never succeed. Note what that code does *not* do: it never reads the chosen track's `lang` tag, so `-from` is required for **every** subtitle-source run and not only for untagged tracks. The tag is what the picker is prefilled with, not a substitute for it; an untagged track — common in the wild, as the CLI's own track listing says by marking them — prefills nothing and leaves Start disabled until someone chooses. Transcription needs no source language at all, because whisper detects it, so the picker is hidden for an audio track rather than shown empty.
 
 Subtitle tracks and audio tracks are one choice, not two: picking an audio track means transcription, picking a subtitle track means translating what is already there. When the file has no subtitle tracks the section says so rather than showing an empty box, because that is the case the whole transcription feature exists for.
+
+The output-mode control offers `embed` and `both` only when `probe.embeds_subtitles` is `true`. It is a three-state field and the window keeps all three apart: `false` is the AVI case and says the container cannot hold an embedded track; **`nil` means nobody said** — an older CLI whose probe event never carried the field — and says that instead, because reporting a missing answer as a refusal would blame the file for the tool, and treating it as `true` would offer a multi-gigabyte container rewrite on a guess. Both withheld cases still offer the sidecar `.srt`, which is the CLI's own default and the only mode that works on every container.
 
 Fast mode is disabled unless the source is an audio track and the output is a sidecar `.srt`, with a line saying why rather than a dead control. The window reads that condition off the `probe` event's `fast` object rather than holding its own copy of the rule.
 
@@ -209,6 +215,8 @@ Minimal, flat, and translucent — the window borrows the desktop behind it rath
 **Type carries the hierarchy.** The system stack — `-apple-system` on macOS, `Segoe UI Variable` on Windows — so the window looks native and nothing is downloaded. Three sizes only: 13px for body and controls, 11px for secondary labels and hints, 20px semibold for the film's title. Numbers that change during a run (percentages, timecodes) use `font-variant-numeric: tabular-nums` so the layout does not jitter as they tick.
 
 **One accent colour**, taken from the OS where it is available (`AccentColor` / `-apple-system-blue`) so it matches whatever the user chose in their system settings. It appears on exactly three things: the selected radio, the progress fill, and the primary button. Nothing else is coloured except errors, which are the system red, and the "you can start watching" line, which is the system green.
+
+One exception, added during implementation: the **keyboard focus ring** is the accent too. It is an accessibility affordance rather than decoration, and an uncoloured focus ring makes the window harder to use with a keyboard — which is not what the rule above is protecting. Everything else stayed out: the drag-over highlight on the Drop screen is drawn by changing the existing hairline from dashed to solid rather than by tinting it, and `accent-color` is scoped to the radio rather than set on `body`, where it would also tint the fast-mode checkbox. A native checkbox still draws in the platform's own accent when it is checked; that is the platform rendering its own control, not the window colouring a fourth thing.
 
 **Dark and light follow the OS**, through `prefers-color-scheme` and `mac.Appearance` — no in-app theme switch. Everything is expressed as CSS custom properties on `:root` and redefined once under the dark media query, so the two themes cannot drift apart.
 
@@ -250,11 +258,13 @@ Closing the window while work is running asks first — "transcription is at 34%
 
 ## Packaging
 
-`make gui` builds the `.app` with `wails build`. `make dmg` packs it with `hdiutil` into `bin/dist/sub-translator-<version>.dmg`, containing the bundle and a symlink to `/Applications`, with the CLI binary placed inside `Contents/MacOS/` so the GUI finds it first.
+`make gui` builds `gui/build/bin/sub-translator.app` with `wails build`. `make dmg` builds the CLI and the `.app`, copies the CLI binary inside `Contents/MacOS/` (beside the window's own `sub-translator-gui` executable, so `LocateCLI`'s first branch finds it before it ever checks `$PATH`), re-signs the bundle ad-hoc, and packs it with `hdiutil` into `bin/dist/sub-translator.dmg`. The disk image holds only the `.app` — no version in the filename and no symlink to `/Applications`; dragging the app out of the mounted volume is enough, since it carries its own CLI.
 
-Both are macOS-only targets and neither is part of `make validate` or `make build-all`, which must keep working on a machine with no Wails and no cgo.
+**The re-sign is not optional, and the reason is the copy.** `wails build` ad-hoc self-signs the `.app`, which seals its resources; adding a file inside `Contents/MacOS/` after that breaks the seal. A broken seal is a different Gatekeeper outcome from an unsigned app, not a milder one: `codesign -v` and `spctl -a -t exec` both report "a sealed resource is missing or invalid" and exit 1, macOS calls the app damaged, and right-click → Open offers no override — only removing the quarantine attribute clears it. So `make dmg` runs `codesign --force --deep --sign -` over the bundle after the copy, which returns `codesign -v` to *valid on disk / satisfies its Designated Requirement* and `spctl` to a plain `rejected` with exit 3 — the unidentified-developer case below. Any future change that puts a file into the bundle belongs before that step.
 
-The DMG is unsigned. macOS will say the developer cannot be verified; the README explains the right-click-Open path and that signing needs an Apple Developer account. Adding signing later is a change to one target, not to the design.
+Both are macOS-only targets and neither is part of `make validate` or `make build-all`, which must keep working on a machine with no Wails and no cgo. The gui module's own suite therefore has its own target, `make validate-gui`.
+
+The DMG carries no Developer ID and is not notarised. macOS will say the developer cannot be verified; the README explains the right-click-Open path (and the `xattr -d com.apple.quarantine` alternative) and that real signing needs an Apple Developer account. Adding that signing later is a change to one target, not to the design — it replaces the ad-hoc identity above with a real one.
 
 ## Testing
 

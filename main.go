@@ -755,14 +755,23 @@ func classifyTranslateErr(err error) errKind {
 // language actually used. Both the whole-file path and the chunked path go
 // through here, so the rule about what whisper is told to hear lives in exactly
 // one place.
-func transcribeInto(opts whisper.Options, audio, outBase, lang string) ([]srt.Block, string, error) {
+//
+// base is the index the first block of this file will have in the whole run:
+// every line whisper hears is sent as a caption under that numbering, so the Run
+// screen can show what is being heard while it is heard, and the translation
+// that arrives for the same line later lands on the same entry.
+func transcribeInto(opts whisper.Options, audio, outBase, lang string, base int) ([]srt.Block, string, error) {
 	opts.Audio = audio
 	opts.OutBase = outBase
 	opts.Language = lang
 
+	heard := 0
 	result, err := whisper.Run(opts, func(pct int) {
 		fmt.Printf("\r  progress: %d%%   ", pct)
 		ev.Emit(&events.Progress{Pct: pct})
+	}, func(text string) {
+		ev.Emit(&events.Caption{Index: base + heard, Source: text})
+		heard++
 	})
 	fmt.Println()
 	if err != nil {
@@ -822,7 +831,7 @@ func transcribe(input, tmpDir string, streams []media.Stream, atrack int, from s
 		fmt.Printf("  VAD: %s\n", filepath.Base(opts.VADModel))
 	}
 	return transcribeInto(opts, wav, filepath.Join(tmpDir, "transcript"),
-		resolveChunkLanguage(from, picked, opts.Language))
+		resolveChunkLanguage(from, picked, opts.Language), 0)
 }
 
 // progressLine is the ordinary run's printed translation progress, exactly as

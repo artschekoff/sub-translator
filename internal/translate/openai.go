@@ -74,8 +74,14 @@ type chatMessage struct {
 // batchPayload is what the model is asked to work on. The field names carry the
 // instruction: whatever else a model ignores, it is being handed an object whose
 // context field says in its own name that it is not to be translated.
+//
+// The context field is sent even when it is empty, which is the first batch of
+// every -fast chunk. Without it the payload is {"translate": {...}} alone, and
+// gpt-4o-mini answers that shape far worse: measured against a real film, it
+// nested its reply under "translate" or merged lines in four of six tries, and
+// in one of six with an empty array in place.
 type batchPayload struct {
-	ContextDoNotTranslate []string          `json:"context_previous_lines_do_not_translate,omitempty"`
+	ContextDoNotTranslate []string          `json:"context_previous_lines_do_not_translate"`
 	Translate             map[string]string `json:"translate"`
 }
 
@@ -108,7 +114,8 @@ func (c *openAIClient) batch(texts, before []string) ([]string, error) {
 		Messages: []chatMessage{
 			{Role: "system", Content: c.systemPrompt()},
 			{Role: "user", Content: mustJSON(batchPayload{
-				ContextDoNotTranslate: before,
+				// [] rather than null: an empty context is still a context field.
+				ContextDoNotTranslate: append([]string{}, before...),
 				Translate:             src,
 			})},
 		},
@@ -235,11 +242,83 @@ func decodeObject(content string) (map[string]string, error) {
 	// stops at the end of the first complete value, so trailing prose — including
 	// prose with a {brace} in it — does not turn a usable reply into a 40-request
 	// fan-out.
-	var got map[string]string
+	var got map[string]json.RawMessage
 	if err := json.NewDecoder(strings.NewReader(s[start:])).Decode(&got); err != nil {
 		return nil, fmt.Errorf("parse the model's reply (%s): %w", excerpt(s), err)
 	}
-	return got, nil
+	got = unwrapReply(got)
+	out := make(map[string]string, len(got))
+	for k, raw := range got {
+		var str string
+		if err := json.Unmarshal(raw, &str); err == nil {
+			out[k] = str
+			continue
+		}
+		// Some models return objects per line. If the object carries a known
+		// translation field, extract that; otherwise keep a JSON representation
+		// so the caller can at least inspect what the model returned.
+		var obj map[string]any
+		if err := json.Unmarshal(raw, &obj); err != nil {
+			return nil, fmt.Errorf("parse value for key %q: %w", k, err)
+		}
+		if translation, ok := extractTranslation(obj); ok {
+			out[k] = translation
+			continue
+		}
+		b, _ := json.Marshal(obj)
+		out[k] = string(b)
+	}
+	return out, nil
+}
+
+// replyWrappers are the keys a model nests its whole answer under when it
+// mirrors the request instead of answering it flat. "translate" is the one seen
+// in practice: a batch with no context lines is the object {"translate": {...}}
+// and nothing else, and gpt-4o-mini answers it as {"translate": {"0": ...}} —
+// which, read flat, is one translation for forty blocks. The first batch of
+// every -fast chunk has no context, so every chunk opened untranslated.
+var replyWrappers = []string{"translate", "translations", "translation"}
+
+// unwrapReply returns the object a model nested its answer in, when the reply is
+// a single wrapper key holding an object; any other reply is returned as is. A
+// single block's {"0": {"translation": "..."}} is not a wrapper — its one key
+// is the block's — and extractTranslation deals with that one.
+func unwrapReply(got map[string]json.RawMessage) map[string]json.RawMessage {
+	if len(got) != 1 {
+		return got
+	}
+	for _, k := range replyWrappers {
+		raw, ok := got[k]
+		if !ok {
+			continue
+		}
+		var inner map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &inner); err != nil || len(inner) == 0 {
+			return got
+		}
+		return inner
+	}
+	return got
+}
+
+// extractTranslation pulls a usable translation out of object-valued replies
+// such as {"translation":"..."} or {"text":"..."}.
+func extractTranslation(obj map[string]any) (string, bool) {
+	for _, key := range []string{"translation", "translatedText", "text", "result"} {
+		v, ok := obj[key]
+		if !ok {
+			continue
+		}
+		s, ok := v.(string)
+		if !ok {
+			continue
+		}
+		s = strings.TrimSpace(s)
+		if s != "" {
+			return s, true
+		}
+	}
+	return "", false
 }
 
 // excerpt trims a model's reply down to something that belongs in an error

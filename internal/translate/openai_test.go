@@ -3,6 +3,7 @@ package translate
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -36,6 +37,18 @@ func (c capturedRequest) payload(t *testing.T) batchPayload {
 	}
 	t.Fatal("no user message in the request")
 	return batchPayload{}
+}
+
+// user returns the user message exactly as it was sent.
+func (c capturedRequest) user(t *testing.T) string {
+	t.Helper()
+	for _, m := range c.Message {
+		if m.Role == "user" {
+			return m.Content
+		}
+	}
+	t.Fatal("no user message in the request")
+	return ""
 }
 
 func (c capturedRequest) system(t *testing.T) string {
@@ -150,6 +163,11 @@ func TestOpenAIRequestShape(t *testing.T) {
 	}
 	if len(first.ContextDoNotTranslate) != 0 {
 		t.Errorf("the first batch has nothing before it, got context %v", first.ContextDoNotTranslate)
+	}
+	// But the field is still there, as []: a payload of "translate" alone is
+	// what the model mirrors back nested, or answers with lines merged.
+	if user := reqs[0].user(t); !strings.Contains(user, `"context_previous_lines_do_not_translate":[]`) {
+		t.Errorf("the first batch must carry an empty context field, got %s", user)
 	}
 
 	// The second batch carries the three lines already seen, in a separate field
@@ -454,24 +472,56 @@ func TestDecodeObjectToleratesWrapping(t *testing.T) {
 		want          map[string]string
 	}{
 		{"plain", `{"0":"uno"}`, map[string]string{"0": "uno"}},
+		{"object values", `{"0":{"translation":"O, Боже мой."}}`, map[string]string{"0": "O, Боже мой."}},
 		{"fenced", "```json\n{\"0\":\"uno\"}\n```", map[string]string{"0": "uno"}},
 		{"prefaced", "Here you go:\n{\"0\":\"uno\"}\n", map[string]string{"0": "uno"}},
 		// A brace in the trailing prose used to be swallowed by the search for the
 		// last one, turning a perfectly usable reply into a 40-request fan-out.
 		{"trailing prose with a brace", `{"0":"uno"} (tell me if {anything} looks off)`, map[string]string{"0": "uno"}},
+		// The request mirrored back: what gpt-4o-mini answers a batch that has no
+		// context lines, which is the first batch of every -fast chunk.
+		{"mirrored request", `{"translate":{"0":"uno","1":"dos"}}`, map[string]string{"0": "uno", "1": "dos"}},
 	} {
 		got, err := decodeObject(tt.content)
 		if err != nil {
 			t.Errorf("%s: %v", tt.name, err)
 			continue
 		}
-		if len(got) != len(tt.want) || got["0"] != tt.want["0"] {
+		if !maps.Equal(got, tt.want) {
 			t.Errorf("%s: got %v, want %v", tt.name, got, tt.want)
 		}
 	}
 	for _, bad := range []string{"", "no object here", `{"0":`, `{"0":[1,2]}`} {
 		if _, err := decodeObject(bad); err == nil {
 			t.Errorf("decodeObject(%q): want an error", bad)
+		}
+	}
+}
+
+// The first batch of a chunk goes out with no context lines, and that payload —
+// {"translate": {...}} alone — is what a model mirrors back nested under the
+// same key. Read flat it is one translation for forty blocks, the per-block
+// fallback gets the same shape back, and the opening forty lines of every -fast
+// chunk stayed in the source language.
+func TestTranslateAllAcceptsAReplyNestedUnderTranslate(t *testing.T) {
+	c, _ := openAIFor(t, func(w http.ResponseWriter, got capturedRequest) {
+		p, _ := batchOf(got)
+		out := make(map[string]string, len(p.Translate))
+		for k, v := range p.Translate {
+			out[k] = "ES:" + v
+		}
+		inner, _ := json.Marshal(out)
+		reply(w, `{"translate":`+string(inner)+`}`)
+	})
+
+	texts := lines(5)
+	got, failed, err := c.TranslateAll(texts, nil)
+	if err != nil || len(failed) != 0 {
+		t.Fatalf("TranslateAll() failed = %v, err = %v; want every block translated", failed, err)
+	}
+	for i, s := range got {
+		if s != "ES:"+texts[i] {
+			t.Errorf("block %d = %q, want it translated", i, s)
 		}
 	}
 }

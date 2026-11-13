@@ -1,0 +1,264 @@
+<!doctype html>
+<!--
+  One window, one card, five contents. The card never changes size and the
+  window never changes size with it: Drop, Busy, File, Run and Settings are all
+  children of the same #card element so the surface stays put between them.
+
+  There is no separate setup screen. Task 7 added one for the case where the
+  CLI cannot be found, but the spec says that case "opens on its settings
+  screen ... with a file picker — the same treatment as a missing key, and for
+  the same reason: it is a setup step, not a run failure", and a missing key
+  lands on Settings. Two screens for one idea meant the window and its spec
+  disagreed, and it also meant the place that says "I cannot find the tool" was
+  not the place that lets you set where the tool is for good. So the CLI path
+  lives on the Settings screen above its divider, labelled as the one setting
+  this window keeps for itself, and a launch that found no CLI opens there.
+
+  Everything textual lives inside the card, which carries the scrim. The blur
+  shows in the gutter around it and in the strip under the title bar — that is
+  where glass reads as glass — and never behind a paragraph, which is what the
+  7:1 contrast constraint needs.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SubTranslator</title>
+    <link rel="stylesheet" href="app.css" />
+  </head>
+  <body>
+    <main id="shell">
+      <section class="card" id="card">
+        <!-- Wizard: launch-time dependency and permission diagnostics. -->
+        <div class="screen" id="screen-wizard" hidden>
+          <header class="filehead">
+            <h1 class="title">Getting ready</h1>
+            <p class="hint">A few things need to be in place before SubTranslator can work.</p>
+          </header>
+          <div class="wizard-list" id="wizard-list"></div>
+          <div class="wizard-log" id="wizard-log" hidden>
+            <pre class="wizard-pre" id="wizard-pre"></pre>
+          </div>
+          <footer class="bar">
+            <button class="btn" id="wizard-recheck">Recheck</button>
+            <span class="spacer"></span>
+            <button class="btn primary" id="wizard-continue" hidden>Continue</button>
+          </footer>
+        </div>
+
+        <!-- Drop: the empty window inviting a film. -->
+        <div class="screen centred" id="screen-drop" hidden>
+          <div class="dropzone" id="dropzone">
+            <h1 class="title">Drop a film here</h1>
+            <p class="body">MKV, MP4, MOV, AVI and anything else ffprobe reads.</p>
+            <p><button class="btn" id="drop-choose">Choose…</button></p>
+          </div>
+          <p class="hint" id="drop-note" hidden></p>
+          <p><button class="btn" id="drop-settings">Settings</button></p>
+        </div>
+
+        <!-- Busy: the probe takes a moment on a feature film. -->
+        <div class="screen centred" id="screen-busy" hidden>
+          <p class="body" id="busy-message">Reading the file…</p>
+        </div>
+
+        <!-- File: the whole choice, in the order the run needs it. -->
+        <div class="screen" id="screen-file" hidden>
+          <header class="filehead">
+            <h1 class="title" id="film-name"></h1>
+            <p class="hint tnum" id="film-meta"></p>
+          </header>
+
+          <div class="rows" id="tracks">
+            <p class="label">Track</p>
+            <div id="audio-tracks"></div>
+            <p class="hint" id="subs-none" hidden>No subtitle tracks in this file.</p>
+            <div id="subtitle-tracks"></div>
+          </div>
+
+          <div class="form">
+            <div class="line">
+              <div class="field" id="from-field" hidden>
+                <label class="label" for="from">Subtitles are in</label>
+                <input
+                  class="control narrow"
+                  id="from"
+                  list="langs"
+                  autocomplete="off"
+                  spellcheck="false"
+                  placeholder="e.g. en"
+                />
+              </div>
+
+              <div class="field">
+                <label class="label" for="to">Translate into</label>
+                <input
+                  class="control narrow"
+                  id="to"
+                  list="langs"
+                  autocomplete="off"
+                  spellcheck="false"
+                  placeholder="e.g. es"
+                />
+              </div>
+
+            </div>
+
+            <div class="field">
+              <label class="label" for="mode">Output</label>
+              <select class="control" id="mode"></select>
+            </div>
+            <p class="hint" id="modes-note" hidden></p>
+
+            <div class="line">
+              <div class="field grow">
+                <p class="label">Save to</p>
+                <p class="body clip" id="out-path">Beside the film, named by sub-translator</p>
+              </div>
+              <button class="btn" id="out-choose">Change…</button>
+              <button class="btn" id="out-reset" hidden>Reset</button>
+            </div>
+
+            <div>
+              <label class="check">
+                <input type="checkbox" id="fast" />
+                <span id="fast-label">Fast mode — start watching within a minute</span>
+              </label>
+              <p class="hint" id="fast-reason" hidden></p>
+            </div>
+          </div>
+
+          <p class="body error" id="file-error" hidden></p>
+
+          <footer class="bar">
+            <button class="btn" id="file-back">Choose another file</button>
+            <span class="spacer"></span>
+            <button class="btn primary" id="start" disabled>Start</button>
+          </footer>
+        </div>
+
+        <!--
+          Run: the stage in words, a bar, and — on the -fast path only — the
+          growing coverage and the line saying the file is worth opening now.
+          On completion every file the run reported through `saved` gets its own
+          "Show in Finder": -mode both writes a sidecar and a container, `done`
+          names only the container, and the sidecar landed minutes earlier.
+        -->
+        <div class="screen" id="screen-run" hidden>
+          <header class="filehead">
+            <h1 class="title" id="run-title"></h1>
+            <p class="body" id="run-stage"></p>
+            <p class="hint" id="run-note" hidden></p>
+          </header>
+
+          <div class="bar-track" id="run-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100">
+            <div class="bar-fill" id="run-fill"></div>
+          </div>
+          <p class="hint tnum" id="run-pct"></p>
+
+          <!-- Live subtitle ticker: the last lines heard (or, once translated,
+               their translation), newest at the bottom, older ones fading up
+               and out. -->
+          <div class="ticker" id="ticker" aria-live="off" hidden>
+            <div class="ticker-line" id="ticker-0"></div>
+            <div class="ticker-line" id="ticker-1"></div>
+            <div class="ticker-line" id="ticker-2"></div>
+            <div class="ticker-line" id="ticker-3"></div>
+            <div class="ticker-line current" id="ticker-4"></div>
+          </div>
+
+          <!-- The system green, and the spec's one use for it: the moment the
+               partial file is worth opening. Only `saved` with watchable:true
+               shows it, which is the -fast path alone. -->
+          <p class="body watchable" id="run-watchable" hidden></p>
+
+          <div class="rows" id="run-files"></div>
+
+          <p class="body" id="run-warning" hidden></p>
+          <p class="body error" id="run-error" hidden></p>
+
+          <footer class="bar">
+            <button class="btn" id="run-cancel">Cancel</button>
+            <button class="btn" id="run-back" hidden>Choose another file</button>
+            <span class="spacer"></span>
+            <button class="btn primary" id="run-retry" hidden>Retry</button>
+          </footer>
+        </div>
+
+        <!--
+          Settings: the CLI path above a divider, labelled as the one setting
+          this window keeps for itself, then the eight config keys. Every one of
+          those is read and written by running the CLI, so a value changed in
+          the terminal shows up here and the other way round, and this window
+          holds no second copy of the validation rules.
+
+          The rows themselves are built in app.js from the key list Go sends,
+          so the order is SettingKeys' order and cannot drift from it.
+        -->
+        <div class="screen" id="screen-settings" hidden>
+          <header class="filehead">
+            <h1 class="title">Settings</h1>
+            <p class="body error" id="settings-message" hidden></p>
+          </header>
+
+          <div class="rows" id="settings-rows">
+            <div class="field">
+              <p class="label">sub-translator binary</p>
+              <div class="line">
+                <p class="body clip grow" id="cli-path"></p>
+                <button class="btn" id="cli-choose">Choose…</button>
+              </div>
+              <p class="hint">
+                The one setting this window keeps for itself, because it has to
+                find the tool before it can ask the tool anything. Everything
+                below is the tool's own configuration, shared with the terminal.
+              </p>
+            </div>
+
+            <div class="divider"></div>
+
+            <div id="settings-fields"></div>
+          </div>
+
+          <footer class="bar">
+            <span class="spacer"></span>
+            <button class="btn primary" id="settings-done">Done</button>
+          </footer>
+        </div>
+      </section>
+    </main>
+
+    <!--
+      The language codes sub-translator's own prompt suggests, as suggestions
+      only: the field stays free text because the CLI accepts any code and a
+      fixed menu would lock out a language it would have translated.
+    -->
+    <datalist id="langs">
+      <option value="en">English</option>
+      <option value="ru">Russian</option>
+      <option value="es">Spanish</option>
+      <option value="fr">French</option>
+      <option value="de">German</option>
+      <option value="it">Italian</option>
+      <option value="pt">Portuguese</option>
+      <option value="nl">Dutch</option>
+      <option value="pl">Polish</option>
+      <option value="uk">Ukrainian</option>
+      <option value="cs">Czech</option>
+      <option value="sv">Swedish</option>
+      <option value="da">Danish</option>
+      <option value="fi">Finnish</option>
+      <option value="no">Norwegian</option>
+      <option value="tr">Turkish</option>
+      <option value="el">Greek</option>
+      <option value="he">Hebrew</option>
+      <option value="ar">Arabic</option>
+      <option value="hi">Hindi</option>
+      <option value="zh">Chinese</option>
+      <option value="ja">Japanese</option>
+      <option value="ko">Korean</option>
+    </datalist>
+
+    <script src="app.js"></script>
+  </body>
+</html>

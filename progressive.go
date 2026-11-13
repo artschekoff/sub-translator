@@ -166,6 +166,62 @@ func resolveChunkLanguage(from, picked, configured string) string {
 	return configured
 }
 
+// runningTexts returns the first "done" entries of translated, treating any
+// remaining empty strings as not-yet-translated and returning the source text
+// placeholder "…" for them. The caller supplies the chunk size so the window
+// does not see more lines than actually exist.
+func runningTexts(translated []string, chunkSize int) []string {
+	if len(translated) == 0 {
+		return nil
+	}
+	out := make([]string, 0, chunkSize)
+	for i := 0; i < chunkSize && i < len(translated); i++ {
+		if translated[i] == "" {
+			out = append(out, "…")
+		} else {
+			out = append(out, translated[i])
+		}
+	}
+	return out
+}
+
+// emitCaptionPreview sends the last completed block plus its neighbours to the
+// event stream so the Run screen can render a scrolling ticker. Source is always
+// present; Translation is empty until the block has finished translating.
+func emitCaptionPreview(blocks []srt.Block, translated []string, absoluteOffset int) {
+	if len(translated) == 0 || ev == nil {
+		return
+	}
+	current := len(translated) - 1 + absoluteOffset
+	start := current - 2
+	if start < 0 {
+		start = 0
+	}
+	end := current + 3
+	if end > absoluteOffset+len(blocks) {
+		end = absoluteOffset + len(blocks)
+	}
+	if start >= end {
+		return
+	}
+	for i := start; i < end; i++ {
+		idx := i - absoluteOffset
+		if idx < 0 || idx >= len(blocks) {
+			continue
+		}
+		src := blocks[idx].Text
+		tr := ""
+		if idx < len(translated) {
+			tr = translated[idx]
+		}
+		ev.Emit(&events.Caption{
+			Index:       i,
+			Source:      src,
+			Translation: tr,
+		})
+	}
+}
+
 // notifyDone raises a desktop notification on macOS. It is best-effort by design:
 // a finished file is the deliverable, and a missing osascript must never turn a
 // successful run into a failed one.
@@ -274,7 +330,7 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 		// The language is settled by the first chunk and then forced, so whisper
 		// cannot change its mind halfway and hand back a two-language file.
 		parsed, detected, err := transcribeInto(opts, chunkWAV,
-			filepath.Join(tmpDir, fmt.Sprintf("chunk-%03d", c.Index)), lang)
+			filepath.Join(tmpDir, fmt.Sprintf("chunk-%03d", c.Index)), lang, len(srcBlocks))
 		// The slice has done its job the moment whisper has read it. Keeping
 		// every chunk to the end of the run roughly doubles peak scratch usage,
 		// on top of a full film's WAV that is already over a gigabyte.
@@ -351,6 +407,11 @@ func runProgressive(input, tmpDir string, streams []media.Stream, atrack int, fr
 			fmt.Printf("\r  translating: %d/%d   ", done, total)
 			ev.Emit(&events.Progress{Pct: pctOf(done, total)})
 		})
+		// The last few translated lines replace what the ticker showed of them
+		// as heard. The results only exist once TranslateAll returns, so this is
+		// once per chunk.
+		running := runningTexts(translated, len(shifted))
+		emitCaptionPreview(shifted, running, len(srcBlocks)-len(shifted))
 		fmt.Println()
 		if err != nil {
 			return fail("chunk %d: translate: %w", c.Index+1, err)
