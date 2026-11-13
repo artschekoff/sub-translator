@@ -10,9 +10,12 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/artschekoff/sub-translator/internal/translate"
 )
 
 type WhisperConfig struct {
@@ -116,7 +119,7 @@ var fields = map[string]field{
 		},
 	},
 	"models.dir": {
-		get: func(c *Config) string { return c.Models.Dir },
+		get: func(c *Config) string { return c.ModelsDir() },
 		set: func(c *Config, v string) error { c.Models.Dir = expandPath(v); return nil },
 	},
 	// The key is the one setting here that is genuinely a secret. It is stored in
@@ -129,11 +132,16 @@ var fields = map[string]field{
 		secret: true,
 	},
 	"translate.model": {
-		get: func(c *Config) string { return c.Translate.Model },
+		get: func(c *Config) string {
+			if c.Translate.Model == "" {
+				return translate.DefaultModel
+			}
+			return c.Translate.Model
+		},
 		set: func(c *Config, v string) error {
 			v = strings.TrimSpace(v)
 			if v == "" {
-				return fmt.Errorf("translate.model must be a model id, e.g. gpt-6-luna")
+				return fmt.Errorf("translate.model must be a model id, e.g. %s", translate.DefaultModel)
 			}
 			c.Translate.Model = v
 			return nil
@@ -217,8 +225,27 @@ func (c *Config) Set(key, value string) error {
 	return f.set(c, value)
 }
 
-// expandPath resolves a leading ~ and makes the path absolute, so what lands in
-// the file means the same thing from any working directory.
+// ModelsDir returns the configured models directory, or the default Whisper
+// models location when nothing is configured. On macOS the default is the
+// Slaive front-end's model store, so models downloaded by either application
+// are shared.
+func (c *Config) ModelsDir() string {
+	if c.Models.Dir != "" {
+		return c.Models.Dir
+	}
+	return defaultModelsDir()
+}
+
+func defaultModelsDir() string {
+	if runtime.GOOS != "darwin" {
+		return ""
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, "Library", "Application Support", "net.slaive.app", "models")
+}
 func expandPath(p string) string {
 	p = strings.TrimSpace(p)
 	if p == "" {

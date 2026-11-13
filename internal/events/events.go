@@ -26,6 +26,7 @@ const (
 	KindStage    Kind = "stage"
 	KindProgress Kind = "progress"
 	KindLanguage Kind = "language"
+	KindCaption  Kind = "caption"
 	KindSaved    Kind = "saved"
 	KindWarning  Kind = "warning"
 	KindDone     Kind = "done"
@@ -123,6 +124,20 @@ type Language struct {
 }
 
 func (*Language) kind() Kind { return KindLanguage }
+
+// Caption carries one recognised or translated line together with the one
+// before it and the one after it, so the Run screen can show a live ticker
+// with context. Source is the text the model is translating from;
+// Translation is empty until the batch containing this line has been
+// translated and is then the translated line.
+type Caption struct {
+	base
+	Index       int    `json:"index"`
+	Source      string `json:"source"`
+	Translation string `json:"translation,omitempty"`
+}
+
+func (*Caption) kind() Kind { return KindCaption }
 
 // Saved names one file a run has written and says whether it is usable yet. The
 // -fast path emits one per chunk, as the file grows; the ordinary path emits one

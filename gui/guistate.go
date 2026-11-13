@@ -11,7 +11,8 @@ import (
 // of the CLI's own settings file on purpose — see the package doc in
 // locate.go for why that would be circular.
 type guiState struct {
-	CLI string `json:"cli,omitempty"`
+	CLI       string `json:"cli,omitempty"`
+	FFmpegDir string `json:"ffmpegDir,omitempty"`
 }
 
 // statePath returns the location of this window's own state file. It is
@@ -45,16 +46,37 @@ func statePath() (string, error) {
 	return filepath.Join(home, "Library", "Application Support", "sub-translator", "gui.json"), nil
 }
 
-// RememberCLI persists path as the CLI location for future launches.
-//
-// It writes atomically, the way the CLI writes its own files (see
-// internal/srt.Write and internal/models's downloader): the new content is
-// staged with os.CreateTemp in the target directory and moved into place
-// with os.Rename, which POSIX guarantees is atomic. That way a crash or a
-// full disk mid-write leaves either the previous complete gui.json or the
-// next one, never a half-written file that would send the next launch to
-// the picker for no reason.
-func RememberCLI(path string) error {
+// RememberFFmpegDir persists dir as the directory to add to PATH for ffmpeg/ffprobe lookups.
+func RememberFFmpegDir(dir string) error {
+	if _, err := statePath(); err != nil {
+		return err
+	}
+	s, _ := loadState()
+	s.FFmpegDir = dir
+	return saveState(s)
+}
+
+// RememberedFFmpegDir returns the directory last saved by RememberFFmpegDir.
+func RememberedFFmpegDir() string {
+	s, _ := loadState()
+	return s.FFmpegDir
+}
+
+func loadState() (guiState, error) {
+	var s guiState
+	p, err := statePath()
+	if err != nil {
+		return s, err
+	}
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return s, err
+	}
+	_ = json.Unmarshal(data, &s)
+	return s, nil
+}
+
+func saveState(s guiState) error {
 	p, err := statePath()
 	if err != nil {
 		return err
@@ -64,7 +86,7 @@ func RememberCLI(path string) error {
 		return err
 	}
 
-	data, err := json.Marshal(guiState{CLI: path})
+	data, err := json.Marshal(s)
 	if err != nil {
 		return err
 	}
@@ -74,8 +96,6 @@ func RememberCLI(path string) error {
 		return err
 	}
 	tmpName := tmp.Name()
-	// Whatever happens below, a stray temp file must not survive this call.
-	// Remove is a no-op once Rename has already moved the file away.
 	defer os.Remove(tmpName)
 
 	if _, err := tmp.Write(data); err != nil {
@@ -89,6 +109,24 @@ func RememberCLI(path string) error {
 		return err
 	}
 	return os.Rename(tmpName, p)
+}
+
+// RememberCLI persists path as the CLI location for future launches.
+//
+// It writes atomically, the way the CLI writes its own files (see
+// internal/srt.Write and internal/models's downloader): the new content is
+// staged with os.CreateTemp in the target directory and moved into place
+// with os.Rename, which POSIX guarantees is atomic. That way a crash or a
+// full disk mid-write leaves either the previous complete gui.json or the
+// next one, never a half-written file that would send the next launch to
+// the picker for no reason.
+func RememberCLI(path string) error {
+	if _, err := statePath(); err != nil {
+		return err
+	}
+	s, _ := loadState()
+	s.CLI = path
+	return saveState(s)
 }
 
 // RememberedCLI returns the CLI path RememberCLI last saved, or "" if

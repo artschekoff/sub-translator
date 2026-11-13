@@ -123,6 +123,27 @@ type Done struct {
 	Covers string `json:"covers,omitempty"`
 }
 
+// Caption carries one recognised or translated line together with its
+// absolute index so the Run screen can show a live ticker. Source is the
+// text the model is translating from; Translation is empty until the batch
+// containing this line has been translated and is then the translated line.
+type Caption struct {
+	Index       int    `json:"index"`
+	Source      string `json:"source"`
+	Translation string `json:"translation,omitempty"`
+}
+
+func (e Event) AsCaption() (*Caption, error) {
+	if e.Type != "caption" {
+		return nil, wrongType("caption", e.Type)
+	}
+	var c Caption
+	if err := json.Unmarshal(e.Raw, &c); err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
 // Error carries a run that failed.
 type Error struct {
 	Kind    string `json:"kind"`

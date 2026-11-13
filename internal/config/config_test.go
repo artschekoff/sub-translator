@@ -224,8 +224,8 @@ func TestSetValidatesTranslateSettings(t *testing.T) {
 		{"translate.workers", "0", "positive"},
 		{"translate.workers", "-2", "positive"},
 		{"translate.workers", "lots", "positive"},
-		{"translate.model", "", "gpt-6-luna"},
-		{"translate.model", "   ", "gpt-6-luna"},
+		{"translate.model", "", "gpt-4o-mini"},
+		{"translate.model", "   ", "gpt-4o-mini"},
 	} {
 		err := c.Set(tt.key, tt.value)
 		if err == nil {

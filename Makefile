@@ -1,5 +1,6 @@
 VERSION  ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 BINARY   := sub-translator
+APP_NAME := SubTranslator
 BIN_DIR  := bin
 DIST_DIR := $(BIN_DIR)/dist
 LDFLAGS   = -ldflags "-X main.version=$(VERSION)"
@@ -87,11 +88,12 @@ gui:
 # or `xattr -d com.apple.quarantine`.
 dmg: build gui
 	rm -rf $(BIN_DIR)/dmg && mkdir -p $(BIN_DIR)/dmg $(DIST_DIR)
-	cp -R gui/build/bin/$(BINARY).app $(BIN_DIR)/dmg/
-	cp $(BIN_DIR)/$(BINARY) $(BIN_DIR)/dmg/$(BINARY).app/Contents/MacOS/
-	codesign --force --deep --sign - $(BIN_DIR)/dmg/$(BINARY).app
-	hdiutil create -volname $(BINARY) -srcfolder $(BIN_DIR)/dmg \
-		-ov -format UDZO $(DIST_DIR)/$(BINARY).dmg
+	cp -R gui/build/bin/$(APP_NAME).app $(BIN_DIR)/dmg/
+	cp $(BIN_DIR)/$(BINARY) $(BIN_DIR)/dmg/$(APP_NAME).app/Contents/MacOS/
+	codesign --force --deep --sign - $(BIN_DIR)/dmg/$(APP_NAME).app
+	ln -s /Applications $(BIN_DIR)/dmg/Applications
+	hdiutil create -volname $(APP_NAME) -srcfolder $(BIN_DIR)/dmg \
+		-ov -format UDZO $(DIST_DIR)/$(APP_NAME).dmg
 
 release:
 	@set -e; \

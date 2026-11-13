@@ -22,7 +22,7 @@
 const $ = (id) => document.getElementById(id);
 
 /* Five screens, one card, one size. Nothing here ever calls WindowSetSize. */
-const SCREENS = ["drop", "busy", "file", "run", "settings"];
+const SCREENS = ["drop", "busy", "file", "run", "settings", "wizard"];
 
 function show(name) {
   for (const screen of SCREENS) {
@@ -178,18 +178,12 @@ async function boot() {
   });
 
   wireRunEvents();
+  wireWizardEvents();
 
-  const info = await app.Boot();
-  if (!info.found) {
-    /* The spec: failing to find the CLI "opens on its settings screen saying
-       it cannot find the tool, with a file picker — the same treatment as a
-       missing key, and for the same reason: it is a setup step, not a run
-       failure". So the same screen, not one of its own. */
-    settingsReturn = "drop";
-    await openSettings(info.error);
-    return;
-  }
-  show("drop");
+  /* The launch wizard checks the pieces a run needs: the CLI, ffmpeg/ffprobe,
+     whisper-cli, an installed model, and macOS permissions. If anything is
+     missing it offers buttons to install, point at a path, or recheck. */
+  await runDiagnostics();
 }
 
 async function loadFilm(path, ignored) {
@@ -421,7 +415,230 @@ function validate() {
   $("start").disabled = !ok;
 }
 
+/* --------------------------------------------------------------- Wizard screen */
+
+function wireWizardEvents() {
+  window.runtime.EventsOn("wizard:pull:line", (line) => {
+    appendPullLine(line);
+  });
+  window.runtime.EventsOn("wizard:pull:done", (err) => {
+    appendPullLine(err ? "Error: " + err : "Done. Click Recheck to refresh.");
+    $("wizard-recheck").disabled = false;
+  });
+}
+
+async function runDiagnostics() {
+  const app = await ready();
+  let result;
+  try {
+    result = await app.Diagnostics();
+  } catch (err) {
+    result = {
+      ok: false,
+      checks: [
+        {
+          name: "error",
+          label: "Diagnostics failed",
+          ok: false,
+          message: String(err),
+          actions: [],
+        },
+      ],
+    };
+  }
+  renderWizard(result);
+}
+
+function renderWizard(result) {
+  clearPullLog();
+
+  if (result.ok) {
+    show("drop");
+    return;
+  }
+
+  const list = $("wizard-list");
+  list.replaceChildren();
+  for (const check of result.checks || []) {
+    list.append(wizardRow(check));
+  }
+
+  const cont = $("wizard-continue");
+  cont.hidden = true;
+  cont.onclick = null;
+
+  const recheck = $("wizard-recheck");
+  recheck.disabled = false;
+  recheck.onclick = async () => {
+    recheck.disabled = true;
+    await runDiagnostics();
+  };
+
+  show("wizard");
+}
+
+function wizardRow(check) {
+  const row = document.createElement("div");
+  row.className = "wizard-item";
+
+  const status = document.createElement("div");
+  status.className = "wizard-status " + (check.ok ? "ok" : "fail");
+  status.textContent = check.ok ? "✓" : "✗";
+
+  const body = document.createElement("div");
+  body.className = "wizard-body";
+
+  const name = document.createElement("div");
+  name.className = "wizard-name";
+  name.textContent = check.label;
+
+  const msg = document.createElement("div");
+  msg.className = "wizard-message";
+  msg.textContent = check.message || "";
+
+  body.append(name, msg);
+
+  if (!check.ok && check.actions && check.actions.length > 0) {
+    const actions = document.createElement("div");
+    actions.className = "wizard-actions";
+    for (const action of check.actions) {
+      actions.append(wizardActionButton(action));
+    }
+    body.append(actions);
+  }
+
+  row.append(status, body);
+  return row;
+}
+
+const WIZARD_ACTION_LABELS = {
+  "choose-cli": "Choose binary",
+  "install-ffmpeg": "How to install",
+  "choose-ffmpeg": "Choose ffmpeg",
+  "settings-whisper-bin": "Set whisper.bin",
+  "pull-model": "Download large-v3-turbo",
+  "settings-models-dir": "Set models folder",
+  "open-accessibility": "Open System Settings",
+};
+
+function wizardActionButton(action) {
+  const btn = document.createElement("button");
+  btn.className = "btn";
+  btn.textContent = WIZARD_ACTION_LABELS[action] || action;
+  btn.addEventListener("click", () => handleWizardAction(action));
+  return btn;
+}
+
+async function handleWizardAction(action) {
+  const app = await ready();
+  switch (action) {
+    case "choose-cli": {
+      await app.ChooseCLI();
+      await runDiagnostics();
+      break;
+    }
+    case "install-ffmpeg": {
+      await app.InstallFFmpeg();
+      break;
+    }
+    case "choose-ffmpeg": {
+      const result = await app.ChooseFFmpeg();
+      renderWizard(result);
+      break;
+    }
+    case "settings-whisper-bin": {
+      settingsReturn = "wizard";
+      await openSettings("", "whisper.bin");
+      break;
+    }
+    case "pull-model": {
+      clearPullLog();
+      $("wizard-log").hidden = false;
+      appendPullLine("Downloading large-v3-turbo…");
+      const err = await app.StartModelPull("large-v3-turbo");
+      if (err) {
+        appendPullLine("Could not start: " + String(err));
+      }
+      break;
+    }
+    case "settings-models-dir": {
+      settingsReturn = "wizard";
+      await openSettings("", "models.dir");
+      break;
+    }
+    case "open-accessibility": {
+      await app.OpenAccessibilitySettings();
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+function appendPullLine(line) {
+  const pre = $("wizard-pre");
+  pre.textContent += (pre.textContent ? "\n" : "") + line;
+  const log = $("wizard-log");
+  log.hidden = false;
+  log.scrollTop = log.scrollHeight;
+}
+
+function clearPullLog() {
+  $("wizard-pre").textContent = "";
+  $("wizard-log").hidden = true;
+}
+
 /* --------------------------------------------------------------- Run screen */
+
+let tickerBuf = [];   // {index, source, translation}
+let tickerIndex = -1; // absolute index of the current centre line
+
+function tickerEmpty() {
+  return "";
+}
+
+function renderTicker() {
+  const ticker = $("ticker");
+  if (tickerBuf.length === 0) {
+    ticker.hidden = true;
+    return;
+  }
+  ticker.hidden = false;
+
+  /* The newest line sits at the bottom and the four before it above it, each
+     a little fainter: what is being heard right now, with enough of what came
+     before to follow along. */
+  const rows = 5;
+  for (let i = 0; i < rows; i++) {
+    const off = i - (rows - 1);
+    const line = tickerBuf.find((c) => c.index === tickerIndex + off);
+    const el = $(`ticker-${i}`);
+    const text = line ? line.translation || line.source : "";
+    el.textContent = text;
+    el.classList.toggle("empty", !text);
+    el.style.opacity = off === 0 ? "1" : String(Math.max(0.2, 1 + off * 0.2));
+  }
+}
+
+function tick(caption) {
+  if (caption.index < 0) return;
+
+  const existing = tickerBuf.find((c) => c.index === caption.index);
+  if (existing) {
+    /* The same line arrives twice: once heard, once translated. */
+    if (caption.source) existing.source = caption.source;
+    if (caption.translation) existing.translation = caption.translation;
+  } else {
+    tickerBuf.push({ ...caption });
+  }
+  tickerBuf.sort((a, b) => a.index - b.index);
+
+  const latest = tickerBuf[tickerBuf.length - 1].index;
+  tickerBuf = tickerBuf.filter((c) => c.index >= latest - 20);
+  tickerIndex = latest;
+
+  renderTicker();
+}
 
 /* Registered once the bindings are up, because window.runtime arrives from the
    same injected script. Every one of these is a fact the CLI stated; none of
@@ -471,6 +688,8 @@ function wireRunEvents() {
       note.hidden = false;
     }
   });
+
+  window.runtime.EventsOn("run:caption", (caption) => tick(caption));
 
   window.runtime.EventsOn("run:warning", (warning) => showWarning(warning));
 
@@ -556,6 +775,9 @@ async function startRun() {
 
   savedFiles = new Map();
   running = true;
+  tickerBuf = [];
+  tickerIndex = -1;
+  renderTicker();
 
   $("run-title").textContent = film ? film.name : "";
   lastStageLine = "";
@@ -691,6 +913,13 @@ const SETTING_LABELS = {
   "models.dir": "Where models are kept",
 };
 
+const SETTING_PATH_KEYS = new Set([
+  "whisper.bin",
+  "whisper.model",
+  "whisper.vad-model",
+  "models.dir",
+]);
+
 function noteSettings(message) {
   const note = $("settings-message");
   note.textContent = message || "";
@@ -818,6 +1047,32 @@ function settingRow(key, value) {
     line.append(reveal);
   }
 
+  /* Path settings get a file or folder picker so the user does not have to
+     type absolute paths by hand. */
+  if (SETTING_PATH_KEYS.has(key)) {
+    const browse = document.createElement("button");
+    browse.className = "btn";
+    browse.textContent = "Choose…";
+    browse.addEventListener("click", async () => {
+      const app = await ready();
+      let chosen;
+      try {
+        chosen = await app.ChooseSettingPath(key);
+      } catch (err) {
+        answer.textContent = String(err);
+        answer.classList.add("error");
+        answer.hidden = false;
+        return;
+      }
+      if (!chosen) {
+        return;
+      }
+      input.value = chosen;
+      input.dispatchEvent(new Event("change"));
+    });
+    line.append(browse);
+  }
+
   /* The answer sits between the label and the control, not under it. The spec
      says a routed error "shows the message above" the field at fault, and the
      reason is legibility rather than taste: a message under a control reads as
@@ -873,6 +1128,10 @@ function wire() {
   });
 
   $("settings-done").addEventListener("click", () => {
+    if (settingsReturn === "wizard") {
+      runDiagnostics();
+      return;
+    }
     show(settingsReturn === "file" && film ? "file" : "drop");
   });
 

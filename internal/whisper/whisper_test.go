@@ -202,7 +202,7 @@ func TestRunRequiresInstalledBinary(t *testing.T) {
 	if _, err := os.Stat("/nonexistent-whisper"); err == nil {
 		t.Skip("unexpected binary present")
 	}
-	_, err := Run(Options{Bin: "/nonexistent-whisper", Model: "m", Audio: "a", OutBase: "o"}, nil)
+	_, err := Run(Options{Bin: "/nonexistent-whisper", Model: "m", Audio: "a", OutBase: "o"}, nil, nil)
 	if err == nil {
 		t.Fatal("want error when the binary cannot be executed")
 	}
@@ -237,7 +237,7 @@ exit 1
 			Model:   "dummy",
 			Audio:   "dummy",
 			OutBase: filepath.Join(dir, "out"),
-		}, nil)
+		}, nil, nil)
 		done <- true
 	}()
 
@@ -276,6 +276,9 @@ while [ $# -gt 0 ]; do
   shift
 done
 echo "whisper_print_progress_callback: progress =  25%" >&2
+echo "[00:00:00.000 --> 00:00:02.000]   hello there"
+echo "[00:00:02.000 --> 00:00:03.000]  "
+echo "main: processing done"
 echo "whisper_print_progress_callback: progress = 100%" >&2
 printf '1\n00:00:00,000 --> 00:00:02,000\nhello there\n\n' > "$outbase.srt"
 printf '{"result":{"language":"en"}}' > "$outbase.json"
@@ -287,18 +290,25 @@ exit 0
 
 	outBase := filepath.Join(dir, "transcript")
 	var pcts []int
+	var segments []string
 	res, err := Run(Options{
 		Bin:     stub,
 		Model:   filepath.Join(dir, "ggml-test.bin"),
 		Audio:   filepath.Join(dir, "audio.wav"),
 		OutBase: outBase,
-	}, func(pct int) { pcts = append(pcts, pct) })
+	}, func(pct int) { pcts = append(pcts, pct) },
+		func(text string) { segments = append(segments, text) })
 	if err != nil {
 		t.Fatalf("Run() = %v, want success", err)
 	}
 
 	if !slices.Equal(pcts, []int{25, 100}) {
 		t.Errorf("progress callback saw %v, want [25 100]", pcts)
+	}
+	// Only the stdout segment lines, trimmed, and not the empty one: they are
+	// what the Run screen shows of what is being heard.
+	if !slices.Equal(segments, []string{"hello there"}) {
+		t.Errorf("segment callback saw %q, want [hello there]", segments)
 	}
 	if res.SRTPath != outBase+".srt" {
 		t.Errorf("SRTPath = %q, want %q", res.SRTPath, outBase+".srt")
@@ -308,5 +318,24 @@ exit 0
 	}
 	if res.Language != "en" {
 		t.Errorf("Language = %q, want en (from the JSON sidecar)", res.Language)
+	}
+}
+
+func TestParseSegment(t *testing.T) {
+	for _, tt := range []struct {
+		line string
+		want string
+		ok   bool
+	}{
+		{"[00:00:01.000 --> 00:00:04.000]   Hello there.", "Hello there.", true},
+		{"[01:02:03.500 --> 01:02:05.250]  Bonjour", "Bonjour", true},
+		{"[00:00:01.000 --> 00:00:04.000]   ", "", false},
+		{"whisper_print_timings:     load time =   100.00 ms", "", false},
+		{"", "", false},
+	} {
+		got, ok := parseSegment(tt.line)
+		if got != tt.want || ok != tt.ok {
+			t.Errorf("parseSegment(%q) = %q, %v; want %q, %v", tt.line, got, ok, tt.want, tt.ok)
+		}
 	}
 }

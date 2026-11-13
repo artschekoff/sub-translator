@@ -38,7 +38,7 @@ func listModels(out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	dirs := models.SearchDirs(c.Models.Dir)
+	dirs := models.SearchDirs(c.ModelsDir())
 	transcribe, vad := models.Discover(dirs)
 
 	installed := map[string]string{}
@@ -72,9 +72,10 @@ func pullModel(name string, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	dest := c.Models.Dir
+	dest := c.ModelsDir()
 	if dest == "" {
-		if dest, err = models.DefaultDir(); err != nil {
+		dest, err = models.DefaultDir()
+		if err != nil {
 			return err
 		}
 	}

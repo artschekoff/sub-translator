@@ -189,6 +189,29 @@ body {
   font-weight: 600;
 }
 
+/* The live ticker: what whisper is hearing, newest line at the bottom. Fixed
+   row heights so a long line or an empty one never makes the card jump. */
+.ticker {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ticker-line {
+  font-size: var(--size-body);
+  line-height: 1.35;
+  min-height: calc(var(--size-body) * 1.35);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: opacity 0.2s ease;
+}
+
+.ticker-line.current {
+  font-weight: 600;
+}
+
 /* Ticking numbers must not jitter. */
 .tnum {
   font-variant-numeric: tabular-nums;
@@ -473,6 +496,13 @@ body.dragging .dropzone {
   flex: none;
 }
 
+/* Path settings share the line with a Choose button; the input gets the
+   leftover width. */
+.setting .control {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
 .setting .answer {
   margin-bottom: 4px;
 }
@@ -483,4 +513,86 @@ body.dragging .dropzone {
    Run screen explicable instead of abrupt. */
 .setting.at-fault .answer {
   color: var(--danger);
+}
+
+/* ---------------------------------------------------------- Wizard screen */
+
+.wizard-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 8px;
+}
+
+.wizard-item {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 10px 0;
+  border-top: 1px solid var(--hairline);
+}
+
+.wizard-item:first-child {
+  border-top: 0;
+}
+
+.wizard-status {
+  flex: none;
+  width: 1.4em;
+  text-align: center;
+  font-weight: 600;
+}
+
+.wizard-status.ok {
+  color: var(--ok);
+}
+
+.wizard-status.fail {
+  color: var(--danger);
+}
+
+.wizard-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.wizard-name {
+  font-weight: 600;
+}
+
+.wizard-message {
+  opacity: 0.8;
+  font-size: var(--size-hint);
+  overflow-wrap: anywhere;
+  line-height: 1.35;
+}
+
+.wizard-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.wizard-log {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-control);
+  padding: 8px;
+  background: rgba(0, 0, 0, 0.04);
+}
+
+.wizard-pre {
+  margin: 0;
+  font: 11px/1.4 ui-monospace, SFMono-Regular, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+@media (prefers-color-scheme: dark) {
+  .wizard-log {
+    background: rgba(255, 255, 255, 0.06);
+  }
 }

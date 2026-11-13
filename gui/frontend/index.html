@@ -23,12 +23,29 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>sub-translator</title>
+    <title>SubTranslator</title>
     <link rel="stylesheet" href="app.css" />
   </head>
   <body>
     <main id="shell">
       <section class="card" id="card">
+        <!-- Wizard: launch-time dependency and permission diagnostics. -->
+        <div class="screen" id="screen-wizard" hidden>
+          <header class="filehead">
+            <h1 class="title">Getting ready</h1>
+            <p class="hint">A few things need to be in place before SubTranslator can work.</p>
+          </header>
+          <div class="wizard-list" id="wizard-list"></div>
+          <div class="wizard-log" id="wizard-log" hidden>
+            <pre class="wizard-pre" id="wizard-pre"></pre>
+          </div>
+          <footer class="bar">
+            <button class="btn" id="wizard-recheck">Recheck</button>
+            <span class="spacer"></span>
+            <button class="btn primary" id="wizard-continue" hidden>Continue</button>
+          </footer>
+        </div>
+
         <!-- Drop: the empty window inviting a film. -->
         <div class="screen centred" id="screen-drop" hidden>
           <div class="dropzone" id="dropzone">
@@ -138,6 +155,17 @@
             <div class="bar-fill" id="run-fill"></div>
           </div>
           <p class="hint tnum" id="run-pct"></p>
+
+          <!-- Live subtitle ticker: the last lines heard (or, once translated,
+               their translation), newest at the bottom, older ones fading up
+               and out. -->
+          <div class="ticker" id="ticker" aria-live="off" hidden>
+            <div class="ticker-line" id="ticker-0"></div>
+            <div class="ticker-line" id="ticker-1"></div>
+            <div class="ticker-line" id="ticker-2"></div>
+            <div class="ticker-line" id="ticker-3"></div>
+            <div class="ticker-line current" id="ticker-4"></div>
+          </div>
 
           <!-- The system green, and the spec's one use for it: the moment the
                partial file is worth opening. Only `saved` with watchable:true

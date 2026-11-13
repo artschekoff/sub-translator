@@ -3774,3 +3774,55 @@ func TestEveryValueTakingFlagIsDefinedBeforeTheArgvScan(t *testing.T) {
 		t.Errorf("only %d value-taking flags were exercised, want the whole documented set", tested)
 	}
 }
+
+// What whisper hears has to reach the Run screen while it is being heard: the
+// SRT is written only when the whole file is done, so the live ticker is fed
+// from whisper's stdout, one caption per segment, numbered from the index the
+// file's first block will have in the run — which is what lets the translation
+// that arrives later for a -fast chunk land on the same line.
+func TestTranscribeIntoEmitsHeardLinesAsCaptions(t *testing.T) {
+	dir := t.TempDir()
+	stub := filepath.Join(dir, "stub-whisper")
+	writeStub(t, stub, `#!/bin/sh
+outbase=""
+while [ $# -gt 0 ]; do
+  if [ "$1" = "-of" ]; then outbase="$2"; fi
+  shift
+done
+echo "[00:00:00.000 --> 00:00:02.000]   first line"
+echo "[00:00:02.000 --> 00:00:04.000]   second line"
+printf '1\n00:00:00,000 --> 00:00:02,000\nfirst line\n\n2\n00:00:02,000 --> 00:00:04,000\nsecond line\n\n' > "$outbase.srt"
+printf '{"result":{"language":"en"}}' > "$outbase.json"
+exit 0
+`)
+
+	saved := ev
+	t.Cleanup(func() { ev = saved })
+	var buf bytes.Buffer
+	ev = events.New(&buf)
+
+	opts := whisper.Options{Bin: stub, Model: filepath.Join(dir, "ggml-test.bin")}
+	if _, _, err := transcribeInto(opts, filepath.Join(dir, "a.wav"),
+		filepath.Join(dir, "out"), "en", 7); err != nil {
+		t.Fatalf("transcribeInto() = %v", err)
+	}
+
+	type caption struct {
+		Index  int    `json:"index"`
+		Source string `json:"source"`
+	}
+	var got []caption
+	for _, line := range strings.Split(buf.String(), "\n") {
+		var m struct {
+			Type string `json:"type"`
+			caption
+		}
+		if json.Unmarshal([]byte(line), &m) == nil && m.Type == "caption" {
+			got = append(got, m.caption)
+		}
+	}
+	want := []caption{{7, "first line"}, {8, "second line"}}
+	if !slices.Equal(got, want) {
+		t.Errorf("captions = %+v, want %+v", got, want)
+	}
+}

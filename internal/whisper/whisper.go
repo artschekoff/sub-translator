@@ -105,6 +105,21 @@ func parseProgress(line string) (int, bool) {
 	return n, true
 }
 
+// segmentRE matches the line whisper-cli prints to stdout for every segment it
+// has just recognised: "[00:00:01.000 --> 00:00:04.000]  text".
+var segmentRE = regexp.MustCompile(`^\[\d+:\d\d:\d\d[.,]\d+ --> \d+:\d\d:\d\d[.,]\d+\]\s*(.*)$`)
+
+// parseSegment returns the text of one stdout segment line. A segment with no
+// text is not one: there is nothing in it to show.
+func parseSegment(line string) (string, bool) {
+	m := segmentRE.FindStringSubmatch(strings.TrimSpace(line))
+	if m == nil {
+		return "", false
+	}
+	text := strings.TrimSpace(m[1])
+	return text, text != ""
+}
+
 // readDetectedLanguage reads the language out of whisper's JSON sidecar. The
 // file is a convenience, not the deliverable, so anything unreadable falls back
 // to the language that was requested.
@@ -128,15 +143,27 @@ func readDetectedLanguage(outBase, requested string) string {
 }
 
 // Run transcribes o.Audio and returns the SRT path plus the language used.
-// Progress is reported as whole percentages as whisper emits them.
-func Run(o Options, progress func(pct int)) (Result, error) {
+// Progress is reported as whole percentages as whisper emits them, and segment,
+// when not nil, is handed the text of every segment the moment whisper prints
+// it — the SRT itself is only written once the whole file is done, which is far
+// too late to show anyone what is being heard.
+func Run(o Options, progress func(pct int), segment func(text string)) (Result, error) {
 	cmd := exec.Command(o.Bin, Args(o)...)
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		return Result{}, fmt.Errorf("whisper: %w", err)
 	}
-	cmd.Stdout = io.Discard
+	var stdout io.Reader
+	if segment != nil {
+		pipe, err := cmd.StdoutPipe()
+		if err != nil {
+			return Result{}, fmt.Errorf("whisper: %w", err)
+		}
+		stdout = pipe
+	} else {
+		cmd.Stdout = io.Discard
+	}
 
 	// A transcription is the longest thing this program starts, so it is the
 	// child most worth being able to kill: proc.Start gives it a process group
@@ -145,6 +172,25 @@ func Run(o Options, progress func(pct int)) (Result, error) {
 	if err := proc.Start(cmd); err != nil {
 		return Result{}, fmt.Errorf("whisper: %w", err)
 	}
+
+	// stdout is read on its own goroutine: whisper writes both streams as it
+	// goes, and a pipe nobody drains blocks the child once its buffer fills. It
+	// must be fully read before proc.Wait, which closes the pipe.
+	stdoutDone := make(chan struct{})
+	go func() {
+		defer close(stdoutDone)
+		if stdout == nil {
+			return
+		}
+		sc := bufio.NewScanner(stdout)
+		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for sc.Scan() {
+			if text, ok := parseSegment(sc.Text()); ok {
+				segment(text)
+			}
+		}
+		io.Copy(io.Discard, stdout)
+	}()
 
 	// Keep the last few lines: when whisper fails, the reason is at the end of
 	// its output, and dumping thousands of lines of model chatter helps nobody.
@@ -174,6 +220,7 @@ func Run(o Options, progress func(pct int)) (Result, error) {
 	if scanErr != nil {
 		io.Copy(io.Discard, stderr)
 	}
+	<-stdoutDone
 
 	// proc.Wait, not cmd.Wait: it drops the reaped child from the set of process
 	// groups a cancel kills. Every path below this point has already been through

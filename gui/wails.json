@@ -1,6 +1,6 @@
 {
   "$schema": "https://wails.io/schemas/config.v2.json",
-  "name": "sub-translator",
+  "name": "SubTranslator",
   "outputfilename": "sub-translator-gui",
   "frontend:install": "",
   "frontend:build": "",

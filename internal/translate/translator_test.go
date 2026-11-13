@@ -278,6 +278,58 @@ func TestTranslateAllPartialFailureReportsIndices(t *testing.T) {
 	}
 }
 
+// A batch that keeps coming back 5xx is not proof the endpoint is down: the
+// server may be choking on the batch itself. Giving the whole batch up at once
+// is what left the opening lines of a -fast run in the source language, so the
+// blocks get their own attempt — and a server that refuses those too still
+// costs a bounded handful of requests, not one per block.
+func TestTranslateAllFallsBackPerBlockAfterABatch5xx(t *testing.T) {
+	t.Run("singles succeed", func(t *testing.T) {
+		c, _ := openAIFor(t, func(w http.ResponseWriter, got capturedRequest) {
+			p, _ := batchOf(got)
+			if len(p.Translate) > 1 {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			echoTranslation(w, p)
+		})
+		c.workers = 1
+
+		texts := lines(5)
+		got, failed, err := c.TranslateAll(texts, nil)
+		if err != nil {
+			t.Fatalf("TranslateAll() = %v, want success via the per-block path", err)
+		}
+		if len(failed) != 0 {
+			t.Errorf("failed = %v, want none", failed)
+		}
+		for i, s := range got {
+			if s != "ES:"+texts[i] {
+				t.Errorf("block %d = %q, want it translated", i, s)
+			}
+		}
+	})
+
+	t.Run("server down", func(t *testing.T) {
+		c, requests := openAIFor(t, func(w http.ResponseWriter, got capturedRequest) {
+			w.WriteHeader(http.StatusInternalServerError)
+		})
+		c.workers = 1
+
+		texts := lines(batchSize)
+		_, failed, err := c.TranslateAll(texts, nil)
+		if err == nil {
+			t.Fatal("want an error when nothing could be translated")
+		}
+		if len(failed) != len(texts) {
+			t.Errorf("failed = %d blocks, want all %d", len(failed), len(texts))
+		}
+		if n, budget := len(requests()), 3*maxAttempts; n > budget {
+			t.Errorf("%d requests for a down server, want at most %d", n, budget)
+		}
+	})
+}
+
 // The per-block path must not outlive the endpoint's health. A batch can fail
 // for a reason that says nothing about the server — a reply whose keys are not
 // the ones it was asked about — and the blocks are then retried one at a time;

@@ -23,11 +23,10 @@ type Translator interface {
 }
 
 const (
-	// DefaultModel is the OpenAI model subtitle translation defaults to. Of the
-	// current line — Astra (flagship, complex reasoning), Sol (balanced), Luna
-	// (cost-sensitive, high volume) — subtitles are the high-volume,
-	// low-reasoning case, which is Luna.
-	DefaultModel = "gpt-6-luna"
+	// DefaultModel is the OpenAI model subtitle translation defaults to. It is
+	// chosen for the subtitle case — many short prompts with modest reasoning
+	// needs — where the smaller "mini" model is cheaper and quickly enough.
+	DefaultModel = "gpt-4o-mini"
 
 	// DefaultWorkers is how many batches are translated at once when neither
 	// -workers nor translate.workers says otherwise. Four is enough to hide the
@@ -216,15 +215,22 @@ func runBatch(p provider, results []string, start int, batch, before []string) (
 	}
 
 	var se statusError
-	if errors.As(err, &se) {
-		// A status-level failure (429, 5xx) has already been retried to
-		// exhaustion: the endpoint is down or throttling, and single blocks
-		// cannot succeed where the batch just failed four times. Fanning out
-		// here is what once turned a sustained rate limit into a multi-hour wait
-		// before the user saw any error at all.
+	if errors.As(err, &se) && se.code < http.StatusInternalServerError {
+		// A 429 or another 4xx is a statement about us — throttling, a bad key, a
+		// request the endpoint will never accept — and single blocks cannot
+		// succeed where the batch just failed. Fanning out here is what once
+		// turned a sustained rate limit into a multi-hour wait before the user
+		// saw any error at all.
 		return 0, giveUp(0), err
 	}
 
+	// A 5xx that survived the batch's retries may still be about the batch — its
+	// size, or one block in it the server chokes on — so it falls through to the
+	// per-block path like any other failure. Giving up here is what left the
+	// opening lines of a -fast run in the source language. The fan-out below
+	// stops at the second status failure, so a server that is genuinely down
+	// costs a couple of single requests, not forty.
+	//
 	// Any other failure — a reply whose key set is not the one the batch asked
 	// about — says nothing about the endpoint's health, so each block gets its own
 	// attempt. This is the expensive path, not the cheap one: the provider retries

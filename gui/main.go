@@ -28,8 +28,10 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -163,11 +165,44 @@ func (a *App) send(name string, data ...interface{}) {
 	a.emit(a.ctx, name, data...)
 }
 
+// ensurePATH appends common Homebrew and MacPorts binary directories to the
+// process PATH. Apps launched from Finder inherit a minimal PATH that does not
+// include /opt/homebrew/bin or /usr/local/bin, so ffmpeg/ffprobe and
+// whisper-cli installed by Homebrew would otherwise be invisible.
+func ensurePATH() {
+	if runtime.GOOS != "darwin" {
+		return
+	}
+	extra := []string{
+		"/opt/homebrew/bin",
+		"/usr/local/bin",
+		"/opt/homebrew/sbin",
+		"/usr/local/sbin",
+	}
+	if d := RememberedFFmpegDir(); d != "" {
+		extra = append([]string{d}, extra...)
+	}
+	cur := os.Getenv("PATH")
+	have := strings.Split(cur, string(os.PathListSeparator))
+	need := []string{}
+	for _, p := range extra {
+		if !slices.Contains(have, p) {
+			need = append(need, p)
+		}
+	}
+	if len(need) == 0 {
+		return
+	}
+	_ = os.Setenv("PATH", strings.Join(append(have, need...), string(os.PathListSeparator)))
+}
+
 // startup runs once, when the window has a context to talk through. It finds
 // the CLI and arms the file drop; it deliberately does no probing and shows no
 // dialog, so the window appears immediately.
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
+
+	ensurePATH()
 
 	cli, err := LocateCLI()
 	a.mu.Lock()
@@ -622,6 +657,12 @@ func (a *App) onRunEvent(ev Event) error {
 			return nil
 		}
 		a.send("run:saved", s)
+	case "caption":
+		c, err := ev.AsCaption()
+		if err != nil {
+			return nil
+		}
+		a.send("run:caption", c)
 	case "warning":
 		w, err := ev.AsWarning()
 		if err != nil {
@@ -743,6 +784,28 @@ func (a *App) LoadSettings() SettingsView {
 	return view
 }
 
+// ChooseSettingPath opens a file or directory picker for the given setting
+// key. Keys that are not filesystem paths return an error without opening a
+// dialog. The empty string means the user cancelled — it is not an error,
+// because the caller just leaves the field as it was.
+func (a *App) ChooseSettingPath(key string) (string, error) {
+	if !slices.Contains(SettingKeys, key) {
+		return "", fmt.Errorf("%q is not a setting this window offers", key)
+	}
+
+	title := "Choose " + key
+	opts := wailsruntime.OpenDialogOptions{Title: title}
+
+	switch key {
+	case "models.dir":
+		return wailsruntime.OpenDirectoryDialog(a.ctx, opts)
+	case "whisper.bin", "whisper.model", "whisper.vad-model":
+		return wailsruntime.OpenFileDialog(a.ctx, opts)
+	default:
+		return "", fmt.Errorf("%q does not accept a filesystem path", key)
+	}
+}
+
 // SaveSetting writes one setting through the CLI and surfaces the CLI's own
 // rejection. The window validates nothing but the key: four of the eight keys
 // and the API key are not validated by the CLI either (see WriteSetting), and
@@ -824,7 +887,7 @@ func (a *App) askToClose(ctx context.Context, quit, message string) (string, err
 	}
 	return a.ask(ctx, wailsruntime.MessageDialogOptions{
 		Type:          wailsruntime.QuestionDialog,
-		Title:         "sub-translator is still working",
+		Title:         "SubTranslator is still working",
 		Message:       message,
 		Buttons:       []string{quit, "Keep working"},
 		DefaultButton: "Keep working",
@@ -846,7 +909,7 @@ func main() {
 	}
 
 	err = wails.Run(&options.App{
-		Title: "sub-translator",
+		Title: "SubTranslator",
 		// One size for every screen. The spec is explicit that the window
 		// never changes shape between Drop, File, Run and Settings — that is
 		// what keeps it one surface instead of a wizard — so nothing here or
